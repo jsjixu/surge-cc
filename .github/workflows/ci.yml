@@ -1,0 +1,32 @@
+name: macOS checks
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Python regression tests
+        run: python3 -B -m unittest discover -s tests -p 'test_*.py'
+        env:
+          PYTHONPATH: src
+      - name: Swift interface contracts
+        run: ./scripts/test-gui.sh
+      - name: Build and verify app
+        run: ./scripts/build-app.sh
