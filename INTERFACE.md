@@ -1,4 +1,22 @@
-# Surge CC 0.2.2 接口合约
+# Surge CC 0.2.4 接口合约
+
+## 终端入口
+
+`terminal.install` 接管当前用户已有的 `~/.local/bin/claude` 官方符号链接。先验证路径、文件权限、原始可执行文件与版本，再将原链接及清单保存在默认 Application Support 下的 `terminal/`，通过原子交换替换入口。已有普通文件、其他用户可写路径、不一致或未完成的清单均拒绝覆盖。`terminal uninstall` 仅在当前包装器仍与记录一致时原子恢复原链接，不移除 Surge 规则、工作区或账号资料。
+
+包装器调用固定 Python、固定后端和固定配置的 `launch code --passthrough -- ...`，不使用 shell 求值传递 Claude 参数；依赖缺失、入口改变或校验失败时没有原版 CLI 回退。`core.default_claude` 经 `terminal.original_claude` 找回校验后的原生程序，避免递归调用包装器。原生路径及 stat 身份固定在安装记录中，原始文件变化后拒绝继续运行，需要通过卸载、维护、重新安装流程更新。
+
+精确单参数 `claude --version` 或 `claude -v` 转到 `terminal version`，只在验证清单、入口和原始文件身份后输出缓存版本，不运行原生程序或网络检测。它用于终端和编辑器的版本发现，不能证明当前线路通过。`--passthrough` 把包装器的检查/错误写到 stderr，成功结束时不在 stdout 追加操作回执；stdin/stdout 保留给 CLI。安装的 shell 入口依赖缺失返回 `78`，进入后端后的退出码约定见下文。
+
+安装入口前要求 `cli_process_paths` 非空、覆盖当前原生程序，并通过 `containment.validate_scope`。运行入口和 GUI 启动共用代理检查、工作区、`OAuthSession` 与受控进程监控。GUI 不需要保持打开，但后端、Python 和配置仍须位于安装记录中的位置；应先把应用放到最终位置，再安装接管。移动或升级应用前先卸载旧入口，再从新位置安装。
+
+当前使用范围为本机终端命令，包括 Ghostty 与 Orca 终端/TUI 通过该路径执行的 `claude`。Orca Native Chat 与 managed accounts 的账号目录、父子进程 transcript 读取及恢复流程尚未验收；包装器会使用 Surge CC 所选工作区的 `CLAUDE_CONFIG_DIR`，不宣称兼容 Orca 的其他账号目录。已在接管前运行的会话不会被收编，其他二进制副本和远端主机也不会自动接管。
+
+Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的原生 `claude`。终端入口不拦截它们，也不根据模型名称推断保护范围。
+
+包装器设置 `SURGE_CC_TERMINAL_ENTRY=1`。该入口仍执行所有启动必需检查，但调用 `full_checks(..., external_dns=False)` 跳过可选外部 DNS 测量；GUI 完整检查与公共 `check` 不因此改变。
+
+每个受控 CLI 子进程设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`；拒绝 `update`、`upgrade`、`install` 更新入口，避免安装器覆盖包装器。这不是全局环境变更。维护需先正常结束会话、卸载入口、更新官方程序，再校验范围并重新安装接管。
 
 ## OAuth 打开器
 
@@ -37,6 +55,7 @@
 | `expected_asn` | 默认空字符串，非空须为 `AS` 加数字，如 `AS64500` |
 | `browser_language` | 默认空字符串；非空须为语言标签，如 `zh-CN`、`en-US`，仅设置工具自有浏览器资料并检验回执 |
 | `browser_path` | 默认空字符串；非空须为独立 Chrome 应用内可执行文件的绝对路径，不含控制字符或逗号，不得指向个人 Chrome。范围检查进一步要求 `Surge CC Browser.app/Contents/MacOS/Google Chrome`、无路径符号链接、可执行文件与包内有效 Helper |
+| `cli_process_paths` | 默认 `[]`；最多 16 个无重复的规范化绝对原生 Claude 路径。目录前缀仅允许当前用户的 `.local/share/claude/versions/`，必须保留尾随 `/`；不接受终端、Node、Python 等共享进程范围。文件有效性及实际程序覆盖在范围检查时进一步验证；当前通过配置文件设置 |
 | `privacy_strict` | 布尔值，默认 `true`；控制部分未知/提示隐私检查是否参与启动判定 |
 | `guard_interval` | 整数，默认 `10`，范围 `2–60` 秒 |
 | `workspace` | 默认 `A`；1–32 位字母、数字、下划线或连字符，GUI 仅提供 A/B |
@@ -45,7 +64,7 @@
 
 ## 公共 CLI
 
-下列所有子命令都接受 `--json`，否则输出摘要与检查行。
+下列子命令接受 `--json`，否则输出摘要与检查行；`terminal version` 特例始终输出单行缓存版本文本。
 
 | 命令 | 行为与副作用 |
 | --- | --- |
@@ -62,11 +81,18 @@
 | `launch web` | 完整检查后启动所选工作区的独立 Chrome 和专属监控进程；不复用个人 Chrome |
 | `launch code --terminal` | 完整检查后打开私有 `.command`；终端内再次执行完整检查，然后启动受监控 CLI |
 | `launch code -- CLAUDE_ARGS...` | 在当前项目目录同步运行受监控 Claude Code；显式代理与工作区 `CLAUDE_CONFIG_DIR`；不对参数做 shell 求值 |
+| `launch code --passthrough -- CLAUDE_ARGS...` | 与上述启动检查相同，但不污染子进程 stdout；检查失败回执写入 stderr，供终端包装器使用 |
+| `terminal install` | 先确认 Claude 原生程序的 Surge 旁路拒绝范围，再可逆接管 `~/.local/bin/claude`；不自行修改 Surge 规则 |
+| `terminal status` | 检查清单、入口、备份、原始程序与后端，返回终端接管状态；不执行线路检查 |
+| `terminal uninstall` | 核对后恢复原始符号链接，保留工作区和 Surge 规则；不覆盖外部改动 |
+| `terminal version` | 验证安装记录并输出缓存的原生 CLI 版本，不执行原生程序 |
 | `guard-status` | 读取现有状态文件并计算最近回执是否有效，不执行新的网络检查、不证明当前进程存活 |
 
-网页入口不接受额外参数。CLI 额外参数必须放在 `--` 后；拒绝 `--settings`、`--setting-sources` 及其 `=VALUE` 形式。启动前检查工作区、项目祖先目录与文件形式的托管 settings，拒绝冲突代理和其他模型服务设置。
+网页入口不接受额外参数。CLI 额外参数必须放在 `--` 后。`--settings VALUE` / `--settings=VALUE` 只接受通过 `launch_settings_safe` 的内联 JSON，不接受文件路径，避免检查后文件变化；`--setting-sources` 的两种形式只接受 `user`、`project`、`local` 的非空、无重复组合。内联及磁盘 settings 均拒绝覆盖 `BROWSER`、`CLAUDE_CONFIG_DIR`，不允许解除更新禁用、设置非专用代理或非空绕过列表，也拒绝其他模型服务与远端启动冲突。Orca 命令发现使用的 `{"disableAllHooks":true}` 可以通过语义检查。启动前仍检查工作区、项目祖先目录与文件形式的托管 settings；检查不会运行其中的 hooks。
 
-CLI 成功返回 `0`；阻止启动、已捕获的 `Blocked` 和受监控 CLI 非零结束返回 `2`；已捕获的系统操作错误返回 `1`。参数解析错误也可返回 `2`。实际子进程退出码位于 `child_exit_code`，公共 CLI 不保证直接转发该非零值。内部 `surge_cc.guard` 进程另返回其监控会话退出码，不是公共 GUI 控制 API。
+`remoteControlAtStartup` 的用户/项目原设置保持不变；受保护启动只在该子进程的内联 settings 中合并 `remoteControlAtStartup:false`。显式 CLI 远端入口、内联 settings 要求开启，或企业托管 settings 强制开启时仍拒绝，不能通过覆盖用户文件绕过托管策略。
+
+CLI 成功返回 `0`；阻止启动、已捕获的 `Blocked` 返回 `2`；已捕获的系统操作错误返回 `1`。参数解析错误也可返回 `2`。普通报告模式将受监控 CLI 的非零结束映射为 `2`，实际退出码保留在 `child_exit_code`。终端使用的 `--passthrough` 模式会直接转发已启动子进程的退出码；信号退出转换为 `128 + 信号编号`。内部 `surge_cc.guard` 进程另返回其监控会话退出码，不是公共 GUI 控制 API。
 
 ## JSON 与启动判定
 
@@ -115,14 +141,16 @@ STUN 错误、超时、缺少完整回执或格式损坏始终为 `unknown`。�
 
 `core.browser_executable(config)` 在 `browser_path` 非空时选择该二进制，否则回退到原 `/Applications/Google Chrome.app` 路径。独立浏览器应是官方 Chrome 应用的完整副本，包名为 `Surge CC Browser.app`；没有自动下载、复制或更新操作。只使用另一个 `--user-data-dir` 而仍运行个人 Chrome 二进制，不能得到进程路径隔离。
 
-`containment.validate_scope` 是只读验证。非空 `browser_path` 启用必需的 `browser_containment` 检查：要求 Surge `mode=rule`、`enhanced-mode=true`，当前配置路径匹配（如果已指定），固定组只有一个指定节点且已选中。专用 HTTP 入口必须监听字面回环地址，端口不能为原有 `6152/6153`，不能带入口认证或同端口公开监听。生效规则前两条必须依次为：
+`containment.validate_scope` 是只读验证。非空 `browser_path` 启用必需的 `browser_containment` 检查：要求 Surge `mode=rule`、`enhanced-mode=true`，当前配置路径匹配（如果已指定），固定组只有一个指定节点且已选中。专用 HTTP 入口必须监听字面回环地址，端口不能为原有 `6152/6153`，不能带入口认证或同端口公开监听。生效规则开头必须依次为：
 
 ```text
 IN-PORT,<专用端口>,<固定组>
 PROCESS-NAME,<Surge CC Browser.app 绝对路径加尾随斜杠>,REJECT
+PROCESS-NAME,<cli_process_paths 中的第一项>,REJECT
+…其余已配置 CLI 路径逐项排列…
 ```
 
-范围核验确认副本主程序及包内 Helper，调用 Surge 路由解释检查原始 TCP/UDP、STUN、QUIC 和 IPv6 的拒绝判定，以及专用端口的 HTTP/HTTPS 固定路由；核验结束再比较配置与组状态。个人 Chrome 路径不在这个拒绝范围内。CLI 使用相同专用代理入口和监控，但没有因此获得面向任意子进程的包路径拒绝规则。
+`cli_process_paths` 为空时不生成后续 CLI 路径行。范围核验确认副本主程序及包内 Helper，以及配置范围内的原生 Claude 程序，调用 Surge 路由解释检查原始 TCP/UDP、STUN、QUIC 和 IPv6 的拒绝判定，以及专用端口的 HTTP/HTTPS 固定路由；核验结束再比较配置与组状态。个人 Chrome、Ghostty、Orca 及共享 Node/Python 路径不在拒绝范围内。CLI 路径匹配仅拒绝该范围内被 Surge 接管的旁路连接，不继承到任意 MCP 或其他子进程，也不保证阻止原始二进制启动。
 
 正常网页启动和临时 Chrome 探针均传入 `--webrtc-ip-handling-policy=disable_non_proxied_udp`，不使用带 `force-` 的参数。自有 `Default/Preferences` 写入：
 
@@ -147,6 +175,7 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 - `browser_path` 非空时，修复计划额外绑定增强模式状态；`scope` 动作恢复独立监听及置顶范围规则，`enhanced-required` 表示增强模式前提不满足，应用在任何写入前拒绝执行，不自动切换该全局开关。
 - 修复执行返回 `actions`、`backup_created`；操作完成不意味着完整线路检查通过，需重新 `check`。
 - `guard-status` 返回 `guard:{running,interval,last_checked_at,detail}` 和按时间倒序的 `guards`。这里的 `running` 是“收到近期有效运行回执”的兼容字段，**不是已验证的当前进程存活状态**。
+- `terminal install` / `status` / `uninstall` 的操作回执含 `terminal:{ok,installed,summary}`；安装有效时还带本机 `command_path` 与 `original_path`，公开分享前需脱敏。`installed:true` 与 `ok:false` 表示存在但无法验证的集成，不表示可安全启动。
 
 ## 运行监控合约
 
@@ -162,13 +191,15 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 ## 工作区、修复与安全边界
 
-工作区是本工具拥有的目录分离：`workspaces/<name>/data/Browser` 与 `data/Claude`，不是独立系统用户、设备身份或钥匙串。快照只复制这些目录并校验清单，不复制工作区外项目。快照和恢复要求独占锁；活动会话持共享锁。恢复前自动备份，并保留 `previous-*` 数据。数据可能包含登录状态，必须私下保存。
+工作区是本工具拥有的目录分离：`workspaces/<name>/data/Browser`、`data/OAuthBrowser` 与 `data/Claude`，不是独立系统用户、设备身份或钥匙串。快照只复制工作区 data 并校验清单，不复制工作区外项目。快照和恢复要求独占锁；活动会话持共享锁。恢复前自动备份，并保留 `previous-*` 数据。数据可能包含登录状态，必须私下保存。
 
-`workspaces.prepare_browser_language` 保留旧函数名，实际在自有工作区未运行时总是更新上述 WebRTC 偏好并清空 URL 覆盖，保留其他字段。仅显式浏览器语言非空时才更新 `intl.accept_languages`；空语言不改原语言值。检测进程使用新的临时空白资料和同样的 WebRTC、显式语言设置，没有复制已有工作区的扩展、策略或其他偏好，回执不能声称完全代表已保存浏览器。
+`launch code` 保留 `Path.cwd()`。独立 `CLAUDE_CONFIG_DIR` 不限制 CLI 可读取的文件，不过滤 `CLAUDE.md`、项目 `.claude`、Git 历史、恢复会话或工具输出。`--resume`、`--continue` 等参数没有被统一禁止。`proxy_env` 先复制调用方环境，再覆盖代理变量并清空代理绕过列表；启动分支覆盖 `CLAUDE_CONFIG_DIR`、`BROWSER` 与更新变量，不是环境白名单，也不删除所有认证凭据。调用方显式指定另一 `CLAUDE_CONFIG_DIR` 时拒绝启动，而不是静默合并。`code_settings_ok` 检查已知冲突设置，不是项目内容审计或文件沙箱。
+
+`workspaces.prepare_browser_language` 保留旧函数名，实际在自有工作区未运行时总是更新上述 WebRTC 偏好并清空 URL 覆盖，保留其他字段。仅显式浏览器语言非空时才同时更新 `intl.accept_languages` 与 `intl.selected_languages`；空语言不改原语言值。`prepare_oauth_browser` 对独立 OAuth 资料使用同一个偏好准备函数。两类窗口仍使用不同的资料目录，不互相复制 Cookie、localStorage 或登录信息；本工具不修改或同步网站自己的语言设置。检测进程使用新的临时空白资料和同样的 WebRTC、显式语言设置，没有复制已有工作区的扩展、策略或其他偏好，回执不能声称完全代表已保存浏览器。
 
 修复只针对当前明确路径下的普通本地 Surge 配置，拒绝托管配置。修改前私有备份并语法校验，执行前重核计划；失败尝试回滚，不覆盖观察到的并发修改。修复可能重载 Surge、改变规则模式或指定组选择，不能描述为只读动作。系统时区、地区、IPv6 和其他无关系统设置不由修复工具自动改动。
 
-`containment.patch_profile` 本身只生成配置文本；`repair-plan`/`repair` 在 `browser_path` 非空时将它接入候选生成，保证专用 `IN-PORT` 与包路径 `PROCESS-NAME REJECT` 排在域名修复之前。范围缺失、错序或当前生效核验失败产生 `scope` 动作，保留原监听入口与无关规则；应用后调用完整 `validate_scope`，失败尝试回滚。发生重载时先进行有界就绪等待（最多约 5 秒的等待间隔，另加查询耗时），确认规则模式、增强模式及首两条规则恢复，再核验完整范围。这个等待不把失败自动转为通过。
+`containment.patch_profile` 本身只生成配置文本；`repair-plan`/`repair` 在 `browser_path` 非空时将它接入候选生成，保证专用 `IN-PORT`、浏览器包路径和已配置的 CLI 路径 `PROCESS-NAME REJECT` 排在域名修复之前。范围缺失、错序或当前生效核验失败产生 `scope` 动作，保留原监听入口与无关规则；应用后调用完整 `validate_scope`，失败尝试回滚。发生重载时先进行有界就绪等待（最多约 5 秒的等待间隔，另加查询耗时），确认规则模式、增强模式及置顶范围规则恢复，再核验完整范围。这个等待不把失败自动转为通过。
 
 无 `browser_path` 时维持常规修复行为。浏览器副本安装和增强模式开启不由修复器自动完成；增强模式未确认时计划包含 `enhanced-required`，写入前阻止执行。规则模式切换仍作为独立动作显示在预览中。模块或临时规则覆盖若没有被本次配置修改解决，应用后的范围核验仍会失败，不能沿用此前通过结果。
 

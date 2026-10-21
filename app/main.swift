@@ -683,7 +683,7 @@ private struct ContentView: View {
 
             Text(vm.settings.browser_path.isEmpty
                  ? "每次启动都会重新检查。工作区分别保存本地 CLI 与浏览器数据，不代表身份隔离；启动检查和进程保护不能替代网络防火墙。"
-                 : "请从这里打开 Claude 专用浏览器或 CLI。专用入口只走指定节点，浏览器旁路请求拒绝；保护需要 Surge 规则模式和增强模式保持开启。个人 Chrome 不受此隔离规则影响。")
+                 : "可从这里启动 Claude；安装终端接管后，Ghostty / Orca 中的 claude 也会先检查线路。专用入口只走指定节点，保护需要 Surge 规则模式和增强模式保持开启。个人 Chrome 不受此隔离规则影响。")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text("Claude Code 登录授权会自动打开专用授权窗口，先检查线路；仅本次登录的本机回调端口可绕过代理。")
@@ -928,7 +928,7 @@ private struct SettingsView: View {
                     TextField("预期出口国家（可选）", text: $vm.draft.expected_country)
                     TextField("预期 ASN（可选）", text: $vm.draft.expected_asn)
                     TextField("专用浏览器语言（可选）", text: $vm.draft.browser_language)
-                    Text("预期项留空时只展示信息。填写后用于检查差异，不会修改系统时区或地区。浏览器语言仅作用于专用网页窗口。")
+                    Text("预期项留空时只展示信息。填写后用于检查差异，不会修改系统时区或地区。浏览器语言作用于专用网页和 OAuth 授权窗口；网站已保存的语言偏好可能需要单独调整。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(18).tabItem { Text("预期环境") }.tag(1)

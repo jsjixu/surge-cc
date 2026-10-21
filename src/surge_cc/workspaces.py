@@ -282,7 +282,11 @@ def _prepare_browser_preferences(profile: Path, config: dict) -> None:
     except (OSError, ValueError):
         raise Blocked("专用浏览器设置无法完整读取，未修改。") from None
     if language:
-        data.setdefault("intl", {})["accept_languages"] = language
+        intl = data.setdefault("intl", {})
+        intl["accept_languages"] = language
+        # Chrome derives its language list from selected_languages on startup.
+        # Keep both preferences aligned so an older selection cannot return.
+        intl["selected_languages"] = language
     webrtc = data.setdefault("webrtc", {})
     webrtc["ip_handling_policy"] = "disable_non_proxied_udp"
     # Chromium's actual preference key is singular: webrtc.ip_handling_url.

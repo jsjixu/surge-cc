@@ -107,8 +107,6 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_hardening_clears_only_webrtc_url_overrides_and_preserves_other_preferences(self):
         loc = ws.paths(self.path, "A")
-        prefs = loc["browser"] / "Default/Preferences"
-        prefs.parent.mkdir()
         original = {
             "intl": {"accept_languages": "zh-CN,en-US", "selected_languages": "zh-CN"},
             "profile": {"name": "saved"}, "other": [1, 2],
@@ -116,19 +114,36 @@ class WorkspaceTests(unittest.TestCase):
                        "ip_handling_url": [{"url": "*", "handling": "default"}],
                        "unrelated": "keep"},
         }
-        prefs.write_text(json.dumps(original))
-        ws.prepare_browser_language(self.path, dict(config(), workspace="A", browser_language=""))
-        changed = json.loads(prefs.read_text())
-        original["webrtc"]["ip_handling_policy"] = "disable_non_proxied_udp"
-        original["webrtc"]["ip_handling_url"] = []
-        self.assertEqual(changed, original)
+        expected = json.loads(json.dumps(original))
+        expected["webrtc"]["ip_handling_policy"] = "disable_non_proxied_udp"
+        expected["webrtc"]["ip_handling_url"] = []
+        for profile, prepare in ((loc["browser"], ws.prepare_browser_language),
+                                 (loc["data"] / "OAuthBrowser", ws.prepare_oauth_browser)):
+            with self.subTest(profile=profile.name):
+                prefs = profile / "Default/Preferences"
+                prefs.parent.mkdir(parents=True)
+                prefs.write_text(json.dumps(original))
+                prepare(self.path, dict(config(), workspace="A", browser_language=""))
+                self.assertEqual(json.loads(prefs.read_text()), expected)
 
     def test_explicit_language_is_applied_with_webrtc_hardening(self):
-        ws.prepare_browser_language(self.path, dict(config(), workspace="A", browser_language="en-US"))
-        prefs = self.root / "workspaces/A/data/Browser/Default/Preferences"
-        self.assertEqual(json.loads(prefs.read_text()), {
-            "intl": {"accept_languages": "en-US"},
-            "webrtc": {"ip_handling_policy": "disable_non_proxied_udp", "ip_handling_url": []}})
+        loc = ws.paths(self.path, "A")
+        original = {
+            "intl": {"accept_languages": "zh-CN,zh", "selected_languages": "zh-CN,zh",
+                     "unrelated": "keep"},
+            "profile": {"name": "saved"}, "other": [1, 2],
+        }
+        expected = json.loads(json.dumps(original))
+        expected["intl"].update(accept_languages="en-US", selected_languages="en-US")
+        expected["webrtc"] = {"ip_handling_policy": "disable_non_proxied_udp", "ip_handling_url": []}
+        for profile, prepare in ((loc["browser"], ws.prepare_browser_language),
+                                 (loc["data"] / "OAuthBrowser", ws.prepare_oauth_browser)):
+            with self.subTest(profile=profile.name):
+                prefs = profile / "Default/Preferences"
+                prefs.parent.mkdir(parents=True)
+                prefs.write_text(json.dumps(original))
+                prepare(self.path, dict(config(), workspace="A", browser_language="en-US"))
+                self.assertEqual(json.loads(prefs.read_text()), expected)
 
     def test_malformed_webrtc_preferences_are_not_overwritten(self):
         loc = ws.paths(self.path, "A")

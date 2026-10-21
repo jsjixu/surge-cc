@@ -238,6 +238,7 @@ class BrowserLanguageReleaseReviewTests(unittest.TestCase):
         ws.prepare_browser_language(self.settings_path, self.settings)
         expected = deepcopy(original)
         expected["intl"]["accept_languages"] = "zh-CN"
+        expected["intl"]["selected_languages"] = "zh-CN"
         expected["webrtc"] = {"ip_handling_policy": "disable_non_proxied_udp", "ip_handling_url": []}
         self.assertEqual(json.loads(prefs.read_text()), expected)
         self.assertEqual(prefs.stat().st_mode & 0o777, 0o600)
@@ -245,7 +246,8 @@ class BrowserLanguageReleaseReviewTests(unittest.TestCase):
     def test_new_profile_language_creates_only_app_owned_preferences(self):
         ws.prepare_browser_language(self.settings_path, self.settings)
         prefs = self.root / "workspaces/A/data/Browser/Default/Preferences"
-        self.assertEqual(json.loads(prefs.read_text()), {"intl": {"accept_languages": "zh-CN"},
+        self.assertEqual(json.loads(prefs.read_text()), {"intl": {
+            "accept_languages": "zh-CN", "selected_languages": "zh-CN"},
             "webrtc": {"ip_handling_policy": "disable_non_proxied_udp", "ip_handling_url": []}})
         self.assertEqual(prefs.stat().st_mode & 0o777, 0o600)
         self.assertEqual(prefs.parent.stat().st_mode & 0o777, 0o700)

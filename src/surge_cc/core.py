@@ -61,7 +61,8 @@ def validate_config(config: dict) -> dict:
         raise Blocked("配置格式不支持，请重新保存设置。")
     allowed = {"schema", "group", "policy", "expected_ip", "proxy_url", "profile_path", "hosts",
                "expected_timezone", "expected_locale", "expected_country", "expected_asn",
-               "browser_language", "privacy_strict", "guard_interval", "workspace", "browser_path"}
+               "browser_language", "privacy_strict", "guard_interval", "workspace", "browser_path",
+               "cli_process_paths"}
     if set(config) - allowed:
         raise Blocked("配置包含不支持的字段。")
     for key in ("group", "policy"):
@@ -99,6 +100,8 @@ def validate_config(config: dict) -> dict:
                 or Path(browser).resolve() == CHROME.resolve()))):
         raise Blocked("专用浏览器必须使用独立应用路径，不能复用个人 Chrome。")
     config["browser_path"] = browser
+    from .containment import validate_cli_process_paths
+    config["cli_process_paths"] = validate_cli_process_paths(config.get("cli_process_paths", []))
     for key in ("expected_timezone", "expected_locale", "expected_country", "expected_asn", "browser_language"):
         val = config.get(key, "")
         if not isinstance(val, str) or len(val) > 100 or any(ord(c) < 32 for c in val):
@@ -162,12 +165,19 @@ def proxy_env(proxy_url: str, base: dict | None = None) -> dict:
 
 
 def default_claude() -> Path:
-    for candidate in (Path.home() / ".local/bin/claude", Path("/opt/homebrew/bin/claude"),
-                      Path("/usr/local/bin/claude")):
+    # Resolve a managed terminal entry back to its verified native executable;
+    # invoking the shim here would recursively launch the guard. Invalid state
+    # raises Blocked instead of silently finding an unprotected alternative.
+    from .terminal import original_claude
+    primary = Path.home() / ".local/bin/claude"
+    managed = original_claude(primary)
+    if managed != primary:
+        return managed
+    for candidate in (primary, Path("/opt/homebrew/bin/claude"), Path("/usr/local/bin/claude")):
         if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
+            return original_claude(candidate)
     path = shutil.which("claude")
-    return Path(path) if path else Path.home() / ".local/bin/claude"
+    return original_claude(Path(path)) if path else primary
 
 
 def split_fields(text: str) -> list[str]:

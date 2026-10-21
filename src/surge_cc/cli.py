@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import datetime as dt
 import json
 import os
@@ -81,19 +82,103 @@ def code_settings_ok(config: dict, cwd: Path, env: dict) -> bool:
             continue
         try:
             settings = json.loads(path.read_text())
-            values = settings.get("env", {})
-            if not isinstance(values, dict) or not provider_environment_ok(values):
+            if isinstance(settings, dict):
+                # User/project auto-remote preference is overridden only in this
+                # protected child. Enterprise-managed policy can outrank CLI
+                # settings, so refuse a managed request to auto-enable remote.
+                if managed_root in path.parents and settings.get("remoteControlAtStartup") is True:
+                    return False
+                settings = {**settings, "remoteControlAtStartup": False}
+            if not launch_settings_safe(config, settings):
                 return False
-            for name, value in values.items():
-                if name.upper() == "BROWSER":
-                    return False
-                if name.lower() in {"http_proxy", "https_proxy", "all_proxy"} and value != config["proxy_url"]:
-                    return False
-                if name.lower() == "no_proxy" and value:
-                    return False
         except (OSError, ValueError, AttributeError, TypeError):
             return False
     return True
+
+
+def launch_settings_safe(config: dict, settings: object) -> bool:
+    """Inspect settings without executing hooks; keep protected env immutable."""
+    if not isinstance(settings, dict) or settings.get("remoteControlAtStartup") is True:
+        return False
+    values = settings.get("env", {})
+    if (not isinstance(values, dict) or
+            any(not isinstance(k, str) or not isinstance(v, str) for k, v in values.items()) or
+            not provider_environment_ok(values)):
+        return False
+    for name, value in values.items():
+        if name.upper() in {"BROWSER", "CLAUDE_CONFIG_DIR"}:
+            return False
+        if name.upper() in {"DISABLE_UPDATES", "DISABLE_AUTOUPDATER"} and value != "1":
+            return False
+        if name.lower() in {"http_proxy", "https_proxy", "all_proxy", "npm_config_proxy", "npm_config_https_proxy"} and value != config["proxy_url"]:
+            return False
+        if name.lower() in {"no_proxy", "npm_config_noproxy"} and value:
+            return False
+    return True
+
+
+def validate_launch_arguments(config: dict, arguments: list[str]) -> None:
+    """Orca's inline settings are allowed only after semantic validation.
+
+    Files are deliberately not accepted here: checking one then handing its path
+    to another process leaves a race with edits after the gate.
+    """
+    for index, arg in enumerate(arguments):
+        flag, sep, value = arg.partition("=")
+        if flag not in {"--settings", "--setting-sources"}:
+            continue
+        if not sep:
+            if index + 1 >= len(arguments):
+                raise Blocked("启动设置缺少参数。")
+            value = arguments[index + 1]
+        if flag == "--settings":
+            try:
+                safe = launch_settings_safe(config, json.loads(value))
+            except (ValueError, TypeError):
+                safe = False
+            if not safe:
+                raise Blocked("启动设置必须是有效的内联 JSON，且不能覆盖代理、浏览器或工作区保护。")
+        else:
+            sources = value.split(",") if value else []
+            if not sources or len(set(sources)) != len(sources) or set(sources) - {"user", "project", "local"}:
+                raise Blocked("无法确认 Claude 设置来源；只接受 user、project、local。")
+
+
+def protected_code_arguments(arguments: list[str]) -> list[str]:
+    """Merge validated inline settings, then force local-only startup in the child.
+
+    The caller must validate each settings object before this transformation.
+    Never edit home/project settings; preserve unrelated Orca settings and env.
+    """
+    settings: dict = {}
+    remaining = []
+    index = 0
+    while index < len(arguments):
+        arg = arguments[index]
+        flag, sep, value = arg.partition("=")
+        if flag != "--settings":
+            remaining.append(arg)
+            index += 1
+            continue
+        if not sep:
+            index += 1
+            if index >= len(arguments):
+                raise Blocked("启动设置缺少参数。")
+            value = arguments[index]
+        try:
+            incoming = json.loads(value)
+        except (ValueError, TypeError):
+            raise Blocked("启动设置必须是有效的内联 JSON。") from None
+        if not isinstance(incoming, dict):
+            raise Blocked("启动设置必须是内联 JSON 对象。")
+        if "env" in incoming:
+            if not isinstance(incoming["env"], dict):
+                raise Blocked("启动设置环境字段无效。")
+            incoming = {**incoming, "env": {**settings.get("env", {}), **incoming["env"]}}
+        settings.update(incoming)
+        index += 1
+    settings["remoteControlAtStartup"] = False
+    return ["--settings", json.dumps(settings, ensure_ascii=False, separators=(",", ":")), *remaining]
 
 
 def terminal_launcher(config_path: Path, arguments: list[str], cwd: Path,
@@ -194,19 +279,33 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
            guarded=run_guarded, web_guard=start_web_guard) -> dict:
     arguments = args[1:] if args[:1] == ["--"] else args
     if target == "code":
+        if os.environ.get("SURGE_CC_TERMINAL_ENTRY") == "1" and (
+                not config.get("cli_process_paths") or not config.get("browser_path")):
+            raise Blocked("终端接管所需的 Claude 进程规则或专用浏览器配置缺失，已阻止启动。")
         claude = default_claude()
         if not claude.is_file() or not os.access(claude, os.X_OK):
             raise Blocked("没有找到 Claude Code 可执行文件，请先完成官方安装。")
-        if any(a in {"--settings", "--setting-sources"} or a.startswith(("--settings=", "--setting-sources="))
-               for a in arguments):
-            raise Blocked("本启动器暂不接受临时覆盖 settings 的参数；请先将配置纳入检查。")
-        remote_commands = {"remote-control", "rc", "remote", "attach", "teleport"}
+        validate_launch_arguments(config, arguments)
+        # A maintenance word used as the immediate print prompt is harmless;
+        # a later --print flag must not pardon an earlier update subcommand.
+        maintenance = any(a in {"update", "upgrade", "install"} and not (
+            i > 0 and arguments[i - 1] in {"-p", "--print"}) for i, a in enumerate(arguments))
+        if maintenance:
+            raise Blocked("终端接管期间不能由 Claude 更新或覆盖命令入口；请先卸载接管，更新后重新安装。")
+        if config.get("cli_process_paths"):
+            from .containment import cli_scope_covers
+            if not cli_scope_covers(config, claude):
+                raise Blocked("当前 Claude 可执行文件不在旁路拒绝范围内，已阻止启动。")
+        remote_commands = {"remote-control", "rc", "remote", "attach", "teleport", "respawn"}
         remote_flags = {"--remote-control", "--remote", "--teleport", "--cloud",
                         "--environment", "--desktop", "--bg", "--background", "--tmux"}
         if any(a in remote_commands or a.split("=", 1)[0] in remote_flags for a in arguments):
             raise Blocked("OAuth 接管仅支持本机独立 CLI；远端或附着会话尚未验证，未启动。")
         code_env = dict(os.environ)
         code_env["CLAUDE_CONFIG_DIR"] = str(workspaces.location(config_path, config["workspace"]) / "data/Claude")
+        external_home = os.environ.get("CLAUDE_CONFIG_DIR")
+        if external_home and Path(external_home).expanduser().resolve() != Path(code_env["CLAUDE_CONFIG_DIR"]).resolve():
+            raise Blocked("调用方指定了另一份 Claude 账号目录；请将 Orca 的 CLAUDE_CONFIG_DIR 与当前 Surge CC 工作区对齐后重试。")
         if not code_settings_ok(config, Path.cwd(), code_env):
             raise Blocked("Claude 的环境或项目配置包含冲突的代理、浏览器或其他模型服务设置，请先检查。")
     else:
@@ -214,7 +313,11 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
             raise Blocked("网页入口不接受额外浏览器参数。")
         if not browser_executable(config).is_file():
             raise Blocked("没有找到 Google Chrome。")
-    report = checker(config)
+    # Terminal/Orca launches retain all mandatory checks but skip the optional
+    # external DNS measurement service, whose latency can stall host handshakes.
+    report = (full_checks(config, external_dns=False)
+              if os.environ.get("SURGE_CC_TERMINAL_ENTRY") == "1" and checker is full_checks
+              else checker(config))
     if not report.get("ok"):
         return report
     loc = workspaces.paths(config_path, config["workspace"])
@@ -234,13 +337,17 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
         env = proxy_env(config["proxy_url"])
         env["CLAUDE_CONFIG_DIR"] = str(loc["claude"])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Native updates replace ~/.local/bin/claude, which is our guarded shim.
+        # Scope this to the child; never change the user's global environment.
+        env["DISABLE_AUTOUPDATER"] = "1"
+        env["DISABLE_UPDATES"] = "1"
         identifier = config["workspace"] + "-" + uuid.uuid4().hex
         folder = (config_path.parent / "sessions").absolute()
         status_path = folder / (identifier + ".status.json")
         receipt_path = folder / (identifier + ".receipt.json")
         with OAuthSession(config, config_path, checker=oauth_checks) as oauth:
             env["BROWSER"] = str(oauth.browser_hook)
-            status = guarded([str(default_claude()), *arguments], env=env, cwd=Path.cwd(),
+            status = guarded([str(default_claude()), *protected_code_arguments(arguments)], env=env, cwd=Path.cwd(),
                              config=config, target="code", status_path=status_path, popen=popen,
                              receipt_path=receipt_path, on_started=oauth.set_child,
                              lock_path=loc["lock"].absolute(), interval=config["guard_interval"],
@@ -323,6 +430,11 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("target", choices=("code", "web"))
     start.add_argument("--terminal", action="store_true")
     start.add_argument("--json", action="store_true")
+    start.add_argument("--passthrough", action="store_true",
+                       help="Keep child stdin/stdout intact; send diagnostics to stderr.")
+    terminal = commands.add_parser("terminal")
+    terminal.add_argument("action", choices=("install", "uninstall", "status", "version"))
+    terminal.add_argument("--json", action="store_true")
     # parse_known_args below accepts extra arguments only after an explicit "--".
     return value
 
@@ -335,11 +447,35 @@ def main(argv: list[str] | None = None) -> int:
         arguments, argv = argv[split + 1:], argv[:split]
     options = parser().parse_args(argv)
     config = None
+    def emit(report):
+        with redirect_stdout(sys.stderr if getattr(options, "passthrough", False) else sys.stdout):
+            print_result(report, options.json)
     try:
         config_path = options.config.expanduser().absolute()
         if arguments and options.command != "launch":
             raise Blocked("只有启动命令接受额外参数。")
-        if options.command == "configure":
+        if options.command == "terminal":
+            from . import terminal
+            if options.action == "version":
+                print(terminal.metadata_version())
+                return 0
+            if options.action == "install":
+                config = load_config(config_path)
+                if not config.get("cli_process_paths"):
+                    raise Blocked("请先配置并验证 Claude 进程旁路拒绝规则，再安装终端接管。")
+                from .containment import validate_scope, cli_scope_covers
+                if not cli_scope_covers(config, default_claude()):
+                    raise Blocked("当前 Claude 程序未被旁路拒绝规则覆盖。")
+                validate_scope(config, Surge())
+                data = terminal.install(config_path, Path(__file__).resolve().parents[2] / "scripts/surge-cc", Path(sys.executable).resolve())
+            elif options.action == "uninstall":
+                data = terminal.uninstall()
+            else:
+                data = terminal.status()
+            report = command_result("Claude 终端入口操作完成", config or {}, terminal=data)
+            if data.get("ok") is False:
+                report.update(ok=False, summary=data.get("summary", "终端入口检查未通过"))
+        elif options.command == "configure":
             existing = load_config(config_path) if config_path.exists() else {}
             candidate = {**existing,
                 "schema": 1, "group": options.group, "policy": options.policy,
@@ -387,15 +523,19 @@ def main(argv: list[str] | None = None) -> int:
                 report = launch(config, config_path, options.target, options.terminal, arguments)
             else:
                 report = full_checks(config)
-        print_result(report, options.json)
+        if not (getattr(options, "passthrough", False) and report.get("launched") and report.get("ok")):
+            emit(report)
+        if getattr(options, "passthrough", False) and report.get("launched"):
+            status = int(report.get("child_exit_code", 2))
+            return status if status >= 0 else 128 - status
         return (int(report.get("child_exit_code", 0)) if report["ok"] else 2)
     except Blocked as exc:
         report = result([row("error", "操作停止", False, str(exc))], config)
-        print_result(report, getattr(options, "json", False))
+        emit(report)
         return 2
     except (OSError, ValueError, TypeError, KeyError):
         report = result([row("error", "操作停止", False, "遇到未完成的系统操作；未自动更改其他网络设置。")], config)
-        print_result(report, getattr(options, "json", False))
+        emit(report)
         return 1
 
 

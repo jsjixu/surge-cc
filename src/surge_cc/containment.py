@@ -1,4 +1,4 @@
-"""Dedicated browser routing scope while Surge rule mode and VIF are active.
+"""Dedicated browser and optional native CLI scope while Surge VIF is active.
 
 This validates Surge's current routing decisions, not an OS firewall. A separate
 Chrome profile using the personal Chrome binary is not a separate process scope.
@@ -17,12 +17,107 @@ from .core import Blocked, CHROME, profile_sections, route_is_fixed, safe_name, 
 BEGIN = "# BEGIN SURGE CC CONTAINMENT"
 END = "# END SURGE CC CONTAINMENT"
 DEFAULT_EXISTING_LISTENER = "127.0.0.1:6152"
+_NATIVE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\Z")
+_MACHO_MAGIC = {b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+                b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
 
 
 def _quoted(value: str) -> str:
     if not isinstance(value, str) or not value or any(c in value for c in '\r\n\0"'):
         raise Blocked("专用线路的名称或路径包含无法安全生成的字符。")
     return '"' + value + '"'
+
+
+def _is_native_cli(binary: Path) -> bool:
+    """Avoid rejecting a shared interpreter when a CLI was installed via npm."""
+    try:
+        if (not binary.is_file() or not os.access(binary, os.X_OK) or
+                binary.resolve(strict=True) != binary):
+            return False
+        with binary.open("rb") as handle:
+            return handle.read(4) in _MACHO_MAGIC
+    except OSError:
+        return False
+
+
+def validate_cli_process_paths(value, *, require_files: bool = False) -> list[str]:
+    """Validate narrow native Claude process scopes, without modifying Surge.
+
+    Only the native install's versions directory may be a directory prefix.
+    Exact paths never target a shared interpreter such as node or python.
+    This verifies process scope, not the publisher or authenticity of a binary.
+    """
+    if not isinstance(value, list) or len(value) > 16:
+        raise Blocked("CLI 进程范围必须是最多 16 个独立路径组成的列表。")
+    result = []
+    versions = Path.home() / ".local/share/claude/versions"
+    for item in value:
+        if (not isinstance(item, str) or not item or
+                any(ord(character) < 32 or ord(character) == 127 for character in item)):
+            raise Blocked("CLI 进程范围包含无效路径。")
+        _quoted(item)
+        prefix = item.endswith("/")
+        path = Path(item)
+        expected = str(path) + ("/" if prefix else "")
+        if (not path.is_absolute() or item != expected or
+                os.path.normpath(str(path)) != str(path) or len(path.parts) < 3):
+            raise Blocked("CLI 进程范围必须使用规范化的绝对路径。")
+        if prefix:
+            if path != versions:
+                raise Blocked("CLI 目录范围只能是当前用户的原生 Claude versions 目录。")
+        elif not (path.name == "claude" or
+                  (path.parent == versions and _NATIVE_VERSION.fullmatch(path.name))):
+            raise Blocked("CLI 文件范围必须指向原生 Claude，不能覆盖通用终端或解释器。")
+        if item in result:
+            raise Blocked("CLI 进程范围包含重复路径。")
+        if require_files:
+            if prefix:
+                try:
+                    valid = path.is_dir() and path.resolve(strict=True) == path
+                except OSError:
+                    valid = False
+                if not valid:
+                    raise Blocked("CLI versions 目录不存在或经过符号链接。")
+            elif not _is_native_cli(path):
+                raise Blocked("CLI 进程范围不是可执行的原生程序，或路径经过符号链接。")
+        result.append(item)
+    return result
+
+
+def _cli_identities(config: dict, *, require_files: bool) -> list[Path]:
+    values = validate_cli_process_paths(config.get("cli_process_paths", []), require_files=require_files)
+    result = []
+    for value in values:
+        path = Path(value)
+        if value.endswith("/"):
+            if not require_files:
+                continue
+            try:
+                candidates = sorted(child for child in path.iterdir() if _NATIVE_VERSION.fullmatch(child.name))
+            except OSError:
+                raise Blocked("无法读取原生 Claude versions 目录。") from None
+            if not candidates or len(candidates) > 64 or any(not _is_native_cli(child) for child in candidates):
+                raise Blocked("原生 Claude versions 目录为空、条目过多或存在无法确认的程序。")
+        else:
+            candidates = [path]
+        for candidate in candidates:
+            if candidate not in result:
+                result.append(candidate)
+    return result
+
+
+def cli_scope_covers(config: dict, executable: Path) -> bool:
+    """Whether the actual native executable lies in the configured reject scope."""
+    values = validate_cli_process_paths(config.get("cli_process_paths", []), require_files=True)
+    try:
+        binary = Path(executable).resolve(strict=True)
+    except OSError:
+        return False
+    if not _is_native_cli(binary):
+        return False
+    return any((binary.is_relative_to(Path(value)) if value.endswith("/") else
+                binary == Path(value)) for value in values)
 
 
 def _browser_identity(config: dict, *, require_files: bool) -> tuple[Path, Path, Path | None]:
@@ -132,10 +227,12 @@ def _listeners(profile: str) -> list[str]:
     return listeners
 
 
-def _expected_rules(config: dict, bundle: Path, port: int) -> tuple[list[str], list[str]]:
+def _expected_rules(config: dict, bundle: Path, port: int) -> tuple[list[str], ...]:
     _quoted(config.get("group"))
     return (["IN-PORT", str(port), config["group"]],
-            ["PROCESS-NAME", str(bundle) + "/", "REJECT"])
+            ["PROCESS-NAME", str(bundle) + "/", "REJECT"],
+            *(["PROCESS-NAME", value, "REJECT"] for value in
+              validate_cli_process_paths(config.get("cli_process_paths", []))))
 
 
 def _rule_fields(line: str) -> list[str]:
@@ -172,6 +269,7 @@ def _rejects(response: dict) -> bool:
 def validate_scope(config: dict, surge) -> None:
     """Reject missing/uncertain dedicated scope; this does not send test traffic."""
     binary, bundle, helper = _browser_identity(config, require_files=True)
+    cli_processes = _cli_identities(config, require_files=True)
     address, port, _ = _endpoint(config)
     status, profile, group = _scope_state(config, surge)
     matched = False
@@ -185,8 +283,8 @@ def validate_scope(config: dict, surge) -> None:
         raise Blocked("生效配置没有专用的本机 HTTP 监听入口。")
     rules = profile_sections(profile).get("rule", [])
     expected = _expected_rules(config, bundle, port)
-    if len(rules) < 2 or tuple(_rule_fields(line) for line in rules[:2]) != expected:
-        raise Blocked("规则开头必须先固定专用入口，再拒绝独立浏览器绕过入口的连接。")
+    if len(rules) < len(expected) or tuple(_rule_fields(line) for line in rules[:len(expected)]) != expected:
+        raise Blocked("规则开头必须先固定专用入口，再拒绝独立浏览器及已配置 CLI 绕过入口的连接。")
     # TCP/UDP include IPv6. Explicit zero listen-port models raw VIF traffic,
     # not a request accepted by the dedicated HTTP listener.
     raw_cases = (
@@ -197,19 +295,19 @@ def validate_scope(config: dict, surge) -> None:
         ("2001:db8::1", "2001:db8::2", "TCP", 443),
         ("2001:db8::1", "2001:db8::2", "UDP", 3478),
     )
-    for process in (binary, helper):
+    for process in (binary, helper, *cli_processes):
         for hostname, source, protocol, destination_port in raw_cases:
             response = surge.call(
                 "rule", "explain", hostname, f"dest-port={destination_port}",
                 f"protocol={protocol}", f"source-address={source}", "source-port=42123",
                 "is-local=on", "listen-port=0", f"process-path={process}")
             if not _rejects(response):
-                role = "主程序" if process == binary else "辅助进程"
+                role = "CLI 程序" if process in cli_processes else ("浏览器主程序" if process == binary else "浏览器辅助进程")
                 family = "IPv6" if ":" in hostname else "IPv4"
                 observed = {key: response.get(key) for key in ("rule-policy", "final", "final-type")}
                 details = "；".join(f"{key}={value if safe_name(value) else '未知'}"
                                    for key, value in observed.items())
-                raise Blocked(f"独立浏览器存在未被拒绝或无法确认的原始路径：{role} {family} {protocol}。{details}")
+                raise Blocked(f"专用程序存在未被拒绝或无法确认的原始路径：{role} {family} {protocol}。{details}")
         for hostname, protocol, destination_port in (
                 ("example.com", "HTTP", 80), ("api.anthropic.com", "HTTPS", 443)):
             response = surge.call(
@@ -239,11 +337,16 @@ def _remove_owned_blocks(lines: list[str]) -> list[str]:
                 raise Blocked("专用范围规则结束标记缺少开头。")
             active = [item.strip() for item in block
                       if item.strip() and not item.lstrip().startswith(("#", ";", "//"))]
-            if (len(active) != 2 or _rule_fields(active[0])[:1] != ["IN-PORT"] or
+            if (len(active) < 2 or _rule_fields(active[0])[:1] != ["IN-PORT"] or
                     len(_rule_fields(active[0])) != 3 or
                     _rule_fields(active[1])[:1] != ["PROCESS-NAME"] or
                     len(_rule_fields(active[1])) != 3 or _rule_fields(active[1])[-1] != "REJECT"):
                 raise Blocked("受管理规则段包含未知内容，请人工确认后再生成。")
+            for line in active[2:]:
+                fields = _rule_fields(line)
+                if len(fields) != 3 or fields[0] != "PROCESS-NAME" or fields[2] != "REJECT":
+                    raise Blocked("受管理 CLI 规则段包含未知内容，请人工确认后再生成。")
+                validate_cli_process_paths([fields[1]])
             block = None
             continue
         if block is not None:
@@ -365,10 +468,8 @@ def patch_profile(text: str, config: dict) -> str:
         if index == rule_header:
             if not output[-1].endswith(("\n", "\r")):
                 output[-1] += newline
-            output.extend([
-                BEGIN + newline,
-                f"IN-PORT,{expected[0][1]},{_quoted(expected[0][2])}" + newline,
-                f"PROCESS-NAME,{_quoted(expected[1][1])},REJECT" + newline,
-                END + newline,
-            ])
+            output.extend([BEGIN + newline,
+                           f"IN-PORT,{expected[0][1]},{_quoted(expected[0][2])}" + newline])
+            output.extend(f"PROCESS-NAME,{_quoted(rule[1])},REJECT" + newline for rule in expected[1:])
+            output.append(END + newline)
     return "".join(output)

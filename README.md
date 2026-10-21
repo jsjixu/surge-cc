@@ -6,7 +6,7 @@
 
 启动前核对节点和实际出口，检查 DNS 与 WebRTC，通过专用浏览器打开网页及 OAuth 授权，并在运行期间持续检查线路。提供原生 macOS 窗口和命令行。
 
-当前版本：**0.2.3** · macOS 13+ · 发布包为 Apple Silicon · 界面以中文为主
+当前源码版本：**0.2.4（Build 6）** · macOS 13+ · 发布包为 Apple Silicon · 界面以中文为主
 
 Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方隶属关系。它管理本地连接和程序，不提供代理节点，也不保证账号状态或服务资格。
 
@@ -19,6 +19,7 @@ Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方�
 | 固定线路 | 核对单节点策略组、实际选中节点、规则和精确公网出口；不自动接受变化后的 IP |
 | 专用网页窗口 | 使用独立 Chrome 应用副本及独立资料目录；通过专用 HTTP 入口访问，核对浏览器旁路拒绝规则 |
 | Claude Code 启动 | 注入专用代理环境，启动前复核线路；保留项目目录及终端交互 |
+| 终端入口接管 | 可选安装到现有 `claude` 命令，供 Ghostty、Orca 终端和其他调用该入口的本机终端使用 |
 | OAuth 授权 | 从受控 CLI 自动打开专用授权窗口；打开前检查线路，仅放行本次登录的精确本机回调端口 |
 | DNS 检查 | 分别检查本机接管迹象和专用代理链的外部 DNS 观测；0.2.3 新增随机域名实测 |
 | WebRTC 检查 | 通过临时 Chrome 收集真实 ICE 候选；发现额外公网地址时阻止启动 |
@@ -47,7 +48,9 @@ Surge CC 的界面最低系统版本不代表各外部依赖都支持所有旧�
 
 ### 2. 安装应用
 
-在 [Releases](https://github.com/jsjixu/surge-cc/releases/latest) 下载 `Surge-CC-0.2.3-arm64.zip`，核对同一版本提供的 SHA-256 校验值，解压后将 `Surge CC.app` 放入 `/Applications`。
+在 [Releases](https://github.com/jsjixu/surge-cc/releases/latest) 下载对应版本的 `Surge-CC-<版本>-arm64.zip`，核对同一版本提供的 SHA-256 校验值，解压后将 `Surge CC.app` 放入 `/Applications`。源码版本与最新公开安装包可能不同，以 Release 页面为准。
+
+**先放到最终安装位置，再配置终端接管。**接管记录会固定应用内后端、Python 和配置文件的绝对路径；不要从下载临时目录安装接管后再移动应用。使用其他安装位置时，后续命令中的 `/Applications/Surge CC.app` 也要相应替换。
 
 发布包只包含 Surge CC，**不包含 Chrome、Python、Claude Code、Surge、节点配置或账号数据**。Intel Mac 可尝试从源码构建；当前发布包和真机验收为 Apple Silicon，不承诺 Intel 已验证。
 
@@ -96,7 +99,7 @@ python3 "$SURGE_CC" configure \
 
 打开 Surge CC，进入「保护」中的修复功能，先查看修复计划，再确认应用。修复器可补充专用监听入口、固定域名规则及浏览器旁路拒绝规则；会备份并校验本地配置，重载可能造成短暂重连。
 
-专用范围的核心规则形如下例，并应位于生效规则的前两条：
+专用范围的核心规则形如下例，并应位于生效规则的最前面：
 
 ```ini
 IN-PORT,62919,"Claude"
@@ -104,6 +107,8 @@ PROCESS-NAME,"/absolute/path/Surge CC Browser.app/",REJECT
 ```
 
 第一条把专用入口固定到指定组；第二条拒绝被 Surge 接管、但绕过该入口的专用浏览器连接。尾部 `/` 使范围包含应用内的辅助进程。修复器保留原监听入口和无关规则，不需要为了使用本工具删除其他节点。
+
+安装终端接管时，还需在这两条后添加原生 Claude 程序的旁路拒绝范围，步骤见下文。
 
 修复后点击 **「检查线路与隐私」**。展开未通过或未确认项查看依据。必需检查通过后，选择项目目录，再使用「打开 Claude 网页」或「启动 Claude Code」。每次启动都会重新检查，不能凭上一次的绿色状态跳过。
 
@@ -119,17 +124,65 @@ PROCESS-NAME,"/absolute/path/Surge CC Browser.app/",REJECT
 - **固定节点：** 「固定指定节点」选择已有单节点组中的目标并重新检查，不修改配置文本。
 - **查看保护：** 刷新保护状态，查看最近心跳及时间。关闭 Surge CC 窗口不等于关闭独立网页监控。
 
-个人 Chrome、直接运行的 `claude` 和其他入口不自动纳入保护。
+个人 Chrome 不受这些启动规则影响。未安装终端接管时，直接运行 `claude` 不会经过启动检查；安装后，调用被接管的同一个命令入口才会自动检查。
+
+### 在 Ghostty、Orca 等终端中直接运行
+
+0.2.4 提供可选的终端接管。它原子替换当前用户的 `~/.local/bin/claude` 符号链接入口，保存原链接和原始程序信息；不修改整个终端应用的代理，也不改变其他节点或普通浏览器。
+
+安装前先正常结束已有 Claude Code 会话，并确认：
+
+1. 使用官方原生安装，`~/.local/bin/claude` 目前是符号链接；其他安装布局会拒绝自动接管。
+2. Surge CC 的 `config.json` 已设置 `cli_process_paths`。常见原生安装使用当前用户 `~/.local/share/claude/versions/` 的**完整绝对路径，并保留尾部 `/`**。不能填写 `~`，也不能把范围设成 Ghostty、Orca、Node、Python 或整个主目录。
+3. 执行 `repair-plan` 查看新增的 Claude 程序路径 `PROCESS-NAME,...,REJECT` 规则，确认后执行 `repair`；随后检查通过。这个范围拒绝被 Surge 接管、却没有经过专用入口的原生 Claude 连接。
+
+以发布包为例：
+
+```sh
+SURGE_CC="/Applications/Surge CC.app/Contents/Resources/scripts/surge-cc"
+python3 "$SURGE_CC" terminal install --json
+python3 "$SURGE_CC" terminal status --json
+```
+
+安装命令会先确认程序范围及生效规则，才替换命令入口。此后在项目目录正常执行 `claude`、`claude --resume` 或 `claude auth login`，会先经过 Surge CC 检查；登录使用专用 OAuth 浏览器。检查失败时不运行原版 CLI，也不回退到其他命令或浏览器。标准输入和输出保留给 Claude，接管提示及错误写入标准错误。
+
+已实测 Orca 内置终端与交互式 zsh。Ghostty 窗口因测试工具限制未操作，Orca 新建 Claude 按钮在测试环境中被禁用；接管按命令路径生效，不依赖终端窗口名称。Orca 若设置了其他 Claude 可执行路径，需要先改回被接管的入口；远端 Orca 不在这台 Mac 的接管范围。**Orca Native Chat 和 managed accounts 的账号目录、恢复历史及完整流程尚未验收，不应视作已支持。**工具仍使用所选 Surge CC 工作区的 Claude 数据目录，不会自动导入原有 `~/.claude` 登录和会话。
+
+**Devin CLI 等其他客户端即使用了 Claude 模型，也不会因此被这个 `claude` 入口接管。**本工具不通过模型名称识别或接管其他程序。
+
+`claude --version` / `claude -v` 仅读取安装时记录并校验过的本地版本，不启动原生程序，也不表示线路检查通过。安装入口变动、备份缺失或原始二进制变化时会拒绝运行；不要手工覆盖包装器。
+
+终端接管保留所有启动必需检查，但跳过可选的外部 DNS 测量，减少终端宿主等待时间。需要查看完整 DNS 观测时，从 GUI 执行「检查线路与隐私」或运行 `check`。
+
+### 更新 Claude Code 或撤销终端接管
+
+受控 CLI 子进程设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`，并拒绝 `claude update`、`upgrade`、`install`，避免更新器覆盖受控入口。仅对该子进程生效，不修改全局环境。
+
+需要更新时，先正常结束受控会话，运行 `terminal uninstall` 恢复原始链接；按官方方式维护 Claude Code，再核对原生程序路径、重新检查规则，运行 `terminal install`。维护期间入口没有 Surge CC 启动保护。升级或移动 Surge CC 应用本身，也应先卸载旧入口、再从新位置安装。
+
+```sh
+python3 "$SURGE_CC" terminal uninstall --json
+```
+
+卸载只恢复自己接管且未被外部改写的入口，不删除工作区、登录资料或项目；不会自动删除 Surge 中的旁路拒绝规则。
 
 ### OAuth 登录
 
-从 Surge CC 启动本机 Claude Code，按官方 CLI 的提示登录即可，无需先打开网页，也无需修改系统默认浏览器。
+从 Surge CC 启动本机 Claude Code，或在安装终端接管后执行 `claude auth login`，按官方 CLI 的提示登录即可，无需先打开网页，也无需修改系统默认浏览器。
 
 工具只向这个 CLI 注入私有 `BROWSER` 打开器。收到符合要求的官方授权链接后，核对线路与实际出口，再打开专用授权窗口。普通网页与 OAuth 使用同一独立 Chrome 应用的不同资料目录，首次授权可能需要重新登录。
 
 仅本次授权的精确回调端口可直连，且须确认监听者是当前受控 CLI；不会开放整个 localhost 或局域网。检查失败时拒绝打开，CLI 结束时关闭它持有的授权窗口。
 
 CLI 仍负责 state、PKCE、令牌交换及凭据保存。Surge CC 的启动脚本和状态回执不记录授权 URL、state 或授权码；浏览器登录资料仍由 Chrome 管理。远端、附着、桌面及后台等不支持的入口会被阻止；第三方 MCP OAuth 不在授权白名单中。
+
+如果用户或项目设置启用了 `remoteControlAtStartup`，受保护启动会仅为本次子进程合并 `remoteControlAtStartup:false`，不修改原设置文件。显式 CLI 参数要求远端启动，或企业托管设置强制开启时，仍拒绝启动。
+
+### 专用浏览器语言
+
+在设置中的「专用浏览器语言」填写 `en-US` 可选择美式英语；其他合法语言标签同样支持。正常关闭专用网页和授权窗口后，下次通过受控入口启动时会分别更新它们的浏览器语言。0.2.4 同时写入 Chrome 的语言列表和选中语言，避免旧选中值在重启后覆盖新设置。留空会保留各资料目录原有的语言偏好，不修改个人 Chrome 或系统语言。
+
+**网站界面语言可能另有保存值。**浏览器使用英语并不保证 Claude 页面立即使用英语：网站自己的 Cookie、localStorage 或账号语言偏好可能继续生效。Surge CC 不会自动删除、改写或同步这些网站数据，也不会同步网页窗口和 OAuth 窗口的登录状态。需要时在对应窗口的站点语言设置中单独调整。
 
 ### 快照与恢复
 
@@ -160,6 +213,8 @@ DNS 的地区及 Anycast 标签不单独作为泄漏依据。权威端看到解�
 ## 断线保护的范围
 
 专用入口固定到只有一个节点的组，不配置自动备用出口；浏览器同时使用显式 HTTP 代理、禁用 QUIC、限制非代理 WebRTC UDP，并核验 Surge 对专用应用旁路连接的拒绝规则。
+
+终端接管增加两层约束：被接管的命令先检查再启动；配置中的原生 Claude 程序路径在 Surge 内拒绝绕过专用入口的连接。直接执行原始版本二进制仍可能启动进程，但其被 Surge 接管的旁路流量应命中拒绝规则。命令接管不等于操作系统禁止运行原始程序，路径规则也不会自动覆盖复制到其他位置的二进制或共享解释器下的其他安装。
 
 运行监控默认每 **10 秒**检查一次，实际出口目标复查间隔至少 **30 秒**，检测命令自身耗时会延长间隔。发现异常或无法确认时，尝试结束它持有的程序并记录结果，不通过进程名关闭个人 Chrome。
 
@@ -211,8 +266,19 @@ DNS 的地区及 Anycast 标签不单独作为泄漏依据。权威端看到解�
 | `sessions/` | 会话配置副本、启动回执及监控状态 |
 | `repair-backups/` | 修复前配置备份，可能含代理凭据 |
 | `launchers/` | 用后清理的临时 Terminal 启动脚本 |
+| `terminal/` | 终端接管清单、原始链接备份及锁；默认位于本工具的 Application Support 目录 |
 
 检查会在内存中读取可能包含节点凭据的 Surge 配置，不输出完整配置。JSON 诊断仍可能含本地路径、组名及真实出口 IP，分享前需要脱敏。不要将工作区、快照、配置、备份或 `.local/` 上传到公开仓库。
+
+### 项目文件与旧会话的边界
+
+`CLAUDE_CONFIG_DIR` 将原生 CLI 的默认数据位置指向所选工作区，**不是文件系统沙箱，也不是内容脱敏器**。CLI 仍在原项目目录运行，可能加载项目及上级目录的指令、设置或记忆，或通过工具读取源码、日志、Git 历史和可访问的其他文件。`--resume`、`--continue` 等参数没有被统一禁用；本工具不会筛除恢复会话中的资料。
+
+启动器会继承终端环境并覆盖受保护的代理、浏览器打开器、工作区和更新变量；它不会清空所有环境变量，也不移除所有 API Key 或其他凭据。配置检查关注与受控启动冲突的设置，不等同于对 hooks、MCP、工程文件或数据内容完成安全审计。
+
+需要减少旧资料进入新会话时，可另建经过审阅的工作副本，只保留源码、测试、必要文档和技术交接摘要，并使用新会话。需要阻止工具读取副本外的资料时，还应配置实际的文件访问限制；新文件夹、Git worktree、`.gitignore` 或 A/B 工作区本身不提供这一保证。提供给云端模型理解的代码和上下文仍会发送给模型服务。
+
+### 外部检查服务
 
 检查涉及以下外部服务：
 
@@ -239,6 +305,9 @@ DNS 观测每次新建测试，不复用旧报告，不直连回退、不跟随�
 ./scripts/surge-cc launch code --terminal --json
 ./scripts/surge-cc launch code -- --resume
 ./scripts/surge-cc guard-status --json
+./scripts/surge-cc terminal install --json
+./scripts/surge-cc terminal status --json
+./scripts/surge-cc terminal uninstall --json
 
 ./scripts/surge-cc workspace list --json
 ./scripts/surge-cc workspace use --name B --json
@@ -253,7 +322,7 @@ DNS 观测每次新建测试，不复用旧报告，不直连回退、不跟随�
 
 `configure` 还支持 `--expected-timezone`、`--expected-locale`、`--expected-country`、`--expected-asn` 和 `--browser-language`，用空字符串清除预期值。再次配置时需继续传入要保留的 `--profile`，否则清空该路径；省略 `--browser-path` 保留旧值，显式空字符串则取消独立应用范围设置。
 
-Claude Code 参数须位于 `--` 后，不允许临时 `--settings` 或 `--setting-sources` 绕过检查。成功退出码 `0`，检查阻止或受监控会话非零结束为 `2`，捕获的系统错误为 `1`；详细 JSON 和退出码约定见 [INTERFACE.md](INTERFACE.md)。
+Claude Code 参数须位于 `--` 后。`--settings` 只接受通过语义检查的内联 JSON，不接受临时设置文件路径；`--setting-sources` 只接受 `user`、`project`、`local` 的非空、无重复组合。不能覆盖专用代理、浏览器打开器、工作区或更新限制。成功退出码 `0`，检查阻止或普通报告模式的受监控会话非零结束为 `2`，捕获的系统错误为 `1`；终端的 `--passthrough` 模式保留已启动子进程的退出码。详细 JSON 和退出码约定见 [INTERFACE.md](INTERFACE.md)。
 
 ## 从源码构建
 
@@ -264,12 +333,12 @@ git clone https://github.com/jsjixu/surge-cc.git
 cd surge-cc
 python3 -m unittest discover -s tests -v
 ./scripts/test-gui.sh
-SURGE_CC_APP_NAME='Surge CC 0.2.3.app' ./scripts/build-app.sh
+SURGE_CC_APP_NAME='Surge CC 0.2.4.app' ./scripts/build-app.sh
 ```
 
-输出为 `dist/Surge CC 0.2.3.app`，只构建当前机器架构，使用 ad-hoc 签名。构建不会安装、启动应用或修改代理。已有同名输出会被拒绝；用 `SURGE_CC_APP_NAME` 或 `SURGE_CC_DIST_DIR` 选择新文件名或目录，不会覆盖正在使用的应用。
+输出为 `dist/Surge CC 0.2.4.app`，只构建当前机器架构，使用 ad-hoc 签名。构建不会安装、启动应用或修改代理。已有同名输出会被拒绝；用 `SURGE_CC_APP_NAME` 或 `SURGE_CC_DIST_DIR` 选择新文件名或目录，不会覆盖正在使用的应用。
 
-0.2.3 的发布验收记录包括 **291 项 Python 测试**、Swift GUI 契约测试、构建及签名核验，以及专用线路 DNS 真机观测。测试条件和未覆盖范围见 [VALIDATION.md](VALIDATION.md)。
+各版本的测试数量、构建与真机验收条件，以及未覆盖的范围见 [VALIDATION.md](VALIDATION.md)。
 
 反馈问题时请提供版本、macOS / Surge / Chrome 版本、复现步骤和脱敏后的具体检查项；不要附登录令牌、完整代理配置、个人路径或工作区快照。参与开发请阅读 [贡献说明](CONTRIBUTING.md)。
 

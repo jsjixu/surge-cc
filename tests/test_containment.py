@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from test_core import config, group, profile, route
 from surge_cc import containment as scope
@@ -20,6 +21,7 @@ class FakeSurge:
         self.bad_protocol = None
         self.bad_process = None
         self.bad_entry = False
+        self.bad_entry_process = None
         self.final_text = None
         self.profile_reads = 0
         self.reject_final = "REJECT"
@@ -39,7 +41,8 @@ class FakeSurge:
         fields = dict(item.split("=", 1) for item in args[3:])
         self.assert_command(args)
         if fields.get("listen-port") == "62919":
-            return {"final": "DIRECT"} if self.bad_entry else route()
+            return ({"final": "DIRECT"} if self.bad_entry or
+                    fields.get("process-path") == self.bad_entry_process else route())
         if (fields.get("protocol") == self.bad_protocol or
                 fields.get("process-path") == self.bad_process):
             return {"rule-policy": "DIRECT", "final": "DIRECT", "final-type": "DIRECT", "steps": []}
@@ -75,6 +78,138 @@ class ScopeTests(unittest.TestCase):
             "[Rule]\nDOMAIN-SUFFIX,unrelated.example,DIRECT\nFINAL,DIRECT\n")
         self.patched = scope.patch_profile(self.original, self.settings)
         self.surge = FakeSurge(self.settings, self.patched)
+
+    def enable_cli_scope(self, *, exact=False):
+        home = patch.object(scope.Path, "home", return_value=self.root)
+        home.start()
+        self.addCleanup(home.stop)
+        self.versions = self.root / ".local/share/claude/versions"
+        self.versions.mkdir(parents=True)
+        self.cli_binary = self.versions / "2.1.296"
+        self.cli_binary.write_bytes(b"\xcf\xfa\xed\xfe" + b"native fixture; never executed")
+        self.cli_binary.chmod(0o700)
+        self.settings["cli_process_paths"] = [str(self.cli_binary) if exact else str(self.versions) + "/"]
+        self.patched = scope.patch_profile(self.original, self.settings)
+        self.surge = FakeSurge(self.settings, self.patched)
+
+    def test_native_cli_prefix_adds_only_scoped_reject_after_browser(self):
+        self.enable_cli_scope()
+        rules = scope.profile_sections(self.patched)["rule"]
+        self.assertEqual(scope._rule_fields(rules[0]), ["IN-PORT", "62919", "Claude"])
+        self.assertEqual(scope._rule_fields(rules[1]), ["PROCESS-NAME", str(self.bundle) + "/", "REJECT"])
+        self.assertEqual(scope._rule_fields(rules[2]), ["PROCESS-NAME", str(self.versions) + "/", "REJECT"])
+        self.assertEqual(rules[3:], ["DOMAIN-SUFFIX,unrelated.example,DIRECT", "FINAL,DIRECT"])
+        self.assertIn("http-listen = 127.0.0.1:6152, 127.0.0.1:62919", self.patched)
+        self.assertIn("socks5-listen = 127.0.0.1:6153", self.patched)
+        self.assertEqual(scope.patch_profile(self.patched, self.settings), self.patched)
+        scope.validate_scope(self.settings, self.surge)
+        self.assertEqual(len(self.surge.calls), 24)
+        fields = [dict(item.split("=", 1) for item in call[3:]) for call in self.surge.calls]
+        cli_fields = [item for item in fields if item["process-path"] == str(self.cli_binary)]
+        self.assertEqual(len(cli_fields), 8)
+        self.assertEqual({item["listen-port"] for item in cli_fields}, {"0", "62919"})
+        self.assertEqual({item["protocol"] for item in cli_fields}, {"TCP", "UDP", "STUN", "QUIC", "HTTP", "HTTPS"})
+
+    def test_native_cli_exact_file_scope_is_supported(self):
+        self.enable_cli_scope(exact=True)
+        scope.validate_scope(self.settings, self.surge)
+        self.assertEqual(len(self.surge.calls), 24)
+        self.assertTrue(scope.cli_scope_covers(self.settings, self.cli_binary))
+
+    def test_new_native_version_is_checked_without_changing_prefix_rule(self):
+        self.enable_cli_scope()
+        updated = self.versions / "2.1.297"
+        updated.write_bytes(self.cli_binary.read_bytes())
+        updated.chmod(0o700)
+        self.assertTrue(scope.cli_scope_covers(self.settings, updated))
+        scope.validate_scope(self.settings, self.surge)
+        self.assertEqual(len(self.surge.calls), 32)
+        self.assertEqual(scope.patch_profile(self.original, self.settings), self.patched)
+
+    def test_cli_reject_and_explicit_proxy_are_both_verified(self):
+        self.enable_cli_scope()
+        self.surge.bad_process = str(self.cli_binary)
+        with self.assertRaisesRegex(Blocked, "CLI 程序"):
+            scope.validate_scope(self.settings, self.surge)
+        self.surge.bad_process = None
+        self.surge.bad_entry_process = str(self.cli_binary)
+        with self.assertRaisesRegex(Blocked, "专用 HTTP 入口"):
+            scope.validate_scope(self.settings, self.surge)
+
+    def test_cli_missing_or_reordered_reject_rule_blocks(self):
+        self.enable_cli_scope()
+        line = f'PROCESS-NAME,"{self.versions}/",REJECT\n'
+        self.surge.text = self.patched.replace(line, "")
+        with self.assertRaises(Blocked):
+            scope.validate_scope(self.settings, self.surge)
+        self.surge.text = self.patched.replace(line, "").replace("FINAL,DIRECT", line + "FINAL,DIRECT")
+        with self.assertRaises(Blocked):
+            scope.validate_scope(self.settings, self.surge)
+        self.assertEqual(self.surge.calls, [])
+
+    def test_cli_paths_reject_overbroad_interpreter_and_malformed_scopes(self):
+        self.enable_cli_scope()
+        bad = [None, "claude", ["/"], [str(self.root) + "/"], ["/usr/bin/"],
+               ["/usr/bin/python3"], ["/usr/local/bin/node"], ["/bin/zsh"],
+               [str(self.bundle) + "/"], ["relative/claude"], ["/tmp/../bin/claude"],
+               ["/tmp//bin/claude"], ["/tmp/claude\n"], ['/tmp/a"/claude'],
+               [str(self.versions) + "/"] * 2, [str(self.versions) + "/"] * 17]
+        for value in bad:
+            with self.subTest(value=value), self.assertRaises(Blocked):
+                scope.patch_profile(self.original, dict(self.settings, cli_process_paths=value))
+
+    def test_cli_shared_interpreter_script_or_symlink_is_not_a_native_identity(self):
+        self.enable_cli_scope(exact=True)
+        self.cli_binary.write_text("#!/usr/bin/env node\n")
+        with self.assertRaises(Blocked):
+            scope.validate_scope(self.settings, self.surge)
+        self.cli_binary.unlink()
+        outside = self.root / "claude"
+        outside.write_bytes(b"\xcf\xfa\xed\xfe")
+        outside.chmod(0o700)
+        self.cli_binary.symlink_to(outside)
+        with self.assertRaises(Blocked):
+            scope.validate_scope(self.settings, self.surge)
+        self.assertEqual(self.surge.calls, [])
+
+    def test_native_prefix_requires_usable_canonical_installed_binary(self):
+        self.enable_cli_scope()
+        self.cli_binary.unlink()
+        with self.assertRaises(Blocked):
+            scope.validate_scope(self.settings, self.surge)
+        self.cli_binary.write_text("#!/bin/sh\n")
+        self.cli_binary.chmod(0o700)
+        with self.assertRaises(Blocked):
+            scope.validate_scope(self.settings, self.surge)
+        self.assertEqual(self.surge.calls, [])
+
+    def test_cli_scope_coverage_resolves_entry_symlink_and_refuses_other_install(self):
+        self.enable_cli_scope()
+        alias = self.root / ".local/bin/claude"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(self.cli_binary)
+        self.assertTrue(scope.cli_scope_covers(self.settings, alias))
+        outside = self.root / "claude"
+        outside.write_bytes(self.cli_binary.read_bytes())
+        outside.chmod(0o700)
+        self.assertFalse(scope.cli_scope_covers(self.settings, outside))
+        self.assertFalse(scope.cli_scope_covers(self.settings, self.root / "missing"))
+        self.assertFalse(scope.cli_scope_covers(dict(self.settings, cli_process_paths=[]), self.cli_binary))
+
+    def test_unrecognized_extra_owned_reject_rule_is_not_removed(self):
+        self.enable_cli_scope()
+        for path in ("/usr/bin/node", "/Users/", str(self.root) + "/"):
+            source = self.patched.replace(scope.END, f'PROCESS-NAME,"{path}",REJECT\n' + scope.END)
+            with self.subTest(path=path), self.assertRaises(Blocked):
+                scope.patch_profile(source, self.settings)
+
+    def test_disabling_cli_scope_only_removes_owned_cli_rules(self):
+        self.enable_cli_scope()
+        disabled = scope.patch_profile(self.patched, dict(self.settings, cli_process_paths=[]))
+        self.assertNotIn(str(self.versions), disabled)
+        self.assertIn(str(self.bundle), disabled)
+        self.assertIn("DOMAIN-SUFFIX,unrelated.example,DIRECT\nFINAL,DIRECT\n", disabled)
+        self.assertEqual(disabled, scope.patch_profile(self.original, dict(self.settings, cli_process_paths=[])))
 
     def test_valid_scope_checks_main_helper_and_raw_ipv4_ipv6_without_network(self):
         scope.validate_scope(self.settings, self.surge)

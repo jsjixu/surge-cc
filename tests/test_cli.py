@@ -101,14 +101,31 @@ class LaunchTests(unittest.TestCase):
         spawn.assert_not_called()
 
     def test_temporary_settings_overrides_rejected_before_check_or_launch(self):
-        for args in (["--settings", "settings.json"], ["--settings={}"],
-                     ["--setting-sources", "project"], ["--setting-sources=user"]):
+        for args in (["--settings", "settings.json"], ["--settings=[]"],
+                     ["--setting-sources", "remote"], ["--setting-sources=user,user"],
+                     ["--settings", '{"env":{"BROWSER":"open"}}']):
             with self.subTest(args=args):
                 checker, spawn = Mock(), Mock()
                 with self.assertRaises(core.Blocked):
                     cli.launch(config(), self.config_path, "code", False, args, checker=checker, popen=spawn)
                 checker.assert_not_called()
                 spawn.assert_not_called()
+
+    def test_orca_inline_settings_are_validated_without_blocking_safe_flags(self):
+        cli.validate_launch_arguments(config(), ["--setting-sources=user,project,local",
+            "--settings", '{"disableAllHooks":true}', "--strict-mcp-config"])
+        for field, value in (("HTTPS_PROXY", "http://127.0.0.1:6153"),
+                             ("NO_PROXY", "*"), ("BROWSER", "open"),
+                             ("DISABLE_UPDATES", "0"), ("CLAUDE_CONFIG_DIR", "/tmp/other")):
+            with self.subTest(field=field), self.assertRaises(core.Blocked):
+                cli.validate_launch_arguments(config(), ["--settings=" + json.dumps({"env": {field: value}})])
+
+    def test_update_cannot_replace_guarded_entry(self):
+        for command in ("install", "update", "upgrade"):
+            checker = Mock()
+            with self.subTest(command=command), self.assertRaises(core.Blocked):
+                cli.launch(config(), self.config_path, "code", False, [command], checker=checker)
+            checker.assert_not_called()
 
     def test_conflicting_provider_settings_rejected_before_launch(self):
         checker, spawn = Mock(), Mock()

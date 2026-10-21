@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import socket
@@ -133,9 +134,11 @@ class SessionTests(unittest.TestCase):
 
         def stop(child):
             child.poll.return_value = 0
-        self.stop = self.enterContext(patch.object(oauth, "stop_owned_child", side_effect=stop))
-        self.owner = self.enterContext(patch.object(oauth, "callback_owned_by", return_value=True))
-        self.prepare = self.enterContext(patch.object(
+        self.patches = ExitStack()
+        self.addCleanup(self.patches.close)
+        self.stop = self.patches.enter_context(patch.object(oauth, "stop_owned_child", side_effect=stop))
+        self.owner = self.patches.enter_context(patch.object(oauth, "callback_owned_by", return_value=True))
+        self.prepare = self.patches.enter_context(patch.object(
             workspaces, "prepare_oauth_browser", create=True, return_value=self.profile))
 
     def session(self):
