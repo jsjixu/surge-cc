@@ -146,7 +146,13 @@ def _read(folder: Path):
     if not backup.is_symlink() or os.readlink(backup) != data["original_link"]:
         raise Blocked("终端集成的原始入口备份被修改，已阻止启动。")
     expected = (Path(data["command_path"]).parent / data["original_link"]).resolve()
-    if expected != Path(data["original_path"]) or _identity(expected) != data["original_stat"]:
+    # st_dev identifies the current mount, not a persistent volume identity; on
+    # macOS it can change across a reboot/remount while the file is unchanged.
+    # Retain the four-field schema for existing installations, but compare only
+    # inode, size and mtime here. _identity still checks the path, owner, mode and
+    # executability. Short-lived race/atomic-exchange checks below must continue
+    # comparing st_dev as well, because both snapshots share the same mount.
+    if expected != Path(data["original_path"]) or _identity(expected)[1:] != data["original_stat"][1:]:
         raise Blocked("原始 Claude 程序已变化；请通过维护流程重新安装终端集成。")
     return data
 

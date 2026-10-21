@@ -6,7 +6,7 @@
 
 启动前核对节点和实际出口，检查 DNS 与 WebRTC，通过专用浏览器打开网页及 OAuth 授权，并在运行期间持续检查线路。提供原生 macOS 窗口和命令行。
 
-当前版本：**0.2.5（Build 8）** · macOS 13+ · Apple Silicon 安装包 · 界面以中文为主
+当前版本：**0.2.6（Build 9）** · macOS 13+ · Apple Silicon 安装包 · 界面以中文为主
 
 Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方隶属关系。它管理本地连接和程序，不提供代理节点，也不保证账号状态或服务资格。
 
@@ -162,13 +162,30 @@ python3 "$SURGE_CC" terminal status --json
 
 受控 CLI 子进程设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`，并拒绝 `claude update`、`upgrade`、`install`，避免更新器覆盖受控入口。仅对该子进程生效，不修改全局环境。
 
-需要更新时，先正常结束受控会话，运行 `terminal uninstall` 恢复原始链接；按官方方式维护 Claude Code，再核对原生程序路径、重新检查规则，运行 `terminal install`。维护期间入口没有 Surge CC 启动保护。升级或移动 Surge CC 应用本身，也应先卸载旧入口、再从新位置安装。
+需要更新 Claude Code 时，先正常结束受控会话，运行 `terminal uninstall` 恢复原始链接；按官方方式维护 Claude Code，再核对原生程序路径、重新检查规则，运行 `terminal install`。维护期间入口没有 Surge CC 启动保护。
 
 ```sh
 python3 "$SURGE_CC" terminal uninstall --json
 ```
 
 卸载只恢复自己接管且未被外部改写的入口，不删除工作区、登录资料或项目；不会自动删除 Surge 中的旁路拒绝规则。
+
+### 升级 Surge CC 到 0.2.6
+
+0.2.6 修复了 Mac 重启或卷重新挂载后可能出现的「原始 Claude 程序已变化」误报：原文件没有改变，但挂载设备编号可能变化。新版仍检查原生程序路径、inode、大小、修改时间、所有者和权限，以及原链接备份和包装器；这些检查不一致时仍阻止启动，不会自动更新登记来放行。
+
+**终端接管指向应用包内后端时，可在相同安装路径升级，无需先卸载接管：**正常结束受控 CLI、专用网页和授权窗口，退出 Surge CC；保留旧 App 备份，将新 App 放回原来的完整路径。保持原有 Python 和配置文件路径不变，然后从新 App 执行 `terminal status --json`，再运行 `claude --version` 核对受控入口，最后在 GUI 执行「检查线路与隐私」。版本查询不启动原生 Claude，也不代替线路检查。
+
+如果需要移动 App、改变后端位置，或终端接管指向另行维护的独立后端，单独替换 GUI 不会更新那个后端。将新 App 放到最终位置后，使用**新版**后端撤销旧接管，再安装到新后端。旧版若因设备编号误报而无法卸载，也使用这一流程：
+
+```sh
+SURGE_CC="/Applications/Surge CC.app/Contents/Resources/scripts/surge-cc"
+python3 "$SURGE_CC" terminal uninstall --json
+python3 "$SURGE_CC" terminal install --json
+python3 "$SURGE_CC" terminal status --json
+```
+
+使用自定义配置路径时，在每条子命令前保留 `--config '/absolute/path/to/config.json'`。只有卸载成功后才继续安装；维护期间不要启动 Claude，安装成功且线路检查通过后再恢复使用。若新版仍报告原生程序或入口改变，应核对实际文件，不要手工修改登记来跳过检查。上述升级保留工作区及登录资料；ad-hoc 签名更新仍可能需要重新授予 macOS 隐私权限。
 
 ### OAuth 登录
 
@@ -356,10 +373,10 @@ git clone https://github.com/jsjixu/surge-cc.git
 cd surge-cc
 python3 -m unittest discover -s tests -v
 ./scripts/test-gui.sh
-SURGE_CC_APP_NAME='Surge CC 0.2.5.app' ./scripts/build-app.sh
+SURGE_CC_APP_NAME='Surge CC 0.2.6.app' ./scripts/build-app.sh
 ```
 
-输出为 `dist/Surge CC 0.2.5.app`，只构建当前机器架构。默认使用开发用 ad-hoc 签名，更新后可能需要重新授权 macOS 隐私权限。若要使用固定代码签名证书，设置 `SURGE_CC_SIGNING_IDENTITY` 为有效证书的 SHA-1 指纹或精确名称；证书缺失或签名失败会停止，不自动降级。证书申请、首次迁移、升级前连续性验证与公证边界见 [固定签名指南](SIGNING.md)。
+输出为 `dist/Surge CC 0.2.6.app`，只构建当前机器架构。默认使用开发用 ad-hoc 签名，更新后可能需要重新授权 macOS 隐私权限。若要使用固定代码签名证书，设置 `SURGE_CC_SIGNING_IDENTITY` 为有效证书的 SHA-1 指纹或精确名称；证书缺失或签名失败会停止，不自动降级。证书申请、首次迁移、升级前连续性验证与公证边界见 [固定签名指南](SIGNING.md)。
 
 构建不会安装、启动应用或修改代理。已有同名输出会被拒绝；用 `SURGE_CC_APP_NAME` 或 `SURGE_CC_DIST_DIR` 选择新文件名或目录，不会覆盖正在使用的应用。
 

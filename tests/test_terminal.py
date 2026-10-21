@@ -139,6 +139,81 @@ class TerminalIntegrationTests(unittest.TestCase):
             self.original_path()
         self.assertFalse(terminal.status(state_dir=self.state)['ok'])
 
+    def change_recorded_mount_device(self):
+        manifest = self.state / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        data['original_stat'][0] += 1
+        manifest.write_text(json.dumps(data))
+
+    def test_remounted_device_number_does_not_invalidate_unchanged_native(self):
+        self.install()
+        self.change_recorded_mount_device()
+        before = (self.state / 'manifest.json').read_bytes()
+        with patch.object(terminal.subprocess, 'run', side_effect=AssertionError('do not start native')):
+            self.assertEqual(self.original_path(), self.original)
+            self.assertTrue(terminal.status(state_dir=self.state)['ok'])
+            self.assertEqual(terminal.metadata_version(state_dir=self.state), '2.1.296 (Claude Code)')
+        self.assertEqual((self.state / 'manifest.json').read_bytes(), before)
+
+    def test_native_inode_change_still_blocks_after_remount(self):
+        self.install()
+        self.change_recorded_mount_device()
+        before = self.original.stat()
+        replacement = self.root / 'replacement-native'
+        replacement.write_bytes(self.original.read_bytes())
+        replacement.chmod(0o700)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, self.original)
+        after = self.original.stat()
+        self.assertNotEqual(after.st_ino, before.st_ino)
+        self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        with self.assertRaises(core.Blocked):
+            self.original_path()
+
+    def test_native_size_change_still_blocks_after_remount(self):
+        self.install()
+        self.change_recorded_mount_device()
+        before = self.original.stat()
+        with self.original.open('ab') as stream:
+            stream.write(b'\n')
+        os.utime(self.original, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(self.original.stat().st_ino, before.st_ino)
+        with self.assertRaises(core.Blocked):
+            self.original_path()
+
+    def test_native_mtime_change_still_blocks_after_remount(self):
+        self.install()
+        self.change_recorded_mount_device()
+        before = self.original.stat()
+        os.utime(self.original, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+        self.assertEqual(self.original.stat().st_ino, before.st_ino)
+        with self.assertRaises(core.Blocked):
+            self.original_path()
+
+    def test_native_unsafe_permissions_still_block_after_remount(self):
+        self.install()
+        self.change_recorded_mount_device()
+        self.original.chmod(0o777)
+        with self.assertRaises(core.Blocked):
+            self.original_path()
+
+    def test_wrong_original_link_still_blocks_after_remount(self):
+        self.install()
+        self.change_recorded_mount_device()
+        backup = self.state / 'original-link'
+        backup.unlink()
+        backup.symlink_to('/different')
+        with self.assertRaises(core.Blocked):
+            self.original_path()
+
+    def test_modified_shim_still_blocks_after_remount(self):
+        self.install()
+        self.change_recorded_mount_device()
+        with self.command.open('ab') as stream:
+            stream.write(b'\n# changed\n')
+        with self.assertRaises(core.Blocked):
+            self.original_path()
+
     def test_changed_shim_or_updater_symlink_is_not_overwritten(self):
         self.install()
         self.command.write_text('#!/bin/sh\necho user command\n')

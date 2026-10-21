@@ -1,4 +1,4 @@
-# Surge CC 0.2.5 接口合约
+# Surge CC 0.2.6 接口合约
 
 ## 终端入口
 
@@ -8,7 +8,9 @@
 
 精确单参数 `claude --version` 或 `claude -v` 转到 `terminal version`，只在验证清单、入口和原始文件身份后输出缓存版本，不运行原生程序或网络检测。它用于终端和编辑器的版本发现，不能证明当前线路通过。`--passthrough` 把包装器的检查/错误写到 stderr，成功结束时不在 stdout 追加操作回执；stdin/stdout 保留给 CLI。安装的 shell 入口依赖缺失返回 `78`，进入后端后的退出码约定见下文。
 
-安装入口前要求 `cli_process_paths` 非空、覆盖当前原生程序，并通过 `containment.validate_scope`。运行入口和 GUI 启动共用代理检查、工作区、`OAuthSession` 与受控进程监控。GUI 不需要保持打开，但后端、Python 和配置仍须位于安装记录中的位置；应先把应用放到最终位置，再安装接管。移动或升级应用前先卸载旧入口，再从新位置安装。
+0.2.6 开始，持久化原生程序身份比较只使用 inode、大小和纳秒修改时间，仍检查规范路径、所有者、权限与可执行性。`original_stat` 保持四项记录格式兼容旧数据，但首项 `st_dev` 是挂载期间的设备编号，不用于跨重启身份比较；短期原子交换和并发检查继续比较设备号。该 stat 检查不是对同 inode、同大小、同修改时间的内容篡改进行密码学鉴定。
+
+安装入口前要求 `cli_process_paths` 非空、覆盖当前原生程序，并通过 `containment.validate_scope`。运行入口和 GUI 启动共用代理检查、工作区、`OAuthSession` 与受控进程监控。GUI 不需要保持打开，但后端、Python 和配置仍须位于安装记录中的位置；应先把应用放到最终位置，再安装接管。包装器固定后端路径，不固定后端文件摘要，因此正常结束受控会话后，在同路径替换应用包内后端即可加载新版，无需重建登记。移动后端则需使用新版 `terminal uninstall` 撤销旧入口，再从新位置安装；旧版因 `st_dev` 误报无法卸载时也使用新版维护命令。独立后端不会随 GUI 替换自动更新。
 
 当前使用范围为本机终端命令，包括 Ghostty 与 Orca 终端/TUI 通过该路径执行的 `claude`。Orca Native Chat 与 managed accounts 的账号目录、父子进程 transcript 读取及恢复流程尚未验收；包装器会使用 Surge CC 所选工作区的 `CLAUDE_CONFIG_DIR`，不宣称兼容 Orca 的其他账号目录。已在接管前运行的会话不会被收编，其他二进制副本和远端主机也不会自动接管。
 
