@@ -257,7 +257,9 @@ def run_guarded(command: list[str], *, env: dict | None, cwd: Path,
         write_state(status_path, target=target, state="starting", ok=True,
                     detail="线路检查通过，正在启动受监控程序。")
         with child_signals(lambda: child):
-            child = popen(command, env=env, cwd=str(cwd), start_new_session=True)
+            # Seatbelt cannot revoke access through already-open descriptors.
+            # Keep only the explicitly intended terminal stdin/stdout/stderr.
+            child = popen(command, env=env, cwd=str(cwd), start_new_session=True, close_fds=True)
             if on_started is not None:
                 on_started(child)
             # A launcher that immediately hands off/exits must not count as an

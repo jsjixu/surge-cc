@@ -124,6 +124,33 @@ private indirect enum JSONValue: Decodable, Sendable {
     var number: Double? { if case .number(let v) = self { return v }; return nil }
 }
 
+private enum BrowserRecoveryAction: String, Sendable {
+    case repairBrowserLocks = "repair-browser-locks"
+
+    func arguments(workspace: String) -> [String]? {
+        guard ["A", "B"].contains(workspace) else { return nil }
+        switch self {
+        case .repairBrowserLocks:
+            return ["browser-locks", "repair", "--workspace", workspace, "--json"]
+        }
+    }
+
+    // Recovery is an explicit allowlist, never a backend-supplied command line.
+    // A failed repair remains retryable even if its response has no action field.
+    static func after(_ response: BackendResponse?, exitCode: Int32,
+                      retrying previous: BrowserRecoveryAction? = nil) -> BrowserRecoveryAction? {
+        guard let response else { return previous }
+        guard !response.ok || exitCode != 0 else { return nil }
+        return response.recoveryAction ?? previous
+    }
+
+    static func checksAfterRepair(_ response: BackendResponse, exitCode: Int32) -> [CheckResult] {
+        // Success discards stale launch failures. A refusal keeps the current
+        // reason visible, such as a live browser process or a permission error.
+        response.ok && exitCode == 0 ? [] : (response.checks ?? [])
+    }
+}
+
 private struct BackendResponse: Decodable, Sendable {
     let schema: Int
     let ok: Bool
@@ -133,10 +160,12 @@ private struct BackendResponse: Decodable, Sendable {
     let settings: Settings?
     let launched: Bool?
     let target: String?
+    let recoveryAction: BrowserRecoveryAction?
     let document: [String: JSONValue]
 
     private enum CodingKeys: String, CodingKey {
         case schema, ok, summary, checked_at, checks, settings, launched, target
+        case recoveryAction = "recovery_action"
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -148,6 +177,8 @@ private struct BackendResponse: Decodable, Sendable {
         settings = try c.decodeIfPresent(Settings.self, forKey: .settings)
         launched = try c.decodeIfPresent(Bool.self, forKey: .launched)
         target = try c.decodeIfPresent(String.self, forKey: .target)
+        recoveryAction = try c.decodeIfPresent(String.self, forKey: .recoveryAction)
+            .flatMap(BrowserRecoveryAction.init(rawValue:))
         document = try JSONValue(from: decoder).object
     }
 }
@@ -302,7 +333,7 @@ private enum DisplayState {
 }
 
 private enum Operation {
-    case check, configure, workspaceList, workspaceUse, snapshot, restore, repairPlan, repair, guardStatus
+    case check, configure, workspaceList, workspaceUse, snapshot, restore, repairPlan, repair, guardStatus, browserLockRepair
 }
 
 @MainActor
@@ -325,6 +356,7 @@ private final class ViewModel: ObservableObject {
     @Published var showingRepair = false
     @Published var repairActions: [RepairAction] = []
     @Published var repairPlanID = ""
+    @Published var browserRecoveryAction: BrowserRecoveryAction?
     @Published var guardRunning: Bool?
     @Published var guardDetail = "尚未读取保护状态。"
     @Published var guardCheckedAt = ""
@@ -362,6 +394,8 @@ private final class ViewModel: ObservableObject {
         guard !busy else { return }
         let id = UUID()
         requestID = id
+        let retryingRecovery = operation == .browserLockRepair ? browserRecoveryAction : nil
+        if operation != .browserLockRepair { browserRecoveryAction = nil }
         state = .busy
         summary = message
         checks = []
@@ -378,6 +412,8 @@ private final class ViewModel: ObservableObject {
                 Backend.run(arguments, workingDirectory: workingDirectory)
             }.value
             guard self.requestID == id else { return }
+            self.browserRecoveryAction = BrowserRecoveryAction.after(
+                result.response, exitCode: result.exitCode, retrying: retryingRecovery)
             guard let response = result.response else {
                 self.state = .blocked
                 self.summary = result.error ?? "无法确认当前线路。"
@@ -413,10 +449,14 @@ private final class ViewModel: ObservableObject {
                         self.repairPlanID = ""
                     case .guardStatus:
                         self.consumeGuard(response)
+                    case .browserLockRepair:
+                        self.summary += " 请重新检查线路后再启动；本次修复没有打开浏览器或登录账号。"
                     default: break
                     }
                 }
-                self.checks = response.checks ?? []
+                self.checks = operation == .browserLockRepair
+                    ? BrowserRecoveryAction.checksAfterRepair(response, exitCode: result.exitCode)
+                    : (response.checks ?? [])
                 return
             }
             let rows = response.checks ?? []
@@ -495,6 +535,16 @@ private final class ViewModel: ObservableObject {
 
     func refreshGuard() {
         perform(["guard-status", "--json"], message: "正在读取保护状态…", operation: .guardStatus)
+    }
+
+    func repairBrowserLocks() {
+        // The workspace maintenance entry remains available after an app restart,
+        // without provoking a launch error or opening any authentication page.
+        let action = BrowserRecoveryAction.repairBrowserLocks
+        guard !busy, let arguments = action.arguments(workspace: settings.workspace) else { return }
+        browserRecoveryAction = action
+        perform(arguments, message: "正在确认专用浏览器已退出，并备份、清理残留锁…",
+                operation: .browserLockRepair)
     }
 
     private func consumeWorkspaces(_ response: BackendResponse) {
@@ -647,6 +697,18 @@ private struct ContentView: View {
                 }.padding(6)
             }
 
+            if vm.browserRecoveryAction != nil {
+                VStack(alignment: .leading, spacing: 7) {
+                    Button { vm.repairBrowserLocks() } label: {
+                        Label("检查并修复浏览器锁", systemImage: "wrench.and.screwdriver")
+                    }
+                    .disabled(vm.busy)
+                    Text("仅处理已退出专用窗口的残留锁；先备份再清理，保留登录资料和个人 Chrome。若仍有进程运行，会提示你正常退出。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             TabView(selection: $vm.selectedTab) {
                 checksTab.tabItem { Label("检查", systemImage: "checklist") }.tag(0)
                 workspacesTab.tabItem { Label("工作区", systemImage: "square.stack.3d.up") }.tag(1)
@@ -788,6 +850,15 @@ private struct ContentView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Text("系统钥匙串和服务端账号身份不属于工作区的隔离范围。")
                     .font(.caption).foregroundStyle(.secondary)
+                Divider()
+                Text("当前工作区 \(vm.settings.workspace) 的浏览器锁").font(.headline)
+                Button { vm.repairBrowserLocks() } label: {
+                    Label("检查并修复浏览器锁", systemImage: "wrench.and.screwdriver")
+                }
+                .disabled(vm.busy || !["A", "B"].contains(vm.settings.workspace))
+                Text("仅检查当前工作区：确认专用浏览器已退出后，备份并清理残留锁。保留登录资料与个人 Chrome；不会启动 Claude 或打开登录页。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Divider()
                 Text("快照与恢复").font(.headline)
                 HStack {

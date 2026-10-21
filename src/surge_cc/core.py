@@ -34,6 +34,10 @@ class Blocked(Exception):
     """A safe user-facing diagnostic, never containing subprocess output."""
 
 
+class BrowserProfileBusy(Blocked):
+    """Known browser singleton state eligible for an explicit safe repair check."""
+
+
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 

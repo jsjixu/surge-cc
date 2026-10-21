@@ -20,7 +20,7 @@ import threading
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from . import core, workspaces
-from .core import Blocked
+from .core import Blocked, BrowserProfileBusy
 from .guard import session_lock, stop_owned_child
 
 
@@ -287,8 +287,10 @@ class OAuthSession:
                 self._stop_browser(release=False)
                 self._lock_profile()
                 profile = workspaces.prepare_oauth_browser(self.config_path, self.config)
-                if profile.is_symlink() or os.path.lexists(profile / "SingletonLock"):
-                    raise Blocked("专用授权资料已被占用，未复用其他浏览器。")
+                if profile.is_symlink():
+                    raise Blocked("专用授权资料目录异常，未启动浏览器。")
+                if os.path.lexists(profile / "SingletonLock"):
+                    raise BrowserProfileBusy("专用授权资料已被占用或留有锁，请在 Surge CC 中检查并修复浏览器锁。")
                 if not self._live() or not callback_owned_by(self.child, authorization.callback_port):
                     raise Blocked("授权回调已经失效。")
                 started = self.popen(

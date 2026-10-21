@@ -39,12 +39,23 @@ import sys
 tool = Path(sys.argv[0]).name
 with open(os.environ["BUILD_TEST_LOG"], "a") as log:
     log.write(json.dumps([tool, *sys.argv[1:]]) + "\\n")
+if tool == "security":
+    if os.environ.get("BUILD_TEST_SECURITY_FAIL"):
+        sys.exit(9)
+    identities = json.loads(os.environ.get("BUILD_TEST_IDENTITIES", "[]"))
+    for index, (fingerprint, name) in enumerate(identities, 1):
+        print('  %d) %s "%s"' % (index, fingerprint, name))
+    print('     %d valid identities found' % len(identities))
 if tool == "swiftc":
     out = Path(sys.argv[sys.argv.index("-o") + 1])
     out.write_bytes(b"fixture executable; never launched")
     if os.environ.get("BUILD_TEST_FAIL"):
         sys.exit(9)
+if tool == "codesign" and "--sign" in sys.argv and os.environ.get("BUILD_TEST_SIGN_FAIL"):
+    sys.exit(9)
 if tool == "codesign" and "--verify" in sys.argv:
+    if os.environ.get("BUILD_TEST_VERIFY_FAIL"):
+        sys.exit(9)
     destination = os.environ.get("BUILD_TEST_RACE")
     if destination:
         path = Path(destination)
@@ -55,7 +66,7 @@ if tool == "codesign" and "--verify" in sys.argv:
             path.mkdir()
             (path / "keep.txt").write_text("concurrent owner")
 """
-        for name in ("swiftc", "plutil", "codesign"):
+        for name in ("swiftc", "plutil", "codesign", "security"):
             tool = self.bin / name
             tool.write_text(stub)
             tool.chmod(0o755)
@@ -63,6 +74,7 @@ if tool == "codesign" and "--verify" in sys.argv:
         self.env = dict(os.environ)
         self.env.pop("SURGE_CC_APP_NAME", None)
         self.env.pop("SURGE_CC_DIST_DIR", None)
+        self.env.pop("SURGE_CC_SIGNING_IDENTITY", None)
         self.env.update(PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                         BUILD_TEST_LOG=str(self.log))
 
@@ -72,6 +84,101 @@ if tool == "codesign" and "--verify" in sys.argv:
 
     def assert_no_staging(self):
         self.assertEqual(list(self.dist.glob(".surge-cc-build.*")), [])
+
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def test_default_ad_hoc_build_warns_about_permission_identity(self):
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ad-hoc development signing", result.stderr)
+        self.assertIn("may lose macOS privacy permissions", result.stderr)
+        self.assertIn("SURGE_CC_SIGNING_IDENTITY", result.stderr)
+        calls = self.calls()
+        self.assertFalse(any(call[0] == "security" for call in calls))
+        signing = next(call for call in calls if "--sign" in call)
+        self.assertEqual(signing[signing.index("--sign") + 1], "-")
+
+    def test_exact_certificate_name_is_resolved_to_unique_hash(self):
+        fingerprint = "A1" * 20
+        name = "Apple Development: Fixture Developer (TESTTEAM12)"
+        result = self.build(SURGE_CC_SIGNING_IDENTITY=name,
+                            BUILD_TEST_IDENTITIES=json.dumps([[fingerprint, name]]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(calls[0], ["security", "find-identity", "-v", "-p", "codesigning"])
+        signing = next(call for call in calls if "--sign" in call)
+        self.assertEqual(signing[signing.index("--sign") + 1], fingerprint)
+        self.assertNotIn("--timestamp", signing)
+        self.assertNotIn("ad-hoc", result.stderr)
+        info = plistlib.loads((self.dist / "Surge CC.app/Contents/Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleIdentifier"], "local.surgecc.app")
+
+    def test_developer_id_sha1_is_exact_and_requests_timestamp(self):
+        fingerprint = "AB" * 20
+        name = "Developer ID Application: Fixture Developer (TESTTEAM12)"
+        result = self.build(SURGE_CC_SIGNING_IDENTITY=fingerprint.lower(),
+                            BUILD_TEST_IDENTITIES=json.dumps([[fingerprint, name]]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        signing = next(call for call in self.calls() if "--sign" in call)
+        self.assertEqual(signing[signing.index("--sign") + 1], fingerprint)
+        self.assertIn("--timestamp", signing)
+        self.assertNotIn("--options", signing)  # Notarization/hardening is a separate step.
+        self.assert_no_staging()
+
+    def test_missing_ambiguous_or_partial_identity_fails_before_compilation(self):
+        fingerprint = "12" * 20
+        name = "Apple Development: Fixture Developer (TESTTEAM12)"
+        cases = [
+            ("99" * 20, [[fingerprint, name]]),
+            ("Fixture Developer", [[fingerprint, name]]),
+            (name, [[fingerprint, name], ["34" * 20, name]]),
+            (name, []),
+        ]
+        for requested, identities in cases:
+            with self.subTest(requested=requested, identities=identities):
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.build(SURGE_CC_SIGNING_IDENTITY=requested,
+                                    BUILD_TEST_IDENTITIES=json.dumps(identities))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unavailable or ambiguous", result.stderr)
+                self.assertEqual([call[0] for call in self.calls()], ["security"])
+                self.assertFalse(self.dist.exists())
+
+    def test_explicit_ad_hoc_or_multiline_identity_cannot_bypass_certificate_check(self):
+        for requested in ("-", "certificate\nname", "certificate\rname"):
+            with self.subTest(requested=requested):
+                result = self.build(SURGE_CC_SIGNING_IDENTITY=requested)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must be a certificate SHA-1", result.stderr)
+                self.assertFalse(self.log.exists())
+                self.assertFalse(self.dist.exists())
+
+    def test_identity_lookup_failure_is_not_downgraded_to_ad_hoc(self):
+        result = self.build(SURGE_CC_SIGNING_IDENTITY="12" * 20,
+                            BUILD_TEST_SECURITY_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Could not check", result.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["security"])
+        self.assertFalse(self.dist.exists())
+
+    def test_signing_or_verification_failure_does_not_publish_or_fallback(self):
+        fingerprint = "12" * 20
+        name = "Apple Development: Fixture Developer (TESTTEAM12)"
+        for failure in ("BUILD_TEST_SIGN_FAIL", "BUILD_TEST_VERIFY_FAIL"):
+            with self.subTest(failure=failure):
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.build(SURGE_CC_SIGNING_IDENTITY=fingerprint,
+                                    BUILD_TEST_IDENTITIES=json.dumps([[fingerprint, name]]),
+                                    **{failure: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.dist / "Surge CC.app").exists())
+                signing = [call for call in self.calls() if "--sign" in call]
+                self.assertEqual(len(signing), 1)
+                self.assertEqual(signing[0][signing[0].index("--sign") + 1], fingerprint)
+                self.assert_no_staging()
 
     def test_versioned_output_preserves_existing_default_app(self):
         existing = self.dist / "Surge CC.app"
@@ -83,9 +190,9 @@ if tool == "codesign" and "--verify" in sys.argv:
         self.assertEqual(list(existing.iterdir()), [existing / "keep.txt"])
         output = self.dist / "Surge CC 0.2.2.app"
         info = plistlib.loads((output / "Contents/Info.plist").read_bytes())
-        self.assertEqual(info["CFBundleShortVersionString"], "0.2.4")
+        self.assertEqual(info["CFBundleShortVersionString"], "0.2.5")
         self.assertEqual(info["CFBundleShortVersionString"], __version__)
-        self.assertEqual(info["CFBundleVersion"], "6")
+        self.assertEqual(info["CFBundleVersion"], "8")
         self.assertTrue((output / "Contents/MacOS/SurgeCC").is_file())
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual([call[0] for call in calls],

@@ -14,10 +14,10 @@ import time
 import uuid
 
 from .core import (
-    APP_SUPPORT, CHROME, DEFAULT_CONFIG, Blocked, Surge, chrome_args, default_claude,
+    APP_SUPPORT, CHROME, DEFAULT_CONFIG, Blocked, BrowserProfileBusy, Surge, chrome_args, default_claude,
     load_config, now, provider_environment_ok, proxy_env, result, row, run_checks, save_config, browser_executable,
 )
-from . import workspaces, repair
+from . import workspaces, repair, isolation
 from .guard import run_guarded
 from .oauth import OAuthSession
 
@@ -278,6 +278,15 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
            checker=full_checks, popen=subprocess.Popen, terminal_open=terminal_launcher,
            guarded=run_guarded, web_guard=start_web_guard) -> dict:
     arguments = args[1:] if args[:1] == ["--"] else args
+    isolated = isolation.for_cwd(config_path, Path.cwd()) if target == "code" else None
+    if target == "code" and arguments == ["--surge-cc-isolation-check"]:
+        if not isolated:
+            raise Blocked("当前目录不是已登记的隔离项目。")
+        report = isolation.diagnose(isolated, default_claude(), config, config_path)
+        # The terminal shim uses passthrough; keep this explicitly requested
+        # diagnostic report on stdout, without triggering native Claude login.
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return {**report, "checks": [], "launched": True, "child_exit_code": 0 if report.get("ok") else 1}
     if target == "code":
         if os.environ.get("SURGE_CC_TERMINAL_ENTRY") == "1" and (
                 not config.get("cli_process_paths") or not config.get("browser_path")):
@@ -301,13 +310,18 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                         "--environment", "--desktop", "--bg", "--background", "--tmux"}
         if any(a in remote_commands or a.split("=", 1)[0] in remote_flags for a in arguments):
             raise Blocked("OAuth 接管仅支持本机独立 CLI；远端或附着会话尚未验证，未启动。")
-        code_env = dict(os.environ)
-        code_env["CLAUDE_CONFIG_DIR"] = str(workspaces.location(config_path, config["workspace"]) / "data/Claude")
-        external_home = os.environ.get("CLAUDE_CONFIG_DIR")
-        if external_home and Path(external_home).expanduser().resolve() != Path(code_env["CLAUDE_CONFIG_DIR"]).resolve():
-            raise Blocked("调用方指定了另一份 Claude 账号目录；请将 Orca 的 CLAUDE_CONFIG_DIR 与当前 Surge CC 工作区对齐后重试。")
-        if not code_settings_ok(config, Path.cwd(), code_env):
-            raise Blocked("Claude 的环境或项目配置包含冲突的代理、浏览器或其他模型服务设置，请先检查。")
+        if isolated:
+            # Only new settings are supplied explicitly below. Do not inspect or
+            # propagate original home/ancestor project settings into this child.
+            isolation.arguments(arguments)
+        else:
+            code_env = dict(os.environ)
+            code_env["CLAUDE_CONFIG_DIR"] = str(workspaces.location(config_path, config["workspace"]) / "data/Claude")
+            external_home = os.environ.get("CLAUDE_CONFIG_DIR")
+            if external_home and Path(external_home).expanduser().resolve() != Path(code_env["CLAUDE_CONFIG_DIR"]).resolve():
+                raise Blocked("调用方指定了另一份 Claude 账号目录；请将 Orca 的 CLAUDE_CONFIG_DIR 与当前 Surge CC 工作区对齐后重试。")
+            if not code_settings_ok(config, Path.cwd(), code_env):
+                raise Blocked("Claude 的环境或项目配置包含冲突的代理、浏览器或其他模型服务设置，请先检查。")
     else:
         if arguments:
             raise Blocked("网页入口不接受额外浏览器参数。")
@@ -324,8 +338,10 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
     if target == "web":
         profile = loc["browser"]
         # Existing sessions may retain old flags; do not silently reuse one.
-        if profile.is_symlink() or os.path.lexists(profile / "SingletonLock"):
-            raise Blocked("专用网页窗口仍在运行，或留有锁文件。请正常关闭后再启动；不会操作你的个人 Chrome。")
+        if profile.is_symlink():
+            raise Blocked("专用网页资料目录异常，未启动浏览器。")
+        if os.path.lexists(profile / "SingletonLock"):
+            raise BrowserProfileBusy("专用网页窗口仍在运行，或退出后留有锁。可点击检查并修复；不会操作个人 Chrome。")
         workspaces.prepare_browser_language(config_path, config)
         profile.mkdir(parents=True, mode=0o700, exist_ok=True)
         web_guard(config, config_path, chrome_args(config, profile), loc, popen=popen)
@@ -334,8 +350,9 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
         terminal_open(config_path, arguments, Path.cwd())
         report.update(launched=True, target="code-terminal", summary="已打开终端；终端将再次检查后启动 Claude Code")
     else:
-        env = proxy_env(config["proxy_url"])
-        env["CLAUDE_CONFIG_DIR"] = str(loc["claude"])
+        env = (isolation.environment(isolated, config["proxy_url"]) if isolated
+               else proxy_env(config["proxy_url"]))
+        env["CLAUDE_CONFIG_DIR"] = str(isolated.config if isolated else loc["claude"])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Native updates replace ~/.local/bin/claude, which is our guarded shim.
         # Scope this to the child; never change the user's global environment.
@@ -347,11 +364,21 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
         receipt_path = folder / (identifier + ".receipt.json")
         with OAuthSession(config, config_path, checker=oauth_checks) as oauth:
             env["BROWSER"] = str(oauth.browser_hook)
-            status = guarded([str(default_claude()), *protected_code_arguments(arguments)], env=env, cwd=Path.cwd(),
+            native = default_claude()
+            command = (isolation.command(isolated, native, arguments, oauth.browser_hook) if isolated
+                       else [str(native), *protected_code_arguments(arguments)])
+            guard_options = {}
+            if isolated:
+                from .guard import RuntimeChecker
+                guard_options["checker"] = RuntimeChecker(config, process=str(native))
+                detail = ("当前 Orca 工作树和独立 HOME 可读写，共享 Git 数据只读；提交和推送请在 Orca 完成。"
+                          if isolated.worktree else "用户文件仅开放当前副本和独立 HOME，系统工具只读。")
+                print(f"[Surge CC] 文件隔离已启用：{isolated.name}；{detail}", file=sys.stderr)
+            status = guarded(command, env=env, cwd=Path.cwd(),
                              config=config, target="code", status_path=status_path, popen=popen,
                              receipt_path=receipt_path, on_started=oauth.set_child,
                              lock_path=loc["lock"].absolute(), interval=config["guard_interval"],
-                             exit_interval=max(30, config["guard_interval"]))
+                             exit_interval=max(30, config["guard_interval"]), **guard_options)
         try:
             receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() and not receipt_path.is_symlink() else {}
         except (OSError, ValueError):
@@ -363,6 +390,10 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                       ok=launched and status == 0,
                       summary=("Claude Code 受监控会话已结束" if status == 0 else "Claude Code 已停止；请查看保护状态")
                       if launched else "启动前复核或运行监控未建立，未确认 Claude Code 启动")
+        if isolated:
+            report["file_isolation"] = {"project": isolated.name, "root": str(isolated.root),
+                                        "home": str(isolated.home), "backend": "macOS Seatbelt",
+                                        "linked_worktree": isolated.worktree is not None}
         if not launched or status != 0:
             report["checks"].append(row("runtime", "运行监控", False,
                                         "未建立受监控会话。" if not launched else "受监控会话以非零状态结束。"))
@@ -426,6 +457,10 @@ def parser() -> argparse.ArgumentParser:
     workspace.add_argument("--label", default="")
     workspace.add_argument("--snapshot")
     workspace.add_argument("--json", action="store_true")
+    browser_locks = commands.add_parser("browser-locks")
+    browser_locks.add_argument("action", choices=("repair",))
+    browser_locks.add_argument("--workspace", required=True)
+    browser_locks.add_argument("--json", action="store_true")
     start = commands.add_parser("launch")
     start.add_argument("target", choices=("code", "web"))
     start.add_argument("--terminal", action="store_true")
@@ -492,7 +527,14 @@ def main(argv: list[str] | None = None) -> int:
                       "checked_at": now(), "checks": [], "settings": config}
         else:
             config = load_config(config_path)
-            if options.command == "workspace":
+            if options.command == "browser-locks":
+                # A stale GUI response must never target a newly selected workspace.
+                if options.workspace != config["workspace"]:
+                    raise Blocked("当前工作区已变更，请刷新后检查当前工作区的浏览器锁。")
+                from . import browser_locks
+                recovery = browser_locks.repair(config_path, options.workspace)
+                report = command_result(recovery["message"], config, recovery=recovery)
+            elif options.command == "workspace":
                 name = options.name or config["workspace"]
                 extra = {}
                 if options.action == "create":
@@ -531,6 +573,14 @@ def main(argv: list[str] | None = None) -> int:
         return (int(report.get("child_exit_code", 0)) if report["ok"] else 2)
     except Blocked as exc:
         report = result([row("error", "操作停止", False, str(exc))], config)
+        current_workspace = (config or {}).get("workspace")
+        error_workspace = (getattr(options, "name", None) or current_workspace
+                           if options.command == "workspace" else current_workspace)
+        if isinstance(exc, BrowserProfileBusy) and error_workspace == current_workspace:
+            report["recovery_action"] = "repair-browser-locks"
+        elif (options.command == "browser-locks" and config and
+              options.workspace == current_workspace):
+            report["recovery_action"] = "repair-browser-locks"
         emit(report)
         return 2
     except (OSError, ValueError, TypeError, KeyError):

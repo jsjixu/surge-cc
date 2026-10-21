@@ -161,11 +161,11 @@ def _verify_active(data):
     _regular(Path(data["config_path"]))
 
 
-def _write_private(path, data):
+def _write_private(path, data, *, mode=0o600):
     fd, name = tempfile.mkstemp(prefix=".terminal-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
-            os.fchmod(stream.fileno(), 0o600)
+            os.fchmod(stream.fileno(), mode)
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
@@ -300,6 +300,138 @@ def install(config_path: Path, entrypoint: Path, python_executable: Path, *, com
                 if os.path.lexists(temp) and not preserve_displaced:
                     temp.unlink()
             return status(state_dir=folder)
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, Blocked) as error:
+        raise _safe_error(error) from None
+
+
+def _update_signature(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+            info.st_size, info.st_mtime_ns)
+
+
+def _update_snapshot(path: Path):
+    """Read a bounded private regular file without following its final entry."""
+    _plain_path(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_size > 16384):
+            raise Blocked("终端更新文件不安全，已取消更新。")
+        body = stream.read(16385)
+        if (len(body) != info.st_size or _update_signature(os.fstat(stream.fileno())) != _update_signature(info)
+                or _update_signature(path.lstat()) != _update_signature(info)):
+            raise Blocked("终端更新期间文件发生变化，已取消更新。")
+    return _update_signature(info), body
+
+
+def _update_matches(path: Path, snapshot):
+    try:
+        return _update_snapshot(path) == snapshot
+    except (OSError, ValueError, Blocked):
+        return False
+
+
+def _update_restore(entry):
+    """Restore a displaced entry only while our replacement still occupies it."""
+    target, staging = entry["target"], entry["staging"]
+    if not _update_matches(target, entry["new"]):
+        return
+    displaced = _update_signature(staging.lstat())
+    _exchange(staging, target)
+    if _update_matches(staging, entry["new"]):
+        entry["swapped"] = False
+        return
+    # A concurrent edit arrived after the ownership check. Put it back if the
+    # restored entry is still the one we just moved; otherwise keep both files.
+    if _update_signature(target.lstat()) == displaced:
+        _exchange(staging, target)
+
+
+def update_backend(entrypoint: Path, python_executable: Path | None = None, *, state_dir=None) -> dict:
+    """Rebind an intact managed entry without exposing the native Claude link.
+
+    Each file exchange is atomic. Between the shim and manifest exchanges their
+    mismatch blocks original_claude. Displaced files stay on disk until commit,
+    and rollback checks ownership while preserving concurrent user edits.
+    """
+    folder = _state_dir(state_dir)
+    try:
+        entrypoint = Path(entrypoint)
+        _regular(entrypoint)
+        if python_executable is not None:
+            python_executable = Path(python_executable)
+            _regular(python_executable, executable=True)
+        _private_dir(folder)
+        with _lock(folder):
+            data = _read(folder)
+            _verify_active(data)
+            command = Path(data["command_path"])
+            manifest = folder / "manifest.json"
+            parent = command.parent.stat()
+            if parent.st_uid != os.getuid() or parent.st_mode & 0o022:
+                raise Blocked("Claude 命令目录必须由当前用户持有且不可被其他用户修改。")
+            old_manifest = _update_snapshot(manifest)
+            old_shim = _update_snapshot(command)
+            if json.loads(old_manifest[1]) != data or old_shim[1] != _shim(data):
+                raise Blocked("终端更新期间文件发生变化，已取消更新。")
+            updated = dict(data, entrypoint=str(entrypoint),
+                           python_executable=str(python_executable) if python_executable is not None
+                           else data["python_executable"])
+            if updated == data:
+                return status(state_dir=folder)
+            body = _shim(updated)
+            updated["shim_sha256"] = _digest(body)
+            manifest_body = (json.dumps(updated, indent=2) + "\n").encode()
+            entries = []
+            committed = False
+            try:
+                for target, old, contents, mode in ((command, old_shim, body, 0o700),
+                                                   (manifest, old_manifest, manifest_body, 0o600)):
+                    fd, name = tempfile.mkstemp(prefix=".surge-cc-update-", dir=target.parent)
+                    staging = Path(name)
+                    with os.fdopen(fd, "wb") as stream:
+                        os.fchmod(stream.fileno(), mode)
+                        stream.flush()
+                    entry = {"target": target, "staging": staging, "old": old,
+                             "new": _update_snapshot(staging), "swapped": False}
+                    entries.append(entry)
+                    # In particular, a failed manifest write happens with the new
+                    # shim installed and exercises the same fail-closed rollback.
+                    _write_private(staging, contents, mode=mode)
+                    entry["new"] = _update_snapshot(staging)
+                    if entry["new"][1] != contents:
+                        raise Blocked("终端更新临时文件发生变化，已取消更新。")
+                    _exchange(staging, target)
+                    entry["swapped"] = True
+                    if (not _update_matches(staging, old)
+                            or not _update_matches(target, entry["new"])):
+                        raise Blocked("终端更新期间入口或记录发生变化，已取消更新；请检查当前入口。")
+                if _read(folder) != updated:
+                    raise Blocked("终端更新记录发生变化，已取消更新。")
+                _verify_active(updated)
+                result = status(state_dir=folder)
+                if not result["ok"]:
+                    raise Blocked(result["summary"])
+                committed = True
+                return result
+            finally:
+                if not committed:
+                    for entry in reversed(entries):
+                        if entry["swapped"]:
+                            try:
+                                _update_restore(entry)
+                            except (OSError, ValueError, Blocked):
+                                # Preserve displaced originals for recovery when
+                                # rollback cannot safely restore the public entry.
+                                pass
+                for entry in entries:
+                    expected = entry["old"] if committed else entry["new"]
+                    if _update_matches(entry["staging"], expected):
+                        try:
+                            entry["staging"].unlink()
+                        except OSError:
+                            pass  # A retained private backup does not invalidate commit.
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, Blocked) as error:
         raise _safe_error(error) from None
 

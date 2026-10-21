@@ -2,10 +2,13 @@
 // It never loads user settings, invokes the backend, or starts an application.
 @main
 private enum GUIContractTests {
-    static func report(_ rows: [[String: Any]], ok: Bool = true) throws -> BackendResponse {
-        let data = try JSONSerialization.data(withJSONObject: [
+    static func report(_ rows: [[String: Any]], ok: Bool = true,
+                       recoveryAction: Any? = nil) throws -> BackendResponse {
+        var document: [String: Any] = [
             "schema": 1, "ok": ok, "summary": "测试结果", "checks": rows, "settings": [:]
-        ])
+        ]
+        if let recoveryAction { document["recovery_action"] = recoveryAction }
+        let data = try JSONSerialization.data(withJSONObject: document)
         return try JSONDecoder().decode(BackendResponse.self, from: data)
     }
 
@@ -85,6 +88,56 @@ private enum GUIContractTests {
         precondition(envelope.document["workspaces"]?.array.first?.object["name"]?.string == "B")
         precondition(envelope.document["guard"]?.object["running"]?.bool == false)
         precondition(envelope.document["plan_id"]?.string == "plan-1")
-        print("GUI contract: gating, optional evidence, disclosure summaries, legacy settings and action payloads passed")
+
+        // Only the named browser-lock operation can expose a repair button.
+        let blockedLocks = try report([check("operation", "fail")], ok: false,
+                                      recoveryAction: "repair-browser-locks")
+        precondition(blockedLocks.recoveryAction == .repairBrowserLocks)
+        let recovery = BrowserRecoveryAction.after(blockedLocks, exitCode: 1)
+        precondition(recovery == .repairBrowserLocks)
+        precondition(recovery?.arguments(workspace: "A") ==
+                     ["browser-locks", "repair", "--workspace", "A", "--json"])
+        precondition(recovery?.arguments(workspace: "B") ==
+                     ["browser-locks", "repair", "--workspace", "B", "--json"])
+        for invalidWorkspace in ["", "../A", "A --launch", "C"] {
+            precondition(recovery?.arguments(workspace: invalidWorkspace) == nil)
+        }
+        let unknownAction = try report([], ok: false, recoveryAction: "launch web --json")
+        precondition(unknownAction.recoveryAction == nil)
+        precondition(BrowserRecoveryAction.after(unknownAction, exitCode: 1) == nil)
+        precondition(envelope.recoveryAction == nil)
+        // Maintenance is reachable without a previous failure, and targets the
+        // configured workspace rather than a not-yet-applied picker selection.
+        var maintenanceSettings = settings
+        maintenanceSettings.workspace = "B"
+        precondition(BrowserRecoveryAction.repairBrowserLocks.arguments(workspace: maintenanceSettings.workspace) ==
+                     ["browser-locks", "repair", "--workspace", "B", "--json"])
+        let repairFailed = try report([], ok: false)
+        precondition(BrowserRecoveryAction.after(repairFailed, exitCode: 1,
+                                                 retrying: recovery) == recovery)
+        precondition(BrowserRecoveryAction.after(nil, exitCode: 1,
+                                                 retrying: recovery) == recovery)
+        let repaired = try report([], recoveryAction: "repair-browser-locks")
+        precondition(BrowserRecoveryAction.after(repaired, exitCode: 0,
+                                                 retrying: recovery) == nil)
+        var liveBrowserFailure = check("operation", "fail")
+        liveBrowserFailure["detail"] = "专用浏览器进程仍在运行，请先正常退出。"
+        let refusedRepair = try report([liveBrowserFailure], ok: false)
+        let visibleFailure = BrowserRecoveryAction.checksAfterRepair(refusedRepair, exitCode: 1)
+        precondition(visibleFailure.count == 1)
+        precondition(visibleFailure[0].detail == "专用浏览器进程仍在运行，请先正常退出。")
+        precondition(BrowserRecoveryAction.after(refusedRepair, exitCode: 1,
+                                                 retrying: recovery) == recovery)
+        let repairWithOldRows = try report([liveBrowserFailure])
+        precondition(BrowserRecoveryAction.checksAfterRepair(repairWithOldRows, exitCode: 0).isEmpty)
+        precondition(BrowserRecoveryAction.checksAfterRepair(repairWithOldRows, exitCode: 1).count == 1)
+        // A lock repair cannot become a passing network assessment or auto-launch.
+        expect(repaired, .blocked)
+        precondition(repaired.launched != true)
+        do {
+            _ = try report([], ok: false, recoveryAction: ["repair-browser-locks"])
+            preconditionFailure("Malformed recovery metadata must not be interpreted as a command")
+        } catch is DecodingError {}
+        print("GUI contract: gating, evidence, summaries, settings, recovery allowlist and repair retry/reset passed")
     }
 }

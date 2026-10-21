@@ -1,4 +1,4 @@
-# Surge CC 0.2.4 接口合约
+# Surge CC 0.2.5 接口合约
 
 ## 终端入口
 
@@ -18,6 +18,8 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 
 每个受控 CLI 子进程设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`；拒绝 `update`、`upgrade`、`install` 更新入口，避免安装器覆盖包装器。这不是全局环境变更。维护需先正常结束会话、卸载入口、更新官方程序，再校验范围并重新安装接管。
 
+维护代码可调用内部 `terminal.update_backend(entrypoint, python_executable=None, *, state_dir=None)`，将完整且可验证的受控入口重新绑定到独立后端；当前没有 `terminal update` 公共命令或自动更新界面。它保留原生程序、配置与原始符号链接备份，先原子交换包装器，再交换清单。中间不一致状态会拒绝启动，不短暂恢复原生入口；失败尝试按已核实的文件身份回滚，并保留无法安全恢复的私有副本。此操作不修改 GUI bundle、Surge 配置或系统权限，不保证系统权限以后不会变化。新后端与 Python 路径仍须长期保留。
+
 ## OAuth 打开器
 
 `launch code` 的非 Terminal 分支创建 `OAuthSession`，仅向自己的 CLI 注入 `BROWSER` 绝对可执行路径。`guard.run_guarded(..., on_started=...)` 将真实 `Popen` 句柄交给该会话，故回调监听归属可以绑定当前 CLI。Terminal 分支仍只创建重新检查并启动 CLI 的脚本。
@@ -31,6 +33,16 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 授权浏览器使用 `workspace/data/OAuthBrowser` 与 `.oauth.lock`。它与普通网页资料分别存储；共享工作区锁阻止备份/恢复，授权专属锁防止并发占用。回调 bypass 是 `<-loopback>` 后追加精确 HTTP host:port，其他连接仍走原专用代理。`OAuthSession` 关闭时只停止它持有的授权浏览器，未修改系统默认浏览器、Surge 配置或其他策略组。
 
 此文档对应 `src/surge_cc/` 当前实现。CLI 入口为 `scripts/surge-cc`；原生 GUI 为 `app/main.swift`，通过子进程调用后端并读取 JSON。参考上游 `yoursjeyo/claude-switcher` 提交 `74ea09e2e7db14968548a5fab7b97e96b4b1b330` 的主要功能思路，独立实现 Surge 适配，并不保证与上游所有行为一致。
+
+## 专用浏览器锁修复
+
+`browser-locks repair --workspace A --json` 仅接受配置中当前工作区，防止界面过期后修复错误的目标。它不运行线路检查、启动程序、结束进程或修改代理。
+
+浏览器占用类错误可返回 `recovery_action:"repair-browser-locks"`；GUI 只识别这一固定白名单动作，不执行后端提供的任意命令。非当前工作区的快照/恢复错误不提供当前工作区的修复动作。工作区页提供相同的常驻入口。
+
+修复按 session → OAuth 顺序取得排他锁，复核专用 profile 进程、SingletonLock 的本机 PID 和 SingletonSocket 状态，再将确认过期的三个顶层符号链接归档到工作区 data 以外的私有目录。权限/路径异常、活跃或无法确认的状态均拒绝操作；不处理其他锁文件、登录资料或外部 socket 目标。
+
+成功返回 `recovery:{status,workspace,removed_count,backup_path,message}`，其中 `status` 为 `repaired` 或 `no_stale_locks`。归档路径是本地私密信息，公开分享前需脱敏。操作成功只表示锁处理完成，`checks:[]`，不代表线路或保护已经通过检查。
 
 ## 设置
 
@@ -78,6 +90,7 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 | `workspace restore [--name NAME] --snapshot ID` | 校验归属及完整性，先保存恢复前快照，再替换数据；保留替换前目录；GUI 有确认，CLI 命令本身表示执行 |
 | `repair-plan` | 只读观察 Surge 当前状态，返回公开动作和 `plan_id`，不写配置、不重载 |
 | `repair --plan-id ID` | 核对原计划仍匹配后执行；配置改写先备份与语法验证，失败时尝试回滚可确认的本次改动 |
+| `browser-locks repair --workspace NAME` | 离线检查当前工作区的专用浏览器运行锁，仅归档可确认过期的锁链接；不结束进程或执行线路检查 |
 | `launch web` | 完整检查后启动所选工作区的独立 Chrome 和专属监控进程；不复用个人 Chrome |
 | `launch code --terminal` | 完整检查后打开私有 `.command`；终端内再次执行完整检查，然后启动受监控 CLI |
 | `launch code -- CLAUDE_ARGS...` | 在当前项目目录同步运行受监控 Claude Code；显式代理与工作区 `CLAUDE_CONFIG_DIR`；不对参数做 shell 求值 |
@@ -193,7 +206,7 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 工作区是本工具拥有的目录分离：`workspaces/<name>/data/Browser`、`data/OAuthBrowser` 与 `data/Claude`，不是独立系统用户、设备身份或钥匙串。快照只复制工作区 data 并校验清单，不复制工作区外项目。快照和恢复要求独占锁；活动会话持共享锁。恢复前自动备份，并保留 `previous-*` 数据。数据可能包含登录状态，必须私下保存。
 
-`launch code` 保留 `Path.cwd()`。独立 `CLAUDE_CONFIG_DIR` 不限制 CLI 可读取的文件，不过滤 `CLAUDE.md`、项目 `.claude`、Git 历史、恢复会话或工具输出。`--resume`、`--continue` 等参数没有被统一禁止。`proxy_env` 先复制调用方环境，再覆盖代理变量并清空代理绕过列表；启动分支覆盖 `CLAUDE_CONFIG_DIR`、`BROWSER` 与更新变量，不是环境白名单，也不删除所有认证凭据。调用方显式指定另一 `CLAUDE_CONFIG_DIR` 时拒绝启动，而不是静默合并。`code_settings_ok` 检查已知冲突设置，不是项目内容审计或文件沙箱。
+`launch code` 保留 `Path.cwd()`。对没有启用下述登记文件沙箱的普通项目，独立 `CLAUDE_CONFIG_DIR` 不限制 CLI 可读取的文件，不过滤 `CLAUDE.md`、项目 `.claude`、Git 历史、恢复会话或工具输出。`--resume`、`--continue` 等参数没有被统一禁止。普通项目的 `proxy_env` 先复制调用方环境，再覆盖代理变量并清空代理绕过列表；启动分支覆盖 `CLAUDE_CONFIG_DIR`、`BROWSER` 与更新变量，不是环境白名单，也不删除所有认证凭据。调用方显式指定另一 `CLAUDE_CONFIG_DIR` 时拒绝启动，而不是静默合并。`code_settings_ok` 检查已知冲突设置，不是项目内容审计或文件沙箱。
 
 `workspaces.prepare_browser_language` 保留旧函数名，实际在自有工作区未运行时总是更新上述 WebRTC 偏好并清空 URL 覆盖，保留其他字段。仅显式浏览器语言非空时才同时更新 `intl.accept_languages` 与 `intl.selected_languages`；空语言不改原语言值。`prepare_oauth_browser` 对独立 OAuth 资料使用同一个偏好准备函数。两类窗口仍使用不同的资料目录，不互相复制 Cookie、localStorage 或登录信息；本工具不修改或同步网站自己的语言设置。检测进程使用新的临时空白资料和同样的 WebRTC、显式语言设置，没有复制已有工作区的扩展、策略或其他偏好，回执不能声称完全代表已保存浏览器。
 
@@ -204,3 +217,51 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 无 `browser_path` 时维持常规修复行为。浏览器副本安装和增强模式开启不由修复器自动完成；增强模式未确认时计划包含 `enhanced-required`，写入前阻止执行。规则模式切换仍作为独立动作显示在预览中。模块或临时规则覆盖若没有被本次配置修改解决，应用后的范围核验仍会失败，不能沿用此前通过结果。
 
 后端不需要 Surge HTTP API 密钥，不安装 root 守护服务。GUI 使用动态检查行，不缓存启动许可；打开 GUI 不自动启动 Claude。所有保护均为有限观测与进程管理，不是系统防火墙、完整防泄漏证明、身份隔离保证或账号封禁保证。实际验证记录由 [VALIDATION.md](VALIDATION.md) 单独维护。
+
+## 已登记项目文件沙箱
+
+v0.2.5 的 `isolation` 模块是可选的高级功能。只有 `launch code` 的当前目录被登记或识别为登记项目的关联工作树时才启用。GUI 选择目录、终端入口接管及 A/B 工作区本身不完成登记；目前没有公开登记命令、迁移工具或设置界面。
+
+维护者需在 `config.json` 同目录准备私有 `isolation.json`，并事先建立项目副本和主项目运行目录。下面仅展示格式；所有路径须替换为本机绝对路径，不展开 `~` 或环境变量：
+
+```json
+{
+  "schema": 1,
+  "root": "/Users/example/Documents/Codex/Claude-Isolated",
+  "projects": [
+    {
+      "id": "demo",
+      "path": "/Users/example/Documents/Codex/Claude-Isolated/projects/demo",
+      "home": "/Users/example/Documents/Codex/Claude-Isolated/.runtime/demo/home"
+    }
+  ]
+}
+```
+
+登记文件须由当前用户拥有、权限 `600`、普通单链接文件；项目 ID 匹配 `[a-z][a-z0-9-]{0,39}` 且不重复。`path` 与 `home` 必须严格对应 `root/projects/<id>` 和 `root/.runtime/<id>/home`，所有相关目录由当前用户拥有、不可由其他用户写入、路径不经过符号链接；运行目录采用私有 `700` 权限。登记过程不应把个人 HOME、原始项目或浏览器数据作为运行目录。
+
+默认 `~/Documents/Codex/Claude-Isolated` 属于保留隔离范围。保留范围、已登记范围或带隔离标记的项目在登记缺失、路径不符、权限不安全时拒绝启动；不会因为无法核验而按普通项目启动。普通范围内没有登记或标记的项目仍沿用常规行为。
+
+### Orca 关联工作树
+
+自动识别仅支持 `~/orca/workspaces/<项目目录>/<工作树目录>` 两层布局。关联工作树根目录需保留以下标记，其中 `project` 对应登记 ID：
+
+```json
+{"schema":1,"project":"demo","requires_registered_launcher":true}
+```
+
+文件名为 `.surge-cc-isolated.json`。标记不构成授权凭据；启动器还必须核对工作树 `.git` 指向已登记主项目的 `.git/worktrees/<条目>`，该条目 `commondir` 指回同一主项目 `.git`，`gitdir` 指回当前工作树 `.git`。相对路径允许规范化，但任何链接穿越、其他项目关联、受保护目录重叠或缺失标记均拒绝。判断只读取受限大小的元数据，不为探测项目而运行 Git hooks。
+
+工作树 HOME 位于 `root/.runtime/<id>/worktrees/<路径摘要>/home`，由启动器在核验后创建；它不会复制主项目 HOME、旧会话或凭据。每次启动在路径发现和生成沙箱策略前分别复核关联。主项目工作文件和其他工作树 HOME 不因此开放。
+
+### 实际限制与诊断
+
+原生 Claude 及其子进程通过 `/usr/bin/sandbox-exec` 进入 macOS Seatbelt，可信启动器、线路监控及 OAuth 代理留在沙箱外。沙箱允许当前项目和独立 HOME 读写，以及指定系统工具和必要资源读取；拒绝文件硬链接。关联工作树仅允许共享 Git 对象、引用及少量元数据读取，允许本工作树 `index` / `index.lock` 写入。代码编辑、`git status`、`git diff`、查看历史在支持范围内；提交、推送及修改共享配置须在 Orca 或普通终端中完成，后者不受该沙箱约束。已允许读取的共享 Git 对象可能包含整个仓库历史，不是内容脱敏。
+
+当前沙箱固定允许 TCP 专用入口 `127.0.0.1:62919` 及本次 OAuth 打开器的 Unix socket；配置中的 `proxy_url` 必须精确为 `http://127.0.0.1:62919`。不提供任意端口或额外网络授权设置。CLI 可建立本机回调监听，OAuth 代理仍独立核对精确回环端口和进程归属；这不是允许所有 localhost 出站连接。
+
+隔离分支使用最小环境变量集和独立 `HOME`、临时目录及 `CLAUDE_CONFIG_DIR`，不继承原终端的认证令牌、SSH agent 或 IDE 句柄。CLI 配置来源置空、hooks 禁用、MCP 置空，并拒绝额外 settings、目录、插件和 IDE/Chrome 集成参数。系统服务、构建工具、登录与授权可能因此受限；本次只验证了明确列出的命令及边界，不承诺所有工程或交互式登录流程兼容。
+
+在已登记目录可执行 `claude --surge-cc-isolation-check`（需已安装终端接管），或从该目录调用后端 `launch code --passthrough -- --surge-cc-isolation-check`。它先做基础线路检查，再用临时文件、Git 只读命令、原生 CLI `--help` 和网络边界探针返回诊断 JSON；不登录或向模型发送提示词。路径、项目名称及出口等回执信息分享前需脱敏。
+
+常规报告模式的隔离 CLI 会话可带 `file_isolation:{project,root,home,backend,linked_worktree}`；这些字段描述启动方式，不是持续文件审计。文件隔离目录不在 A/B `data` 快照中，需另外备份；已有浏览器与 OAuth 资料目录仍按所选 A/B 工作区管理，不随项目 HOME 复制。

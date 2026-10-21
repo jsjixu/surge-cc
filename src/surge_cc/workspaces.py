@@ -13,7 +13,7 @@ import stat
 import tempfile
 import uuid
 
-from .core import Blocked, now, save_config
+from .core import Blocked, BrowserProfileBusy, now, save_config
 
 
 def name_ok(name: str) -> str:
@@ -113,7 +113,7 @@ def exclusive(config_path: Path, name: str):
                "claude": path / "data/Claude", "lock": path / ".session.lock"}
         if (os.path.lexists(loc["browser"] / "SingletonLock") or
                 os.path.lexists(path / "data/OAuthBrowser/SingletonLock")):
-            raise Blocked("这个工作区的 Chrome 仍在运行或留有锁，请正常关闭后重试。")
+            raise BrowserProfileBusy("这个工作区的专用浏览器仍在运行，或退出后留有锁。可点击检查并修复浏览器锁。")
         yield loc
 
 
@@ -255,8 +255,10 @@ def prepare_oauth_browser(config_path: Path, config: dict) -> Path:
     with _lock(path, exclusive=False):
         _initialize(path, config["workspace"])
         profile = path / "data/OAuthBrowser"
-        if profile.is_symlink() or os.path.lexists(profile / "SingletonLock"):
-            raise Blocked("专用授权窗口仍在运行或目录异常，请先正常关闭该授权窗口。")
+        if profile.is_symlink():
+            raise Blocked("专用授权资料目录异常，未启动浏览器。")
+        if os.path.lexists(profile / "SingletonLock"):
+            raise BrowserProfileBusy("专用授权窗口仍在运行，或退出后留有锁。请在 Surge CC 中检查并修复浏览器锁。")
         profile.mkdir(mode=0o700, exist_ok=True)
         _prepare_browser_preferences(profile, config)
         return profile
