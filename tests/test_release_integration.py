@@ -294,7 +294,8 @@ class BundleReleaseIntegrationTests(Fixture):
                      'src/surge_cc/paste_terminal.py', 'src/surge_cc/pasted_images.py'):
             self.assertTrue((self.resources / file).is_file(), file)
         info = plistlib.loads((self.app / 'Contents/Info.plist').read_bytes())
-        self.assertEqual(info['CFBundleShortVersionString'], '0.4.1')
+        from surge_cc import __version__
+        self.assertEqual(info['CFBundleShortVersionString'], __version__)
         self.assertFalse(any(self.app.rglob('launcher.json')))
         self.assertFalse(any(self.app.rglob('.local')))
 

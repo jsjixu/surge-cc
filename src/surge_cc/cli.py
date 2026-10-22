@@ -661,6 +661,19 @@ def parser() -> argparse.ArgumentParser:
     terminal = commands.add_parser("terminal")
     terminal.add_argument("action", choices=("install", "uninstall", "status", "version"))
     terminal.add_argument("--json", action="store_true")
+    maintenance = commands.add_parser("maintenance", help="检查、预览并维护受控 Claude Code 入口")
+    maintenance.add_argument("action", choices=("status", "plan", "apply"))
+    maintenance.add_argument("--operation", choices=("repair-terminal", "update-claude"))
+    maintenance.add_argument("--plan-id")
+    maintenance.add_argument("--json", action="store_true")
+    updates = commands.add_parser("updates", help="检查、下载校验并安装正式版本")
+    updates.add_argument("action", choices=("check", "download", "install"))
+    updates.add_argument("--version")
+    updates.add_argument("--json", action="store_true")
+    orca = commands.add_parser("orca", help="检查 Orca 启动入口")
+    orca.add_argument("action", choices=("status", "open-terminal"))
+    orca.add_argument("--project")
+    orca.add_argument("--json", action="store_true")
     project = commands.add_parser("project", help="预览并建立隔离工程，或管理同范围共享")
     project.add_argument("action", choices=("status", "plan", "apply", "enable", "enable-plan"))
     project.add_argument("--source", type=Path)
@@ -702,7 +715,9 @@ def main(argv: list[str] | None = None) -> int:
         arguments, argv = argv[split + 1:], argv[:split]
     options = parser().parse_args(argv)
     config = None
-    def emit(report):
+    def emit(report, error=None):
+        from .remediation import attach
+        attach(report, command=options.command, error=error)
         with redirect_stdout(sys.stderr if getattr(options, "passthrough", False) else sys.stdout):
             print_result(report, options.json)
     try:
@@ -779,6 +794,43 @@ def main(argv: list[str] | None = None) -> int:
                     data = projects.apply(config_path, options.source, names[0], root=options.root,
                                           expected_digest=options.plan_id, **flags)
             report = command_result("项目隔离操作完成", {}, project=data)
+        elif options.command == "maintenance":
+            from . import maintenance
+            config = load_config(config_path)
+            if options.action == "status":
+                data = maintenance.status(config_path)
+                report = command_result(data.get("summary", "维护检查完成"), config, maintenance=data)
+            elif options.action == "plan":
+                if not options.operation:
+                    raise Blocked("请先选择要预览的维护操作。")
+                data = maintenance.plan(config_path, options.operation)
+                report = command_result(data.pop("summary", "请确认维护计划"), config, **data)
+            else:
+                if not options.plan_id:
+                    raise Blocked("请先预览维护计划，再执行对应计划。")
+                data = maintenance.apply(config_path, options.plan_id)
+                report = command_result(data.pop("summary", "维护完成，请重新检查线路"), config, maintenance=data)
+        elif options.command == "updates":
+            from . import updates
+            config = load_config(config_path) if config_path.exists() else {}
+            if options.action == "check":
+                data = updates.check(config_path)
+            else:
+                if not options.version:
+                    raise Blocked("请先选择正式版本。")
+                data = (updates.download(config_path, options.version) if options.action == "download"
+                        else updates.install(config_path, options.version))
+            report = command_result(data.get("summary", "版本检查完成"), config, update=data)
+        elif options.command == "orca":
+            from . import orca_integration
+            config = load_config(config_path)
+            if options.action == "status":
+                data = orca_integration.integration_status(config_path)
+            else:
+                if not options.project:
+                    raise Blocked("请明确选择 Orca 工作区后打开受控终端。")
+                data = orca_integration.open_protected_terminal(config_path, options.project)
+            report = command_result(data.get("summary", "Orca 入口检查完成"), config, orca=data, ok=data.get("ok") is True)
         elif options.command == "terminal":
             from . import terminal
             if options.action == "version":
@@ -913,9 +965,9 @@ def main(argv: list[str] | None = None) -> int:
                                          else "repair-browser-locks")
         emit(report)
         return 2
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError) as exc:
         report = result([row("error", "操作停止", False, "遇到未完成的系统操作；未自动更改其他网络设置。")], config)
-        emit(report)
+        emit(report, error=exc)
         return 1
 
 

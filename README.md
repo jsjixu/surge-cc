@@ -6,11 +6,11 @@
 
 规则模式下，启动前核对节点和实际出口，检查 DNS 与 WebRTC，通过专用浏览器打开网页及 OAuth 授权，并在运行期间持续检查线路。全局代理模式可挂起出口保护继续使用。提供原生 macOS 窗口和命令行。
 
-当前版本：**0.4.1（Build 15）** · macOS 13+ · Apple Silicon 安装包 · 界面以中文为主
+当前版本：**0.5.0（Build 16）** · macOS 13+ · Apple Silicon 安装包 · 界面以中文为主
 
 Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方隶属关系。它管理本地连接和程序，不提供代理节点，也不保证账号状态或服务资格。
 
-[下载最新版](https://github.com/jsjixu/surge-cc/releases/latest) · [安装与首次配置](#安装与首次配置) · [日常使用](#日常使用) · [多账号切换](#ab-多账号切换) · [检查结果怎么看](#检查结果怎么看) · [常见问题](#常见问题) · [更新记录](CHANGELOG.md) · [验证记录](VALIDATION.md) · [开发接口](INTERFACE.md)
+[下载最新版](https://github.com/jsjixu/surge-cc/releases/latest) · [安装与首次配置](#安装与首次配置) · [日常使用](#日常使用) · [更新与维护](#更新与维护中心) · [多账号切换](#ab-多账号切换) · [检查结果怎么看](#检查结果怎么看) · [常见问题](#常见问题) · [更新记录](CHANGELOG.md) · [验证记录](VALIDATION.md) · [开发接口](INTERFACE.md)
 
 ## 能做什么
 
@@ -34,6 +34,10 @@ Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方�
 | 模型与启动页 | 按工作区保存模型、Effort 和 Claude／新标签页选择；显式 CLI 参数可覆盖模型与 Effort |
 | Dock 快捷入口 | 可自定义名称和工作区；检查线路后打开或激活专用浏览器，使用主应用同一套后端 |
 | 修复预览 | 先列出改动，确认后备份、校验并修复指定组及相关规则；保留无关配置 |
+| 更新维护中心 | 检查终端接管、核验并登记官方原生 Claude Code，保持受控入口；账号和代理设置不变 |
+| 错误处理入口 | 按实际失败项提供浏览器恢复、终端维护、线路预览或系统设置入口；处理后重新检查 |
+| Surge CC 更新 | 手动检查正式发布，下载并验证安装包；同路径安装、自检失败回滚、保留旧 App |
+| Orca 启动诊断 | 显示不同入口的支持范围，并可在已登记的本机 Orca 项目里打开受控终端 |
 
 **规则模式下“异常时停止”有明确范围：** 固定组不含备用节点，专用入口不会主动改走其他出口；进程监控仍有轮询间隔，依赖 Surge 的规则模式、增强模式和有效规则。它不是操作系统防火墙，也不能约束任意忽略代理的 CLI 子进程。完整边界见下文。
 
@@ -67,7 +71,7 @@ Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方�
 
 此发布包为 **Apple Silicon、ad-hoc 签名，未经过 Apple 公证**。macOS 可能阻止首次打开；核对来源后使用系统「隐私与安全性」提供的单个应用打开入口，不需要关闭整体 Gatekeeper。没有相应选项时可从源码构建。新版 ad-hoc 包可能需要重新授予隐私权限，见 [签名说明](SIGNING.md)。Intel 可从源码构建，但尚无真实机器验收。
 
-**先把 App 放到最终位置，再运行向导。** 终端与 Dock 入口引用主应用绝对路径；移动或删除主应用后，需要重新配置，缺失时会阻止启动。发布和下载不会自动替换你现用的安装。
+**先把 App 放到最终位置，再运行向导。** 终端与 Dock 入口引用主应用绝对路径；移动或删除主应用后，需要重新配置，缺失时会阻止启动。仅检查或下载安装包不会替换现用的安装；只有明确点击「安装并重新打开」并确认后，才会执行同路径升级。
 
 ## 日常使用
 
@@ -134,7 +138,11 @@ python3 "$SURGE_CC" terminal status --json
 
 安装命令会先确认程序范围及生效规则，才替换命令入口。此后在项目目录正常执行 `claude`、`claude --resume` 或 `claude auth login`，会先经过 Surge CC 检查；登录使用专用 OAuth 浏览器。检查失败时不运行原版 CLI，也不回退到其他命令或浏览器。标准输入和输出保留给 Claude，接管提示及错误写入标准错误。
 
-已实测 Orca 内置终端与交互式 zsh，以及已登记隔离项目的 Orca 工作树启动检查和原生 CLI 帮助命令。Ghostty 窗口因测试工具限制未操作，Orca 新建 Claude 按钮的完整交互流程未验收；接管按命令路径生效，不依赖终端窗口名称。Orca 若设置了其他 Claude 可执行路径，需要先改回被接管的入口；远端 Orca 不在这台 Mac 的接管范围。**Orca Native Chat 和 managed accounts 的账号目录、恢复历史及完整流程尚未验收，不应视作已支持。**普通项目使用所选 Surge CC 工作区的 Claude 数据目录，已登记隔离项目使用其独立 HOME；都不会自动导入原有 `~/.claude` 登录和会话。
+v0.5.0 增加「维护 → Orca 启动方式」。点击「检查 Orca」可查看本机连接、受控入口与各启动方式的范围；选择已登记的本机 Orca 项目后，可点击「在 Orca 打开受控终端」。这个入口使用已核验的绝对 `claude` 包装器路径，不依赖 shell 别名或 Orca 自定义启动路径。它只创建一个新终端，不向正在使用的终端发送命令；终端创建成功也不等于线路或账号检查通过，真正的检查在新终端中执行。
+
+Orca 1.4.237 已实测内置终端、标准「新建 Claude」终端入口，以及 Native Chat 标准新建聊天的最小请求经过受控入口；具体条件见 [VALIDATION.md](VALIDATION.md)。这不代表所有自定义启动配置均已接管。**旧 Native Chat 恢复、Orca managed accounts 的账号目录和完整恢复流程仍需单独验证。**Orca 的账号选择不等于 Surge CC 的 A/B，受控 CLI 仍使用 Surge CC 当前工作区；不会导入 Orca 账号凭据。
+
+接管按命令路径生效，不依赖终端窗口名称。Orca 若设置了其他 Claude 可执行路径，需要先改回被接管的入口，或使用上述受控终端按钮；远端 Orca、SSH 目标机器和直接执行其他路径的程序不在本机启动接管范围。普通项目使用所选 Surge CC 工作区的 Claude 数据目录，已登记隔离项目使用其独立 HOME；都不会自动导入原有 `~/.claude` 登录和会话。
 
 **Devin CLI 等其他客户端即使用了 Claude 模型，也不会因此被这个 `claude` 入口接管。**本工具不通过模型名称识别或接管其他程序。
 
@@ -142,34 +150,53 @@ python3 "$SURGE_CC" terminal status --json
 
 终端接管保留所有启动必需检查，但跳过可选的外部 DNS 测量，减少终端宿主等待时间。需要查看完整 DNS 观测时，从 GUI 执行「检查线路与隐私」或运行 `check`。
 
-### 更新 Claude Code 或撤销终端接管
+### 更新与维护中心
 
-受控 CLI 子进程设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`，并拒绝 `claude update`、`upgrade`、`install`，避免更新器覆盖受控入口。仅对该子进程生效，不修改全局环境。
+v0.5.0 起，更新和常见故障处理集中在 App 的 **「维护」** 页。维护操作保留 A/B 浏览器资料、CLI 凭据与线路设置；不会修改个人 Chrome、其他代理节点或自动发起登录。完成修复后重新检查线路，修复成功本身不表示线路通过。
 
-需要更新 Claude Code 时，先正常结束受控会话，运行 `terminal uninstall` 恢复原始链接；按官方方式维护 Claude Code，再核对原生程序路径、重新检查规则，运行 `terminal install`。维护期间入口没有 Surge CC 启动保护。
+**Claude Code 出现「原始程序已变化」或入口缺失：** 点击「修复终端接管…」，查看核验及修改计划，再确认执行。计划绑定当前程序、包装器、后端与配置；预览后任何相关文件变化，或计划超过 30 分钟，都会要求重新预览。只接受可验证的官方 macOS 原生安装：固定 Anthropic Developer ID 团队、Claude Code 签名标识及 Apple 信任链，验证后才在空白临时环境中读取版本。未知程序、无法识别的链接和签名不符不会被直接接受或覆盖。
 
-```sh
-python3 "$SURGE_CC" terminal uninstall --json
-```
+**更新 Claude Code：** 先保存并正常关闭受控浏览器和 CLI，点击「更新 Claude Code…」，预览后执行。维护中心通过已配置的本机代理下载官方最新版本，核对发布清单 SHA-256、文件大小及上述 Apple 发布者签名，再重新登记程序。维护期间保留受控包装器，不先恢复成可直接启动的原生链接；账号启动门禁、工作区锁和持久维护标记阻止并发启动。提交失败会尝试恢复本次替换的记录；遇到并发修改或无法确认恢复状态则继续阻止启动，保留恢复文件供后续检查。
 
-卸载只恢复自己接管且未被外部改写的入口，不删除工作区、登录资料或项目；不会自动删除 Surge 中的旁路拒绝规则。
+原版本文件保留，新版本必须已在现有 CLI 旁路保护范围内。若仅配置了某一个版本文件，而没有官方 `versions/` 目录范围，先通过配置向导调整该范围并检查；维护中心不会擅自扩展 Surge 规则。Homebrew、npm、自定义目录和未知安装布局不在这一自动维护流程内。
 
-### 升级 Surge CC（0.2.6 及以后）
+受控 CLI 子进程继续设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`，拒绝在普通会话中直接执行 `claude update`、`upgrade` 或 `install`；这些限制只作用于受控子进程。更新维护中心不运行远程安装脚本，也不读取或复制旧账号的配置来运行版本探测。官方原生安装与签名说明见 [Claude Code 官方文档](https://code.claude.com/docs/en/setup#binary-integrity-and-code-signing)。
 
-0.2.6 修复了 Mac 重启或卷重新挂载后可能出现的「原始 Claude 程序已变化」误报：原文件没有改变，但挂载设备编号可能变化。新版仍检查原生程序路径、inode、大小、修改时间、所有者和权限，以及原链接备份和包装器；这些检查不一致时仍阻止启动，不会自动更新登记来放行。
-
-**终端接管指向应用包内后端时，可在相同安装路径升级，无需先卸载接管：**正常结束受控 CLI、专用网页和授权窗口，退出 Surge CC；保留旧 App 备份，将新 App 放回原来的完整路径。保持原有 Python 和配置文件路径不变，然后从新 App 执行 `terminal status --json`，再运行 `claude --version` 核对受控入口，最后在 GUI 执行「检查线路与隐私」。版本查询不启动原生 Claude，也不代替线路检查。
-
-如果需要移动 App、改变后端位置，或终端接管指向另行维护的独立后端，单独替换 GUI 不会更新那个后端。将新 App 放到最终位置后，使用**新版**后端撤销旧接管，再安装到新后端。旧版若因设备编号误报而无法卸载，也使用这一流程：
+命令行使用同一流程：
 
 ```sh
 SURGE_CC="/Applications/Surge CC.app/Contents/Resources/scripts/surge-cc"
-python3 "$SURGE_CC" terminal uninstall --json
-python3 "$SURGE_CC" terminal install --json
-python3 "$SURGE_CC" terminal status --json
+python3 "$SURGE_CC" maintenance status --json
+python3 "$SURGE_CC" maintenance plan --operation repair-terminal --json
+# 核对返回的 actions 后，将真实 plan_id 填入下一条命令：
+python3 "$SURGE_CC" maintenance apply --plan-id '<plan_id>' --json
+# 更新版本的预览，将 operation 改为 update-claude：
+python3 "$SURGE_CC" maintenance plan --operation update-claude --json
 ```
 
-使用自定义配置路径时，在每条子命令前保留 `--config '/absolute/path/to/config.json'`。只有卸载成功后才继续安装；维护期间不要启动 Claude，安装成功且线路检查通过后再恢复使用。若新版仍报告原生程序或入口改变，应核对实际文件，不要手工修改登记来跳过检查。上述升级保留工作区及登录资料；ad-hoc 签名更新仍可能需要重新授予 macOS 隐私权限。
+**常见错误下方的处理按钮：** 浏览器占用进入专用窗口恢复；原生程序变化进入维护计划；Surge 未运行或模式不合适时打开 Surge；规则异常进入线路修复预览；出口不符时打开线路设置供核对。不会把探测到的新 IP 自动改成预期 IP，也不会把另一处终端故障当作当前网络错误的原因。权限缺失时打开对应系统设置，系统仍可能要求用户完成身份确认。
+
+### 升级 Surge CC
+
+在「维护 → Surge CC 更新」中点击「检查新版本」，查看正式发布说明后选择「下载并校验」，再点击「安装并重新打开…」。只检查或下载不会替换 App，不会在后台定时自动安装。
+
+更新器只接受本仓库的正式发布，检查安装包大小、SHA-256、解压路径、应用标识、版本、代码签名完整性、处理器和系统要求。安装前要求受控会话空闲，在原路径替换 App；新版基础自检失败时回滚，成功后保留旧 App 备份并重新打开。工作区和代理配置位于 App 之外，更新流程不迁移或覆盖它们。当前应用内安装包更新仅适用于 Apple Silicon；源码构建及 Intel 机器继续手动维护。
+
+**这与 Claude Code 的发布者签名验证不同：Surge CC 发布包仍使用 ad-hoc 签名，未经过 Apple 公证。** GitHub 发布和配套校验清单是当前分发信任来源；SHA-256 可发现下载损坏，不能抵御发布账号本身被攻破。安装新版后 macOS 仍可能要求重新开启应用管理等权限，固定 Developer ID 签名问题尚未解决，见 [SIGNING.md](SIGNING.md)。
+
+手动应急升级仍可使用：保存工作并正常关闭专用会话和 Surge CC，备份旧 App，把验证过的新 App 放回**原来的完整安装路径**，再执行 `terminal status --json`、`claude --version` 和线路检查。同路径替换不需要先卸载终端接管；版本查询只读取受控登记，不代替线路检查。
+
+App 移动到其他路径或终端入口指向独立后端时，需要先恢复其已登记的后端位置，或由维护人员使用 `terminal.update_backend` 原子重新绑定到新版后端；不能仅替换另一份 GUI 就认为终端已更新。不要手工编辑 manifest 来接受未知二进制，也不要为更新而临时移除包装器。自定义配置路径应在每条命令的子命令前保留 `--config '/absolute/path/to/config.json'`。
+
+### 明确撤销终端接管
+
+只有决定不再由 Surge CC 接管 `claude` 时，才运行：
+
+```sh
+python3 "$SURGE_CC" terminal uninstall --json
+```
+
+卸载只恢复能够验证的原始命令链接，不删除工作区、登录资料或项目，也不会自动删除 Surge 中的旁路拒绝规则。撤销后该命令不再执行 Surge CC 的启动检查。程序或入口已经变化时可能拒绝卸载，应先从维护中心核验处理；这不是日常升级的必要步骤。
 
 ### OAuth 登录
 
@@ -392,10 +419,10 @@ git clone https://github.com/jsjixu/surge-cc.git
 cd surge-cc
 python3 -m unittest discover -s tests -v
 ./scripts/test-gui.sh
-SURGE_CC_APP_NAME='Surge CC 0.4.1.app' ./scripts/build-app.sh
+SURGE_CC_APP_NAME='Surge CC 0.5.0.app' ./scripts/build-app.sh
 ```
 
-使用 v0.4.1 源码时，输出为 `dist/Surge CC 0.4.1.app`，只构建当前机器架构。默认使用开发用 ad-hoc 签名，更新后可能需要重新授权 macOS 隐私权限；浏览器恢复和暂停提示没有改变这一限制。若要使用固定代码签名证书，设置 `SURGE_CC_SIGNING_IDENTITY` 为有效证书的 SHA-1 指纹或精确名称；证书缺失或签名失败会停止，不自动降级。证书申请、首次迁移、升级前连续性验证与公证边界见 [固定签名指南](SIGNING.md)。
+使用 v0.5.0 源码时，输出为 `dist/Surge CC 0.5.0.app`，只构建当前机器架构。默认使用开发用 ad-hoc 签名，更新后可能需要重新授权 macOS 隐私权限；浏览器恢复和暂停提示没有改变这一限制。若要使用固定代码签名证书，设置 `SURGE_CC_SIGNING_IDENTITY` 为有效证书的 SHA-1 指纹或精确名称；证书缺失或签名失败会停止，不自动降级。证书申请、首次迁移、升级前连续性验证与公证边界见 [固定签名指南](SIGNING.md)。
 
 构建不会安装、启动应用或修改代理。已有同名输出会被拒绝；用 `SURGE_CC_APP_NAME` 或 `SURGE_CC_DIST_DIR` 选择新文件名或目录，不会覆盖正在使用的应用。
 

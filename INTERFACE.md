@@ -1,28 +1,28 @@
-# Surge CC 0.4.1 接口合约
+# Surge CC 0.5.0 接口合约
 
-本文对应 **v0.4.1 / Build 15**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
+本文对应 **v0.5.0 / Build 16**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 终端入口
 
 `terminal.install` 接管当前用户已有的 `~/.local/bin/claude` 官方符号链接。先验证路径、文件权限、原始可执行文件与版本，再将原链接及清单保存在默认 Application Support 下的 `terminal/`，通过原子交换替换入口。已有普通文件、其他用户可写路径、不一致或未完成的清单均拒绝覆盖。`terminal uninstall` 仅在当前包装器仍与记录一致时原子恢复原链接，不移除 Surge 规则、工作区或账号资料。
 
-包装器调用固定 Python、固定后端和固定配置的 `launch code --passthrough -- ...`，不使用 shell 求值传递 Claude 参数；依赖缺失、入口改变或校验失败时没有原版 CLI 回退。`core.default_claude` 经 `terminal.original_claude` 找回校验后的原生程序，避免递归调用包装器。原生路径及 stat 身份固定在安装记录中，原始文件变化后拒绝继续运行，需要通过卸载、维护、重新安装流程更新。
+包装器调用固定 Python、固定后端和固定配置的 `launch code --passthrough -- ...`，不使用 shell 求值传递 Claude 参数；依赖缺失、入口改变或校验失败时没有原版 CLI 回退。`core.default_claude` 经 `terminal.original_claude` 找回校验后的原生程序，避免递归调用包装器。原生路径及 stat 身份固定在安装记录中，原始文件变化后拒绝继续运行；通过维护中心生成修复计划，核验官方签名后重新登记，不先卸载受控入口。
 
 精确单参数 `claude --version` 或 `claude -v` 转到 `terminal version`，只在验证清单、入口和原始文件身份后输出缓存版本，不运行原生程序或网络检测。它用于终端和编辑器的版本发现，不能证明当前线路通过。`--passthrough` 把包装器的检查/错误写到 stderr，成功结束时不在 stdout 追加操作回执；stdin/stdout 保留给 CLI。安装的 shell 入口依赖缺失返回 `78`，进入后端后的退出码约定见下文。
 
 0.2.6 开始，持久化原生程序身份比较只使用 inode、大小和纳秒修改时间，仍检查规范路径、所有者、权限与可执行性。`original_stat` 保持四项记录格式兼容旧数据，但首项 `st_dev` 是挂载期间的设备编号，不用于跨重启身份比较；短期原子交换和并发检查继续比较设备号。该 stat 检查不是对同 inode、同大小、同修改时间的内容篡改进行密码学鉴定。
 
-安装入口前要求 `cli_process_paths` 非空、覆盖当前原生程序，并通过 `containment.validate_scope`。运行入口和 GUI 启动共用代理检查、工作区、`OAuthSession` 与受控进程监控。GUI 不需要保持打开，但后端、Python 和配置仍须位于安装记录中的位置；应先把应用放到最终位置，再安装接管。包装器固定后端路径，不固定后端文件摘要，因此正常结束受控会话后，在同路径替换应用包内后端即可加载新版，无需重建登记。移动后端则需使用新版 `terminal uninstall` 撤销旧入口，再从新位置安装；旧版因 `st_dev` 误报无法卸载时也使用新版维护命令。独立后端不会随 GUI 替换自动更新。
+安装入口前要求 `cli_process_paths` 非空、覆盖当前原生程序，并通过 `containment.validate_scope`。运行入口和 GUI 启动共用代理检查、工作区、`OAuthSession` 与受控进程监控。GUI 不需要保持打开，但后端、Python 和配置仍须位于安装记录中的位置；应先把应用放到最终位置，再安装接管。包装器固定后端路径，不固定后端文件摘要，因此正常结束受控会话后，在同路径替换应用包内后端即可加载新版，无需重建登记。移动后端需要显式维护绑定，可通过下述内部 `terminal.update_backend` 在验证后重新绑定；正常同路径升级不需要此步骤。独立后端不会随 GUI 替换自动更新。
 
-当前使用范围为本机终端命令，包括 Ghostty 与 Orca 终端/TUI 通过该路径执行的 `claude`。Orca Native Chat 与 managed accounts 的账号目录、父子进程 transcript 读取及恢复流程尚未验收；包装器会使用 Surge CC 所选工作区的 `CLAUDE_CONFIG_DIR`，不宣称兼容 Orca 的其他账号目录。已在接管前运行的会话不会被收编，其他二进制副本和远端主机也不会自动接管。
+当前使用范围为本机终端命令，包括 Ghostty 与 Orca 终端/TUI 通过该路径执行的 `claude`。Orca 标准 Native Chat 新建最小请求与同工作区 CLI 历史恢复已实测，具体版本和条件见 [Orca 启动验收](docs/orca-launch-validation.md)。Native Chat 界面继续旧聊天和 managed accounts 切换尚未端到端验收；包装器使用 Surge CC 所选工作区的 `CLAUDE_CONFIG_DIR`，不将 Orca 的账号选择映射为 A/B。已在接管前运行的会话不会被收编，其他二进制副本和远端主机也不会自动接管。
 
 Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的原生 `claude`。终端入口不拦截它们，也不根据模型名称推断保护范围。
 
 包装器设置 `SURGE_CC_TERMINAL_ENTRY=1`。该入口仍执行所有启动必需检查，但调用 `full_checks(..., external_dns=False)` 跳过可选外部 DNS 测量；GUI 完整检查与公共 `check` 不因此改变。
 
-每个受控 CLI 子进程设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`；拒绝 `update`、`upgrade`、`install` 更新入口，避免安装器覆盖包装器。这不是全局环境变更。维护需先正常结束会话、卸载入口、更新官方程序，再校验范围并重新安装接管。
+每个受控 CLI 子进程设置 `DISABLE_UPDATES=1` 与 `DISABLE_AUTOUPDATER=1`；拒绝 `update`、`upgrade`、`install` 更新入口，避免安装器覆盖包装器。这不是全局环境变更。日常维护先正常结束受控会话，再使用 `maintenance plan` / `maintenance apply`；核验官方更新并保持包装器受控，不先卸载入口或直接运行原生更新器。
 
-维护代码可调用内部 `terminal.update_backend(entrypoint, python_executable=None, *, state_dir=None)`，将完整且可验证的受控入口重新绑定到独立后端；当前没有 `terminal update` 公共命令或自动更新界面。它保留原生程序、配置与原始符号链接备份，先原子交换包装器，再交换清单。中间不一致状态会拒绝启动，不短暂恢复原生入口；失败尝试按已核实的文件身份回滚，并保留无法安全恢复的私有副本。此操作不修改 GUI bundle、Surge 配置或系统权限，不保证系统权限以后不会变化。新后端与 Python 路径仍须长期保留。
+维护代码可调用内部 `terminal.update_backend(entrypoint, python_executable=None, *, state_dir=None)`，将完整且可验证的受控入口重新绑定到独立后端；此内部重绑定操作没有 `terminal update` 公共命令；0.5.0 的维护界面及下述 `maintenance` / `updates` 命令分别处理原生 CLI 和应用版本维护。它保留原生程序、配置与原始符号链接备份，先原子交换包装器，再交换清单。中间不一致状态会拒绝启动，不短暂恢复原生入口；失败尝试按已核实的文件身份回滚，并保留无法安全恢复的私有副本。此操作不修改 GUI bundle、Surge 配置或系统权限，不保证系统权限以后不会变化。新后端与 Python 路径仍须长期保留。
 
 ## OAuth 打开器
 
@@ -48,11 +48,27 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 
 `repair` 本身不结束任何进程，仍可离线独立调用。它按上述 session 机制取得工作区租约，再依次取得 OAuth 和浏览器独占锁，复核专用 profile 进程、SingletonLock 的本机 PID 和 SingletonSocket 状态，再将确认过期的三个顶层符号链接归档到工作区 data 以外的私有目录。权限/路径异常、活跃或无法确认的状态均拒绝操作；不处理登录资料、其他锁文件或外部 socket 目标。
 
-浏览器占用类错误返回 `recovery_action:"recover-browser"`；`recover` 的拒绝结果保留该动作供重试，传统 `repair` 的拒绝结果可返回 `recovery_action:"repair-browser-locks"`。GUI 只识别这两个固定白名单动作，不执行任意后端命令，也不从摘要猜测动作。非当前工作区的快照/恢复错误不提供当前工作区动作。工作区页常驻提供恢复按钮及次要的仅清锁按钮，目标为已应用的当前工作区，而非尚未生效的选择器值。
+浏览器占用类错误返回 `recovery_action:"recover-browser"`；`recover` 的拒绝结果保留该动作供重试，传统 `repair` 的拒绝结果可返回 `recovery_action:"repair-browser-locks"`。这两个旧恢复字段保持兼容。0.5.0 另提供下述 `remediation_action` 固定白名单；GUI 不从错误文本拼接命令或执行后端提供的任意命令。非当前工作区的快照/恢复错误不提供当前工作区动作。工作区页常驻提供恢复按钮及次要的仅清锁按钮，目标为已应用的当前工作区，而非尚未生效的选择器值。
 
 成功返回 `recovery:{status,workspace,removed_count,backup_path,message}`。离线 `repair` 的 `status` 为 `repaired` 或 `no_stale_locks`；`recover` 还附 `stopped_profiles`，实际关闭窗口时状态为 `recovered`。归档路径是本地私密信息，公开分享前需脱敏。操作成功只表示恢复完成，`checks:[]`，不代表线路或保护已经通过。
 
 GUI 调用任一命令成功后清除旧错误并自动执行新的 `check`；仅消费新检查的线路结论，不自动启动网页、CLI 或登录。失败显示具体原因并保留重试，执行期间禁用操作按钮，新检查清除上次恢复动作。CLI 使用者需自行运行 `check`。
+
+## 更新维护与错误处理
+
+`maintenance status` 只读检查终端登记和文件状态，不运行原生程序或访问更新服务器；结果放在 `maintenance` 字段，含 `ok`、`summary`、`entries` 和时间。操作回执的 `ok:true` 仅表示读取完成，具体入口是否有效须检查 `maintenance.ok`。
+
+`maintenance plan --operation repair-terminal|update-claude` 返回顶层 `plan_id`、`operation`、`target_version` 和 `actions:[{id,title,detail}]`。计划保存在私有目录，有效期 30 分钟，绑定配置、登记和文件状态。修复只接受可核验的官方原生安装；更新从官方发布源经现有本机代理读取清单并下载，核对 SHA-256、大小以及 Apple 信任链、固定 Anthropic 团队和 Claude Code 签名标识。原生版本探测只在发布者核验后、清除认证变量的临时环境内运行。
+
+`maintenance apply --plan-id ID` 执行前重新核验计划，取得账号门禁及所有工作区空闲锁；活动会话或并发变化均拒绝，不强行结束任务。目标必须处于已有 CLI 旁路拒绝范围，维护不扩张 Surge 规则。维护标记阻止新启动；受控入口、清单和备份通过原子文件交换提交，失败回滚可确认的本次改动，未知冲突保持阻止并保留恢复资料。成功回执放在 `maintenance` 字段，GUI 随后重新检查线路，不自动启动或登录。
+
+`updates check` 手动查询固定 GitHub 仓库 `jsjixu/surge-cc` 的正式发布。结果位于 `update`，状态为 `available`、`current`、`ahead` 或 `unavailable`，带当前/最新版本及 `can_download`。`updates download --version X.Y.Z` 下载指定正式版本到私有缓存，校验配套 SHA-256、归档路径、应用标识、版本、签名完整性、处理器和系统要求；不会安装；只有高于当前版本时才返回 `can_install:true`，应用内安装拒绝同版或降级。当前公开安装包为 arm64。
+
+`updates install --version X.Y.Z` 使用已验证缓存，只在应用包上下文和原安装路径执行。所有工作区须空闲；后台 helper 重新解压核验，完成准备确认后等待 GUI 退出，再原子交换应用。准备超时会取消，自检失败尝试回滚，旧包与恢复回执保留在私有目录。`installing` 只表示安装已交接；最终结果通过后续检查的 `last_install` 显示 `installed`、`rolled-back` 或 `failed`。下载摘要和 ad-hoc 签名不构成发行者身份证明，分发信任依赖固定 GitHub 仓库；当前版本未经过 Apple 公证，更新可能要求重新授予 macOS 权限。
+
+`orca status` 返回 `orca` 下的入口检查、版本和支持范围，不读取凭据或聊天。`orca open-terminal --project PATH` 只接受已登记的本机项目，核验包装器与配置绑定后，通过 Orca 官方 CLI 创建一个终端并调用绝对受控路径。成功创建仍带 `route_checked:false`，实际线路和启动结果以终端内检查为准；回执不明时不自动重试。它不向既有任务发送内容，也不改变 Orca 托管账号或 Surge CC A/B。
+
+错误回执可含 `remediation_action`，允许值为 `recover-browser`、`repair-terminal`、`open-surge`、`configure-route`、`repair-route`、`open-app-management`、`recheck`。后端依据已知检查项和维护错误生成动作，GUI 仅映射到固定实现；未知值不执行。线路或终端修复先预览再确认，操作成功后重新检查；出口不符不会自动覆盖预期 IP，打开系统权限页也不等于已经获得权限。
 
 ## 设置
 
@@ -115,6 +131,14 @@ GUI 调用任一命令成功后清除旧错误并自动执行新的 `check`；�
 | `terminal status` | 检查清单、入口、备份、原始程序与后端，返回终端接管状态；不执行线路检查 |
 | `terminal uninstall` | 核对后恢复原始符号链接，保留工作区和 Surge 规则；不覆盖外部改动 |
 | `terminal version` | 验证安装记录并输出缓存的原生 CLI 版本，不执行原生程序 |
+| `maintenance status` | 读取受控 CLI 维护状态，不执行原生程序或网络查询 |
+| `maintenance plan --operation repair-terminal\|update-claude` | 核验官方候选并生成有时效的维护计划，不替换入口 |
+| `maintenance apply --plan-id ID` | 重新核验计划，在工作区空闲和门禁下修复或更新 CLI；保留账号与代理配置 |
+| `updates check` | 查询固定 GitHub 仓库的正式版本和上次安装结果 |
+| `updates download --version X.Y.Z` | 下载并校验指定正式安装包，不安装；仅较新版本允许后续安装 |
+| `updates install --version X.Y.Z` | 对已验证的缓存准备同路径安装，空闲校验后交接后台 helper |
+| `orca status` | 只读核验本机 Orca 与终端入口，返回支持范围 |
+| `orca open-terminal --project PATH` | 在已登记本机项目创建一个使用受控绝对入口的 Orca 终端 |
 | `guard-status` | 读取现有状态文件并计算最近回执是否有效，不执行新的网络检查、不证明当前进程存活 |
 
 网页入口不接受额外参数。CLI 额外参数必须放在 `--` 后。`--settings VALUE` / `--settings=VALUE` 只接受通过 `launch_settings_safe` 的内联 JSON，不接受文件路径，避免检查后文件变化；`--setting-sources` 的两种形式只接受 `user`、`project`、`local` 的非空、无重复组合。内联及磁盘 settings 均拒绝覆盖 `BROWSER`、`CLAUDE_CONFIG_DIR`，不允许解除更新禁用、设置非专用代理或非空绕过列表，也拒绝其他模型服务与远端启动冲突。Orca 命令发现使用的 `{"disableAllHooks":true}` 可以通过语义检查。启动前仍检查工作区、项目祖先目录与文件形式的托管 settings；检查不会运行其中的 hooks。

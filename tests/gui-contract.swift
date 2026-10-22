@@ -314,6 +314,164 @@ private enum GUIContractTests {
             _ = try report([], ok: false, recoveryAction: ["repair-browser-locks"])
             preconditionFailure("Malformed recovery metadata must not be interpreted as a command")
         } catch is DecodingError {}
-        print("GUI contract: gating, strict global suspension/launch metadata, evidence, summaries, settings, recovery allowlist, retry/reset and automatic recheck passed")
+        // General remediation is an exact enum allowlist. Neither backend prose
+        // nor an arbitrary command line or URL can create an executable action.
+        for action in RemediationAction.allCases {
+            let failed = try report([], ok: false, metadata: ["remediation_action": action.rawValue])
+            precondition(failed.remediationAction == action)
+            precondition(RemediationAction.after(failed, exitCode: 1) == action)
+            let successful = try report([], metadata: ["remediation_action": action.rawValue])
+            precondition(RemediationAction.after(successful, exitCode: 0) == nil)
+        }
+        for untrusted in ["", "open https://evil.example", "repair-terminal --force", "rm -rf ~", "maintenance-terminal"] {
+            let failed = try report([], ok: false, metadata: ["remediation_action": untrusted])
+            precondition(failed.remediationAction == nil)
+        }
+        do {
+            _ = try report([], ok: false, metadata: ["remediation_action": ["repair-terminal"]])
+            preconditionFailure("Malformed remediation metadata must not decode")
+        } catch is DecodingError {}
+
+        // A maintenance plan needs successful status, a bound opaque ID, a known
+        // operation, and a complete, unambiguous action list before apply exists.
+        let maintenanceActions: [[String: Any]] = [
+            ["id": "verify", "title": "Verify native program", "detail": "Signature and checksum"],
+            ["id": "register", "title": "Register wrapper", "detail": "Retain workspace data"]
+        ]
+        let maintenanceMetadata: [String: Any] = ["plan_id": "plan_0123456789-abc",
+            "operation": "repair-terminal", "actions": maintenanceActions]
+        let maintenanceResponse = try report([], metadata: maintenanceMetadata)
+        let plan = MaintenancePlan(maintenanceResponse, exitCode: 0)!
+        precondition(plan.operation == .repairTerminal && plan.actions.count == 2)
+        precondition(plan.arguments == ["maintenance", "apply", "--plan-id", "plan_0123456789-abc", "--json"])
+        precondition(MaintenanceOperation.updateClaude.arguments == ["maintenance", "plan", "--operation", "update-claude", "--json"])
+        precondition(MaintenancePlan(maintenanceResponse, exitCode: 1) == nil)
+        let failedMaintenance = try report([], ok: false, metadata: maintenanceMetadata)
+        precondition(MaintenancePlan(failedMaintenance, exitCode: 0) == nil)
+        for invalidID in ["", "../../plan", "plan --force", String(repeating: "a", count: 129), "日本語", "plan\n"] {
+            var metadata = maintenanceMetadata
+            metadata["plan_id"] = invalidID
+            let invalidPlan = MaintenancePlan(try report([], metadata: metadata), exitCode: 0)
+            precondition(invalidPlan == nil)
+        }
+        for invalidOperation in ["install", "update-claude --force", "", "launch"] {
+            var metadata = maintenanceMetadata
+            metadata["operation"] = invalidOperation
+            let invalidPlan = MaintenancePlan(try report([], metadata: metadata), exitCode: 0)
+            precondition(invalidPlan == nil)
+        }
+        for invalidActions: Any in [[], [maintenanceActions[0], maintenanceActions[0]],
+                                   [["id": "x", "title": "Incomplete"]],
+                                   Array(repeating: maintenanceActions[0], count: 41), "shell"] {
+            var metadata = maintenanceMetadata
+            metadata["actions"] = invalidActions
+            let invalidPlan = MaintenancePlan(try report([], metadata: metadata), exitCode: 0)
+            precondition(invalidPlan == nil)
+        }
+        let maintenanceEntries = try report([], metadata: ["maintenance": ["entries": [
+            ["id": "terminal", "title": "Terminal", "status": "warn", "detail": "Changed", "action": "repair-terminal"],
+            ["id": "unknown", "title": "Other", "status": "info", "detail": "Info", "action": "launch web"],
+            ["id": "bad", "title": "Bad", "status": "invalid", "detail": "Invalid"]
+        ]]])
+        let entryValues = maintenanceEntries.document["maintenance"]!.object["entries"]!.array
+        precondition(MaintenanceEntry(entryValues[0])?.action == .repairTerminal)
+        precondition(MaintenanceEntry(entryValues[1])?.action == nil)
+        precondition(MaintenanceEntry(entryValues[2]) == nil)
+
+        // Download and install form separate phases. UI only quits for a positive
+        // installing acknowledgement, never merely for a fetched release.
+        let updateMetadata: [String: Any] = ["state": "available", "current_version": "0.4.1",
+            "latest_version": "0.5.0", "version": "0.5.0", "can_download": true,
+            "release_url": "https://github.com/jsjixu/surge-cc/releases/tag/v0.5.0", "size": 2000000,
+            "notes": "A maintenance release"]
+        let available = UpdateInfo(try report([], metadata: ["update": updateMetadata]))!
+        precondition(available.canDownload && !available.canInstall && available.releaseURL != nil)
+        precondition(available.downloadArguments == ["updates", "download", "--version", "0.5.0", "--json"])
+        precondition(available.installArguments == nil && available.size == 2000000)
+        precondition(!available.shouldQuitForInstall(exitCode: 0, successful: true))
+        var downloadedMetadata = updateMetadata
+        downloadedMetadata["state"] = "downloaded"
+        downloadedMetadata["can_install"] = true
+        downloadedMetadata["package_path"] = "/tmp/Surge-CC-0.5.0-arm64.zip"
+        downloadedMetadata["sha256"] = String(repeating: "a", count: 64)
+        let downloaded = UpdateInfo(try report([], metadata: ["update": downloadedMetadata]))!
+        precondition(downloaded.canInstall && !downloaded.canDownload)
+        precondition(downloaded.installArguments == ["updates", "install", "--version", "0.5.0", "--json"])
+        var installingMetadata = downloadedMetadata
+        installingMetadata["state"] = "installing"
+        let installing = UpdateInfo(try report([], metadata: ["update": installingMetadata]))!
+        precondition(installing.shouldQuitForInstall(exitCode: 0, successful: true))
+        precondition(!installing.shouldQuitForInstall(exitCode: 1, successful: true))
+        precondition(!installing.shouldQuitForInstall(exitCode: 0, successful: false))
+        for badVersion in ["", "v0.5.0", "0.5.0 --force", "../0.5.0", "0.5.0\n", "1", "1.2.3;open"] {
+            var metadata = updateMetadata
+            metadata["version"] = badVersion
+            let update = UpdateInfo(try report([], metadata: ["update": metadata]))!
+            precondition(update.downloadArguments == nil)
+            precondition(update.installArguments == nil)
+            precondition(!update.shouldQuitForInstall(exitCode: 0, successful: true))
+        }
+        for link in ["https://github.com.evil.example/jsjixu/surge-cc/releases/tag/v0.5.0",
+                     "https://evil.example", "file:///Applications/Surge.app", "http://github.com/jsjixu/surge-cc/releases/latest",
+                     "https://github.com/jsjixu/surge-cc/releases/tag/v9.9.9",
+                     "https://user@github.com/jsjixu/surge-cc/releases/latest",
+                     "https://github.com:443/jsjixu/surge-cc/releases/latest",
+                     "https://github.com/jsjixu/surge-cc/releases/latest?next=evil",
+                     "https://github.com/jsjixu/surge-cc/releases/latest#fragment"] {
+            precondition(UpdateInfo.releaseURL(link, version: "0.5.0") == nil)
+        }
+        precondition(UpdateInfo.releaseURL("https://github.com/jsjixu/surge-cc/releases/latest", version: "") != nil)
+        for state in ["current", "ahead", "unavailable"] {
+            var metadata = downloadedMetadata
+            metadata["state"] = state
+            let update = UpdateInfo(try report([], metadata: ["update": metadata]))!
+            precondition(!update.canDownload && !update.canInstall)
+        }
+        let failedUpdate = UpdateInfo(try report([], ok: false, metadata: ["update": updateMetadata]))!
+        precondition(!failedUpdate.canDownload && !failedUpdate.canInstall)
+        let missingUpdate = UpdateInfo(try report([]))
+        let unknownUpdate = UpdateInfo(try report([], metadata: ["update": ["state": "execute"]]))
+        precondition(missingUpdate == nil && unknownUpdate == nil)
+        let orcaMetadata: [String: Any] = ["version": "1.0.0", "running": true, "launch_ready": true,
+            "modes": [["id": "terminal", "title": "Terminal", "status": "pass", "detail": "Guarded wrapper"],
+                      ["id": "managed", "title": "Managed account", "status": "warn", "detail": "Separate authentication"]]]
+        let orcaResponse = try report([], metadata: ["orca": orcaMetadata])
+        let orca = OrcaStatus(orcaResponse, exitCode: 0)!
+        precondition(orca.running && orca.launchReady && orca.modes.count == 2)
+        let projectURL = URL(fileURLWithPath: "/tmp/Project with spaces")
+        precondition(orca.terminalArguments(project: projectURL) ==
+                     ["orca", "open-terminal", "--project", "/tmp/Project with spaces", "--json"])
+        precondition(orca.terminalArguments(project: URL(string: "https://example.com/project")!) == nil)
+        precondition(orca.terminalArguments(project: URL(fileURLWithPath: "/tmp/project\ncommand")) == nil)
+        let failedOrca = OrcaStatus(try report([], ok: false, metadata: ["orca": orcaMetadata]), exitCode: 0)!
+        precondition(!failedOrca.launchReady && failedOrca.terminalArguments(project: projectURL) == nil)
+        precondition(OrcaStatus(orcaResponse, exitCode: 1)?.launchReady == false)
+        var unknownReadiness = orcaMetadata
+        unknownReadiness["launch_ready"] = "true"
+        let unknownOrca = OrcaStatus(try report([], metadata: ["orca": unknownReadiness]), exitCode: 0)!
+        precondition(!unknownOrca.launchReady)
+        for state in ["installed", "rolled-back", "failed"] {
+            let receiptResponse = try report([], metadata: ["update": ["state": "current", "last_install": [
+                "state": state, "version": "0.5.0", "summary": "Previous update result", "backup_available": true,
+                "backup_path": "/private/local/backup", "app": "/private/local/application"
+            ]]])
+            let receipt = InstallReceipt(receiptResponse.document["update"]!.object["last_install"]!)!
+            precondition(receipt.state == state && receipt.version == "0.5.0" && receipt.backupAvailable)
+            precondition(receipt.summary == "Previous update result" && !receipt.title.isEmpty)
+        }
+        for invalidReceipt: [String: Any] in [
+            ["state": "installing", "summary": "incomplete", "backup_available": true],
+            ["state": "failed", "summary": "", "backup_available": false],
+            ["state": "failed", "summary": "result", "backup_available": "true"],
+            ["state": "failed", "summary": "result"]
+        ] {
+            let receiptResponse = try report([], metadata: ["receipt": invalidReceipt])
+            precondition(InstallReceipt(receiptResponse.document["receipt"]!) == nil)
+        }
+        let receiptBounds = try report([], metadata: ["receipt": ["state": "failed", "version": "../../private",
+            "summary": String(repeating: "x", count: 3000), "backup_available": false]])
+        let boundedReceipt = InstallReceipt(receiptBounds.document["receipt"]!)!
+        precondition(boundedReceipt.version == nil && boundedReceipt.summary.count == 2000 && !boundedReceipt.backupAvailable)
+        print("GUI contract: gating, recovery, maintenance plans, update phases, and strict command/URL allowlists passed")
     }
 }

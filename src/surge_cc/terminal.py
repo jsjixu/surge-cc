@@ -120,7 +120,8 @@ def _exchange(first: Path, second: Path):
         raise OSError(error, os.strerror(error))
 
 
-def _read(folder: Path):
+def _read_registration(folder: Path):
+    """Read structural ownership evidence without accepting a changed native binary."""
     _private_dir(folder)
     file = folder / "manifest.json"
     info = _regular(file)
@@ -146,6 +147,16 @@ def _read(folder: Path):
     if not backup.is_symlink() or os.readlink(backup) != data["original_link"]:
         raise Blocked("终端集成的原始入口备份被修改，已阻止启动。")
     expected = (Path(data["command_path"]).parent / data["original_link"]).resolve()
+    if expected != Path(data["original_path"]):
+        raise Blocked("终端集成原始入口记录不一致。")
+    return data
+
+
+def _read(folder: Path):
+    if os.path.lexists(folder / "maintenance-active.json"):
+        raise Blocked("Claude Code 维护尚未完成，已阻止启动；请在更新维护中心检查并修复。")
+    data = _read_registration(folder)
+    expected = Path(data["original_path"])
     # st_dev identifies the current mount, not a persistent volume identity; on
     # macOS it can change across a reboot/remount while the file is unchanged.
     # Retain the four-field schema for existing installations, but compare only

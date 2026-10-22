@@ -194,6 +194,217 @@ private enum BrowserRecoveryAction: String, Sendable {
     }
 }
 
+private enum RemediationAction: String, Sendable, CaseIterable {
+    case repairTerminal = "repair-terminal"
+    case repairRoute = "repair-route"
+    case recoverBrowser = "recover-browser"
+    case openSurge = "open-surge"
+    case openAppManagement = "open-app-management"
+    case configureRoute = "configure-route"
+    case recheck
+
+    var title: String {
+        switch self {
+        case .repairTerminal: return "修复 Claude Code 接管…"
+        case .repairRoute: return "预览线路修复…"
+        case .recoverBrowser: return "关闭专用窗口并修复"
+        case .openSurge: return "打开 Surge"
+        case .openAppManagement: return "打开应用管理权限"
+        case .configureRoute: return "补全线路设置"
+        case .recheck: return "重新检查"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .repairTerminal: return "核验 Claude Code 程序并重新登记终端接管。先显示维护计划，确认后执行；保留 A/B 登录资料。"
+        case .repairRoute: return "先查看需要修复的专用线路配置，确认后执行并重新检查。"
+        case .recoverBrowser: return BrowserRecoveryAction.recoverDedicatedBrowser.detail
+        case .openSurge: return "在 Surge 中确认运行状态和增强模式，完成后点击重新检查。全局模式仍按你的选择挂起保护。"
+        case .openAppManagement: return "在系统设置中开启 Surge CC 的应用管理权限，完成后重试。应用更新后 macOS 可能要求重新授权。"
+        case .configureRoute: return "补全当前工作区的策略组、指定节点和预期出口，再检查线路。"
+        case .recheck: return "重新取得当前状态，不使用上一次检查的结果，也不会自动启动或登录。"
+        }
+    }
+
+    static func after(_ response: BackendResponse, exitCode: Int32) -> RemediationAction? {
+        guard !response.ok || exitCode != 0 else { return nil }
+        return response.remediationAction
+    }
+}
+
+private enum MaintenanceOperation: String, Sendable, CaseIterable {
+    case repairTerminal = "repair-terminal"
+    case updateClaude = "update-claude"
+
+    var title: String { self == .repairTerminal ? "修复终端接管" : "更新 Claude Code" }
+    var arguments: [String] { ["maintenance", "plan", "--operation", rawValue, "--json"] }
+}
+
+private struct MaintenanceEntry: Identifiable, Sendable {
+    let id: String
+    let title: String
+    let status: String
+    let detail: String
+    let action: MaintenanceOperation?
+
+    init?(_ value: JSONValue) {
+        let item = value.object
+        guard let id = item["id"]?.string, !id.isEmpty,
+              let title = item["title"]?.string,
+              let status = item["status"]?.string,
+              ["pass", "warn", "fail", "info", "unknown"].contains(status),
+              let detail = item["detail"]?.string else { return nil }
+        self.id = id
+        self.title = title
+        self.status = status
+        self.detail = detail
+        action = item["action"]?.string.flatMap(MaintenanceOperation.init(rawValue:))
+    }
+}
+
+private struct MaintenancePlan: Sendable {
+    let id: String
+    let operation: MaintenanceOperation
+    let actions: [RepairAction]
+
+    init?(_ response: BackendResponse, exitCode: Int32) {
+        guard response.ok, exitCode == 0,
+              let id = response.document["plan_id"]?.string,
+              Self.validID(id),
+              let operationValue = response.document["operation"]?.string,
+              let operation = MaintenanceOperation(rawValue: operationValue),
+              let values = response.document["actions"]?.array, !values.isEmpty, values.count <= 40 else { return nil }
+        var actions: [RepairAction] = []
+        var seen = Set<String>()
+        for value in values {
+            let item = value.object
+            guard let actionID = item["id"]?.string, !actionID.isEmpty, seen.insert(actionID).inserted,
+                  let title = item["title"]?.string, !title.isEmpty,
+                  let detail = item["detail"]?.string else { return nil }
+            actions.append(RepairAction(id: actionID, title: title, detail: detail))
+        }
+        self.id = id
+        self.operation = operation
+        self.actions = actions
+    }
+
+    static func validID(_ value: String) -> Bool {
+        value.range(of: "\\A[A-Za-z0-9_-]{1,128}\\z", options: .regularExpression) != nil
+    }
+    var arguments: [String] { ["maintenance", "apply", "--plan-id", id, "--json"] }
+}
+
+private struct InstallReceipt: Sendable {
+    let state: String
+    let version: String?
+    let summary: String
+    let backupAvailable: Bool
+
+    init?(_ value: JSONValue) {
+        let item = value.object
+        guard let state = item["state"]?.string, ["installed", "rolled-back", "failed"].contains(state),
+              let summary = item["summary"]?.string, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let backupAvailable = item["backup_available"]?.bool else { return nil }
+        self.state = state
+        self.summary = String(summary.prefix(2_000))
+        self.backupAvailable = backupAvailable
+        let rawVersion = item["version"]?.string ?? ""
+        version = UpdateInfo.validVersion(rawVersion) ? rawVersion : nil
+        // Local job, app and backup paths intentionally are not part of this
+        // presentation model. Receipt data cannot initiate any restore action.
+    }
+
+    var title: String {
+        switch state {
+        case "installed": return "最近更新已安装"
+        case "rolled-back": return "最近更新已回滚"
+        default: return "最近更新未完成"
+        }
+    }
+}
+
+private struct UpdateInfo: Sendable {
+    let state: String
+    let currentVersion: String
+    let version: String
+    let notes: String
+    let packagePath: String
+    let sha256: String
+    let size: Double?
+    let canDownload: Bool
+    let canInstall: Bool
+    let releaseURL: URL?
+
+    init?(_ response: BackendResponse) {
+        guard let value = response.document["update"] else { return nil }
+        let item = value.object
+        guard let state = item["state"]?.string,
+              ["available", "current", "ahead", "unavailable", "downloaded", "installing"].contains(state) else { return nil }
+        self.state = state
+        currentVersion = item["current_version"]?.string ?? ""
+        version = item["version"]?.string ?? item["latest_version"]?.string ?? ""
+        notes = String((item["notes"]?.string ?? "").prefix(12_000))
+        packagePath = item["package_path"]?.string ?? ""
+        sha256 = item["sha256"]?.string ?? ""
+        let reportedSize = item["size"]?.number
+        size = reportedSize.flatMap { $0.isFinite && $0 > 0 && $0 <= 2_000_000_000 ? $0 : nil }
+        let validVersion = Self.validVersion(version)
+        canDownload = response.ok && validVersion && state == "available" && item["can_download"]?.bool == true
+        canInstall = response.ok && validVersion && state == "downloaded" && item["can_install"]?.bool == true
+        releaseURL = Self.releaseURL(item["release_url"]?.string ?? "", version: version)
+    }
+
+    static func validVersion(_ value: String) -> Bool {
+        value.count <= 40 && value.range(of: "\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z", options: .regularExpression) != nil
+    }
+
+    static func releaseURL(_ value: String, version: String) -> URL? {
+        guard let url = URL(string: value), let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.scheme == "https", parts.host == "github.com", parts.port == nil,
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+              parts.percentEncodedPath == "/jsjixu/surge-cc/releases/latest"
+                || (validVersion(version) && parts.percentEncodedPath == "/jsjixu/surge-cc/releases/tag/v\(version)") else { return nil }
+        return url
+    }
+
+    var downloadArguments: [String]? {
+        canDownload ? ["updates", "download", "--version", version, "--json"] : nil
+    }
+    var installArguments: [String]? {
+        canInstall ? ["updates", "install", "--version", version, "--json"] : nil
+    }
+    func shouldQuitForInstall(exitCode: Int32, successful: Bool) -> Bool {
+        successful && exitCode == 0 && state == "installing" && Self.validVersion(version)
+    }
+}
+
+private struct OrcaStatus: Sendable {
+    let version: String
+    let running: Bool
+    let launchReady: Bool
+    let modes: [MaintenanceEntry]
+
+    init?(_ response: BackendResponse, exitCode: Int32) {
+        guard let value = response.document["orca"] else { return nil }
+        let object = value.object
+        version = object["version"]?.string ?? ""
+        running = object["running"]?.bool == true
+        launchReady = response.ok && exitCode == 0 && object["launch_ready"]?.bool == true
+        var seen = Set<String>()
+        modes = (object["modes"]?.array ?? []).prefix(20).compactMap(MaintenanceEntry.init)
+            .filter { seen.insert($0.id).inserted }
+    }
+
+    func terminalArguments(project: URL) -> [String]? {
+        guard launchReady, project.isFileURL, project.path.hasPrefix("/"),
+              !project.path.contains("\n"), !project.path.contains("\0") else { return nil }
+        // Pass the path as a separate argument. The backend independently checks
+        // that this is a registered local Orca project before opening a terminal.
+        return ["orca", "open-terminal", "--project", project.path, "--json"]
+    }
+}
+
 private struct BackendResponse: Decodable, Sendable {
     let schema: Int
     let ok: Bool
@@ -204,6 +415,7 @@ private struct BackendResponse: Decodable, Sendable {
     let launched: Bool?
     let target: String?
     let recoveryAction: BrowserRecoveryAction?
+    let remediationAction: RemediationAction?
     let paused: Bool?
     let pauseReason: String?
     let surgeMode: String?
@@ -214,6 +426,7 @@ private struct BackendResponse: Decodable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case schema, ok, summary, checked_at, checks, settings, launched, target, paused
         case recoveryAction = "recovery_action"
+        case remediationAction = "remediation_action"
         case pauseReason = "pause_reason"
         case surgeMode = "surge_mode"
         case launchAllowed = "launch_allowed"
@@ -231,6 +444,8 @@ private struct BackendResponse: Decodable, Sendable {
         target = try c.decodeIfPresent(String.self, forKey: .target)
         recoveryAction = try c.decodeIfPresent(String.self, forKey: .recoveryAction)
             .flatMap(BrowserRecoveryAction.init(rawValue:))
+        remediationAction = try c.decodeIfPresent(String.self, forKey: .remediationAction)
+            .flatMap(RemediationAction.init(rawValue:))
         paused = try c.decodeIfPresent(Bool.self, forKey: .paused)
         pauseReason = try c.decodeIfPresent(String.self, forKey: .pauseReason)
         surgeMode = try c.decodeIfPresent(String.self, forKey: .surgeMode)
@@ -449,7 +664,9 @@ private enum Backend {
         let input = standardInput == nil ? nil : Pipe()
         process.standardInput = input?.fileHandleForReading ?? FileHandle.nullDevice
 
-        let deadline: TimeInterval = 180
+        // Verified downloads and native CLI maintenance may need several minutes.
+        // Keep a finite deadline and only extend the known maintenance commands.
+        let deadline: TimeInterval = ["maintenance", "updates"].contains(arguments.first ?? "") ? 660 : 180
         let watchdog = DispatchWorkItem {
             // Only terminate this app's backend process, never a browser or proxy.
             if process.isRunning { process.terminate() }
@@ -517,6 +734,8 @@ private enum DisplayState {
 
 private enum Operation: Equatable {
     case check, configure, workspaceList, workspaceUse, workspaceAuth, snapshot, restore, repairPlan, repair, guardStatus, recovery
+    case maintenanceStatus, maintenancePlan, maintenanceApply, updateCheck, updateDownload, updateInstall
+    case orcaStatus, orcaTerminal
 }
 
 @MainActor
@@ -548,6 +767,19 @@ private final class ViewModel: ObservableObject {
     @Published var repairActions: [RepairAction] = []
     @Published var repairPlanID = ""
     @Published var browserRecoveryAction: BrowserRecoveryAction?
+    @Published var remediationAction: RemediationAction?
+    @Published var maintenanceEntries: [MaintenanceEntry] = []
+    @Published var maintenanceSummary = "读取维护状态，查看 Claude Code 接管和安装情况。"
+    @Published var maintenanceCheckedAt = ""
+    @Published var maintenancePlan: MaintenancePlan?
+    @Published var showingMaintenancePlan = false
+    @Published var maintenanceResult = ""
+    @Published var updateInfo: UpdateInfo?
+    @Published var updateSummary = "尚未检查 Surge CC 新版本。"
+    @Published var confirmingUpdateInstall = false
+    @Published var lastInstall: InstallReceipt?
+    @Published var orcaStatus: OrcaStatus?
+    @Published var orcaSummary = "检查 Orca 的终端与 Claude 启动入口。"
     @Published var guardRunning: Bool?
     @Published var guardSuspended = false
     @Published var suspendedSessions = 0
@@ -592,6 +824,7 @@ private final class ViewModel: ObservableObject {
         requestID = id
         let retryingRecovery = operation == .recovery ? browserRecoveryAction : nil
         if operation != .recovery { browserRecoveryAction = nil }
+        remediationAction = nil
         state = .busy
         summary = message
         checks = []
@@ -618,8 +851,21 @@ private final class ViewModel: ObservableObject {
                 if operation == .configure { self.settingsError = self.summary }
                 if operation == .workspaceAuth { self.credentialError = self.summary }
                 if operation == .guardStatus { self.guardDetail = self.summary }
+                if [.maintenanceStatus, .maintenancePlan, .maintenanceApply].contains(operation) {
+                    self.maintenanceSummary = self.summary
+                    self.maintenancePlan = nil
+                }
+                if [.updateCheck, .updateDownload, .updateInstall].contains(operation) {
+                    self.updateSummary = self.summary
+                    self.updateInfo = nil
+                }
+                if [.orcaStatus, .orcaTerminal].contains(operation) {
+                    self.orcaSummary = self.summary
+                    self.orcaStatus = nil
+                }
                 return
             }
+            self.remediationAction = RemediationAction.after(response, exitCode: result.exitCode)
             if let settings = response.settings, settings.isComplete {
                 self.settings = settings
                 self.currentWorkspace = settings.workspace
@@ -631,6 +877,34 @@ private final class ViewModel: ObservableObject {
                 self.currentWorkspace = settings.workspace
             }
             self.summary = response.summary
+            if [.orcaStatus, .orcaTerminal].contains(operation) {
+                self.state = response.ok && result.exitCode == 0 ? .message : .blocked
+                self.orcaSummary = response.summary
+                self.checks = response.checks ?? []
+                if operation == .orcaStatus {
+                    self.orcaStatus = OrcaStatus(response, exitCode: result.exitCode)
+                }
+                return
+            }
+            if [.maintenanceStatus, .maintenancePlan, .maintenanceApply].contains(operation) {
+                self.consumeMaintenance(response, exitCode: result.exitCode, operation: operation)
+                return
+            }
+            if [.updateCheck, .updateDownload, .updateInstall].contains(operation) {
+                self.updateSummary = response.summary
+                self.updateInfo = UpdateInfo(response)
+                if let receipt = response.document["update"]?.object["last_install"] {
+                    self.lastInstall = InstallReceipt(receipt)
+                }
+                self.state = response.ok && result.exitCode == 0 ? .message : .blocked
+                self.checks = response.checks ?? []
+                if result.exitCode != 0 { self.updateInfo = nil }
+                if operation == .updateInstall,
+                   self.updateInfo?.shouldQuitForInstall(exitCode: result.exitCode, successful: response.ok) == true {
+                    NSApplication.shared.terminate(nil)
+                }
+                return
+            }
             if operation == .configure {
                 if response.ok && result.exitCode == 0 {
                     self.state = .saved
@@ -682,6 +956,8 @@ private final class ViewModel: ObservableObject {
                         self.showingRepair = false
                         self.repairActions = []
                         self.repairPlanID = ""
+                        self.check()
+                        return
                     case .guardStatus:
                         self.consumeGuard(response)
                     default: break
@@ -826,6 +1102,110 @@ private final class ViewModel: ObservableObject {
         guard !busy, let arguments = action.arguments(workspace: settings.workspace) else { return }
         browserRecoveryAction = action
         perform(arguments, message: action.progressMessage, operation: .recovery)
+    }
+
+    func remediate(_ action: RemediationAction) {
+        guard !busy else { return }
+        // Only these local actions can be invoked. Backend text is never used as
+        // executable code, a shell command, a path to launch, or a settings URL.
+        switch action {
+        case .repairTerminal:
+            selectedTab = 3
+            planMaintenance(.repairTerminal)
+        case .repairRoute: planRepair()
+        case .recoverBrowser: recoverDedicatedBrowser()
+        case .openSurge:
+            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/Applications/Surge.app"),
+                configuration: NSWorkspace.OpenConfiguration())
+        case .openAppManagement:
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles") {
+                NSWorkspace.shared.open(url)
+            }
+        case .configureRoute: openSettings()
+        case .recheck: check()
+        }
+    }
+
+    func refreshMaintenance() {
+        maintenanceEntries = []
+        maintenanceCheckedAt = ""
+        maintenanceSummary = "正在读取本机维护状态…"
+        perform(["maintenance", "status", "--json"], message: maintenanceSummary, operation: .maintenanceStatus)
+    }
+
+    func planMaintenance(_ operation: MaintenanceOperation) {
+        maintenancePlan = nil
+        maintenanceResult = ""
+        perform(operation.arguments, message: "正在生成\(operation.title)计划…", operation: .maintenancePlan)
+    }
+
+    func applyMaintenance() {
+        guard let plan = maintenancePlan else { return }
+        perform(plan.arguments, message: "正在\(plan.operation.title)，完成后将重新检查…", operation: .maintenanceApply)
+    }
+
+    private func consumeMaintenance(_ response: BackendResponse, exitCode: Int32, operation: Operation) {
+        state = response.ok && exitCode == 0 ? .message : .blocked
+        maintenanceSummary = response.summary
+        checks = response.checks ?? []
+        if operation == .maintenanceStatus {
+            let items = response.document["maintenance"]?.object["entries"]?.array ?? []
+            var seen = Set<String>()
+            maintenanceEntries = items.prefix(50).compactMap(MaintenanceEntry.init).filter { seen.insert($0.id).inserted }
+            maintenanceCheckedAt = Self.displayTime(response.checked_at)
+        } else if operation == .maintenancePlan {
+            maintenancePlan = MaintenancePlan(response, exitCode: exitCode)
+            if maintenancePlan != nil {
+                showingMaintenancePlan = true
+            } else if response.ok && exitCode == 0 {
+                state = .blocked
+                summary = "维护计划不完整，未执行任何修改。请刷新状态后重试。"
+                maintenanceSummary = summary
+            }
+        } else if operation == .maintenanceApply {
+            maintenanceResult = response.summary
+            maintenancePlan = nil
+            // Plan IDs are consumed or stale after an attempt. Never offer to
+            // replay the old plan; another attempt must build a fresh preview.
+            showingMaintenancePlan = false
+            if response.ok && exitCode == 0 {
+                maintenanceEntries = []
+                maintenanceCheckedAt = ""
+                check()
+            }
+        }
+    }
+
+    func checkUpdates() {
+        updateInfo = nil
+        updateSummary = "正在检查 GitHub 最新正式版本…"
+        perform(["updates", "check", "--json"], message: updateSummary, operation: .updateCheck)
+    }
+
+    func downloadUpdate() {
+        guard let args = updateInfo?.downloadArguments else { return }
+        perform(args, message: "正在下载并核验 Surge CC 安装包…", operation: .updateDownload)
+    }
+
+    func installUpdate() {
+        guard let args = updateInfo?.installArguments else { return }
+        perform(args, message: "正在准备更新与回滚备份，随后将重新打开 Surge CC…", operation: .updateInstall)
+    }
+
+    func openReleasePage() {
+        guard let url = updateInfo?.releaseURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func refreshOrca() {
+        orcaStatus = nil
+        orcaSummary = "正在读取 Orca 启动方式与终端接管状态…"
+        perform(["orca", "status", "--json"], message: orcaSummary, operation: .orcaStatus)
+    }
+
+    func openOrcaTerminal() {
+        guard let args = orcaStatus?.terminalArguments(project: projectDirectory) else { return }
+        perform(args, message: "正在为所选项目打开 Orca 受控终端…", operation: .orcaTerminal)
     }
 
     private func consumeWorkspaces(_ response: BackendResponse) {
@@ -1028,16 +1408,31 @@ private struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+            } else if let action = vm.remediationAction {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        Button { vm.remediate(action) } label: {
+                            Label(action.title, systemImage: "wrench.and.screwdriver")
+                        }
+                        if action == .openSurge || action == .openAppManagement {
+                            Button("已处理，重新检查") { vm.check() }
+                        }
+                    }.disabled(vm.busy)
+                    Text(action.detail).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             TabView(selection: $vm.selectedTab) {
                 checksTab.tabItem { Label("检查", systemImage: "checklist") }.tag(0)
                 workspacesTab.tabItem { Label("工作区", systemImage: "square.stack.3d.up") }.tag(1)
                 protectionTab.tabItem { Label("保护", systemImage: "shield.lefthalf.filled") }.tag(2)
+                maintenanceTab.tabItem { Label("维护", systemImage: "wrench.and.screwdriver") }.tag(3)
             }
             .frame(minHeight: 320, maxHeight: .infinity)
             .onChange(of: vm.selectedTab) { tab in
                 if tab == 1 && !vm.busy { vm.refreshWorkspaces() }
+                if tab == 3 && !vm.busy { vm.refreshMaintenance() }
             }
 
             HStack(spacing: 10) {
@@ -1086,6 +1481,15 @@ private struct ContentView: View {
         }
         .sheet(isPresented: $vm.showingTokenEntry) {
             WorkspaceTokenView(vm: vm)
+        }
+        .sheet(isPresented: $vm.showingMaintenancePlan) {
+            MaintenancePlanView(vm: vm)
+        }
+        .alert("安装 Surge CC \(vm.updateInfo?.version ?? "")？", isPresented: $vm.confirmingUpdateInstall) {
+            Button("取消", role: .cancel) {}
+            Button("备份并安装") { vm.installUpdate() }
+        } message: {
+            Text("请先保存专用会话中的工作。安装前会再次核验安装包并创建旧版本备份，随后退出并重新打开 Surge CC。A/B 登录资料和线路配置保留；失败时可恢复旧版本。macOS 可能要求重新授予应用管理权限。")
         }
         .alert("切换到工作区 \(vm.pendingWorkspace)？", isPresented: $vm.confirmingWorkspaceSwitch) {
             Button("取消", role: .cancel) {}
@@ -1310,6 +1714,160 @@ private struct ContentView: View {
             }.padding(16)
         }.disabled(vm.busy)
     }
+
+    private var maintenanceTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Label("Claude Code 维护", systemImage: "terminal").font(.headline)
+                    Spacer()
+                    Button("刷新维护状态") { vm.refreshMaintenance() }
+                }
+                Text(vm.maintenanceSummary).font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !vm.maintenanceCheckedAt.isEmpty {
+                    Text("读取时间：\(vm.maintenanceCheckedAt)").font(.caption).foregroundStyle(.secondary)
+                }
+                if !vm.maintenanceResult.isEmpty && vm.maintenanceResult != vm.maintenanceSummary {
+                    Label(vm.maintenanceResult, systemImage: "clock.arrow.circlepath")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(vm.maintenanceEntries) { entry in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: entry.status == "pass" ? "checkmark.circle.fill"
+                              : entry.status == "fail" ? "xmark.circle.fill"
+                              : entry.status == "info" ? "info.circle.fill" : "exclamationmark.circle.fill")
+                            .foregroundStyle(entry.status == "pass" ? Color.green
+                                             : entry.status == "fail" ? Color.red : Color.secondary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(entry.title).font(.callout.weight(.medium))
+                            Text(entry.detail).font(.caption).foregroundStyle(.secondary)
+                                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                HStack {
+                    Button { vm.planMaintenance(.repairTerminal) } label: {
+                        Label("修复终端接管…", systemImage: "wrench.adjustable")
+                    }
+                    Button { vm.planMaintenance(.updateClaude) } label: {
+                        Label("更新 Claude Code…", systemImage: "arrow.down.circle")
+                    }
+                }
+                Text("先预览核验结果和操作范围，再确认执行。维护完成后重新检查，不会启动 Claude 或代你登录；A/B 浏览器资料、凭据和其他代理服务保持不变。仍有受控任务运行时，请先保存并结束任务。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Divider()
+                HStack {
+                    Label("Orca 启动方式", systemImage: "macwindow").font(.headline)
+                    Spacer()
+                    Button("检查 Orca") { vm.refreshOrca() }
+                }
+                Text(vm.orcaSummary).font(.callout).fixedSize(horizontal: false, vertical: true)
+                if let orca = vm.orcaStatus {
+                    if !orca.version.isEmpty {
+                        Text("Orca \(orca.version) · \(orca.running ? "正在运行" : "未运行")")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(orca.modes) { mode in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label(mode.title, systemImage: mode.status == "pass" ? "checkmark.circle"
+                                  : mode.status == "fail" ? "xmark.circle" : "info.circle")
+                                .font(.callout.weight(.medium))
+                                .foregroundStyle(mode.status == "pass" ? Color.green : Color.primary)
+                            Text(mode.detail).font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Button("在 Orca 打开受控终端") { vm.openOrcaTerminal() }
+                        .disabled(orca.terminalArguments(project: vm.projectDirectory) == nil)
+                    Text("使用下方选择的项目，只打开受控终端。终端里的 claude 仍会经过线路检查和专用 OAuth；项目必须已登记在 Orca 中。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider()
+                HStack {
+                    Label("Surge CC 更新", systemImage: "shippingbox").font(.headline)
+                    Spacer()
+                    Button("检查新版本") { vm.checkUpdates() }
+                }
+                Text("当前应用版本：\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发构建")")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(vm.updateSummary).font(.callout).fixedSize(horizontal: false, vertical: true)
+                if let receipt = vm.lastInstall {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label(receipt.title, systemImage: receipt.state == "installed" ? "checkmark.circle"
+                              : receipt.state == "rolled-back" ? "arrow.uturn.backward.circle" : "exclamationmark.circle")
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(receipt.state == "installed" ? Color.green : Color.orange)
+                        if let version = receipt.version {
+                            Text("版本：\(version)").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text(receipt.summary).font(.caption).fixedSize(horizontal: false, vertical: true)
+                        if receipt.backupAvailable {
+                            Text("上一版本备份已保留。此处只展示结果，不会自动恢复版本。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                }
+                if let update = vm.updateInfo {
+                    if !update.version.isEmpty {
+                        LabeledContent("目标版本", value: update.version)
+                    }
+                    if let size = update.size {
+                        Text("安装包：\(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if !update.notes.isEmpty {
+                        DisclosureGroup("更新说明") {
+                            Text(update.notes).font(.caption).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+                        }
+                    }
+                    HStack {
+                        if update.canDownload {
+                            Button("下载并校验 \(update.version)") { vm.downloadUpdate() }
+                                .buttonStyle(.borderedProminent)
+                        }
+                        if update.canInstall {
+                            Button("安装并重新打开…") { vm.confirmingUpdateInstall = true }
+                                .buttonStyle(.borderedProminent)
+                        }
+                        if update.releaseURL != nil {
+                            Button("查看 GitHub 发布页") { vm.openReleasePage() }
+                        }
+                    }
+                    if update.state == "downloaded", !update.sha256.isEmpty {
+                        DisclosureGroup("已校验的安装包") {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(update.packagePath)
+                                Text("SHA-256：\(update.sha256)")
+                            }.font(.caption.monospaced()).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 4)
+                        }
+                    }
+                }
+                Text("只在你点击后检查或下载。安装包通过发布校验后才允许安装；此操作不会更新你的 Chrome、Surge 或代理节点。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Divider()
+                Text("常用修复入口").font(.headline)
+                HStack {
+                    Button("修复专用浏览器") { vm.recoverDedicatedBrowser() }
+                    Button("预览线路修复…") { vm.planRepair() }
+                }
+                HStack {
+                    Button("打开应用管理权限") { vm.remediate(.openAppManagement) }
+                    Button("打开 Surge") { vm.remediate(.openSurge) }
+                }
+                Text("浏览器修复会关闭当前工作区的专用窗口，再备份、清理残留锁，保留登录资料。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(16)
+        }.disabled(vm.busy)
+    }
 }
 
 private struct CheckRow: View {
@@ -1525,6 +2083,45 @@ private struct RepairPlanView: View {
                 Button("确认执行 \(vm.repairActions.count) 项修复") { vm.applyRepair() }
                     .buttonStyle(.borderedProminent)
                     .disabled(vm.repairPlanID.isEmpty || vm.repairActions.isEmpty)
+            }.disabled(vm.busy)
+        }
+        .padding(24).frame(width: 620)
+        .interactiveDismissDisabled(vm.busy)
+    }
+}
+
+private struct MaintenancePlanView: View {
+    @ObservedObject var vm: ViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(vm.maintenancePlan?.operation.title ?? "维护计划").font(.title2.bold())
+            Text("确认以下操作后开始维护。执行前会再次核对程序、计划和当前会话；发生变化时停止，并要求重新预览。")
+                .font(.callout).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(Array((vm.maintenancePlan?.actions ?? []).enumerated()), id: \.offset) { index, action in
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("\(index + 1). \(action.title)").font(.headline)
+                            Text(action.detail).font(.callout).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }.frame(minHeight: 160, maxHeight: 360)
+            Text("保留 A/B 的登录与线路设置。不会自动打开浏览器、登录账号或启动 Claude 任务。")
+                .font(.caption).foregroundStyle(.secondary)
+            if vm.busy {
+                HStack { ProgressView(); Text(vm.summary).font(.callout) }
+            }
+            HStack {
+                Spacer()
+                Button("取消") {
+                    vm.showingMaintenancePlan = false
+                    vm.maintenancePlan = nil
+                }.keyboardShortcut(.cancelAction)
+                Button("确认并执行") { vm.applyMaintenance() }
+                    .buttonStyle(.borderedProminent).disabled(vm.maintenancePlan == nil)
             }.disabled(vm.busy)
         }
         .padding(24).frame(width: 620)
