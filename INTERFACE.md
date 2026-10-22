@@ -1,6 +1,6 @@
-# Surge CC 0.4.0 接口合约
+# Surge CC 0.4.1 接口合约
 
-本文对应 **v0.4.0 / Build 14**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
+本文对应 **v0.4.1 / Build 15**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 终端入口
 
@@ -44,9 +44,9 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 
 `recover` 先持有 `.browser-recovery.lock`，读取 `Browser` 与 `OAuthBrowser` 的 Chromium 运行锁。锁里的 PID 只是候选：必须匹配当前用户、配置中的专用浏览器可执行程序、进程启动身份及精确 `--user-data-dir`，并在发送信号前复核。仅向核验通过的专用浏览器主进程请求 `SIGTERM` 正常退出，不按进程名批量关闭，不向个人 Chrome、另一个工作区、CLI、终端或监控进程发信号；退出超时不升级为强杀，也不清锁。PID 核验不是针对同用户恶意并发的操作系统安全边界。
 
-窗口退出后等待原持有者释放 session/OAuth 锁，再复用离线 `repair`。若受控 CLI、授权或备份操作仍占用工作区，会拒绝清理并要求用户正常结束该操作，不会强制终止 CLI。
+窗口退出后等待原持有者释放浏览器/OAuth 租约，再复用离线 `repair`。空闲工作区保留 session 独占锁并核验未确认退出的会话标记；已有正常 CLI 持有共享锁时，先取得账号启动独占锁，再取得 session 共享锁，并保留浏览器/OAuth 独占锁。现有 CLI 可以继续运行，新启动、账号切换、快照和恢复保持互斥。检查、移动及回滚全程持锁；释放时先关闭 session 描述符，再释放账号启动锁，避免修复器的共享锁被新启动误认成正常会话。仍在进行的授权、浏览器启动或备份会阻止清理；不会强制终止 CLI，也不会移除未确认退出的会话标记。
 
-`repair` 本身不结束任何进程，仍可离线独立调用。它按 session → OAuth 顺序取得排他锁，复核专用 profile 进程、SingletonLock 的本机 PID 和 SingletonSocket 状态，再将确认过期的三个顶层符号链接归档到工作区 data 以外的私有目录。权限/路径异常、活跃或无法确认的状态均拒绝操作；不处理登录资料、其他锁文件或外部 socket 目标。
+`repair` 本身不结束任何进程，仍可离线独立调用。它按上述 session 机制取得工作区租约，再依次取得 OAuth 和浏览器独占锁，复核专用 profile 进程、SingletonLock 的本机 PID 和 SingletonSocket 状态，再将确认过期的三个顶层符号链接归档到工作区 data 以外的私有目录。权限/路径异常、活跃或无法确认的状态均拒绝操作；不处理登录资料、其他锁文件或外部 socket 目标。
 
 浏览器占用类错误返回 `recovery_action:"recover-browser"`；`recover` 的拒绝结果保留该动作供重试，传统 `repair` 的拒绝结果可返回 `recovery_action:"repair-browser-locks"`。GUI 只识别这两个固定白名单动作，不执行任意后端命令，也不从摘要猜测动作。非当前工作区的快照/恢复错误不提供当前工作区动作。工作区页常驻提供恢复按钮及次要的仅清锁按钮，目标为已应用的当前工作区，而非尚未生效的选择器值。
 

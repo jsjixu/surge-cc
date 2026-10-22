@@ -2,8 +2,9 @@
 
 ``repair`` only moves stale links. ``recover`` can first request a normal stop
 of a verified, current-workspace dedicated browser. Neither resets a profile.
-The Surge CC session, OAuth and shared-browser locks exclude cooperating
-launchers, including those preparing a profile before Chromium has started;
+Workspace and account locks exclude snapshots, switches and new launches, while
+exclusive OAuth and browser locks exclude profile preparation before Chromium
+has started. Unrelated CLI sessions may continue;
 browser databases and personal Chrome are untouched.
 """
 from __future__ import annotations
@@ -252,20 +253,22 @@ def recover(config_path: Path, name: str, *, timeout: float = 8) -> dict:
                 else:
                     raise Blocked("专用浏览器未在等待期限内退出；请保存工作并正常退出专用窗口，再点击恢复。未强制结束或清锁。")
 
-            # The existing owner releases its locks after noticing browser exit.
-            # A running CLI may legitimately keep .session.lock: never stop it.
+            # Wait for the browser owner to release its leases. Share the
+            # workspace lock with unrelated CLI sessions; exclusive workspace
+            # operations still block, as do browser/OAuth profile leases.
             deadline = time.monotonic() + timeout
             while True:
                 try:
                     with ExitStack() as held:
                         for lock in _RUNTIME_LOCKS:
-                            _lock(held, root_fd, lock)
+                            _lock(held, root_fd, lock, allow_cli=lock == ".session.lock",
+                                  workspace_root=root, config_path=config_path)
                     break
                 except Blocked as exc:
                     if "仍在运行" not in str(exc):
                         raise
                     if time.monotonic() >= deadline:
-                        raise Blocked("当前工作区仍有 Claude 会话、授权或备份操作占用；请先结束该会话再恢复。专用窗口已请求正常关闭，登录资料未清理。") from None
+                        raise Blocked("当前工作区仍有浏览器、授权或备份操作占用；请先结束该操作再恢复。专用窗口已请求正常关闭，登录资料未清理。") from None
                     time.sleep(0.1)
             if executable is not None:
                 _assert_stopped(base, dict(profiles, runtime=executable.parents[2]))
@@ -315,18 +318,42 @@ def _open_base(stack: ExitStack, base: Path) -> int:
     return fd
 
 
-def _lock(stack: ExitStack, root_fd: int, name: str) -> tuple[int, tuple]:
+def _lock(stack: ExitStack, root_fd: int, name: str, *, allow_cli: bool = False,
+          workspace_root: Path | None = None, config_path: Path | None = None) -> tuple[int, tuple]:
     fd = os.open(name, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
                  0o600, dir_fd=root_fd)
+    startup_gate = ExitStack()
+    # ExitStack unwinds in reverse: close our session fd before releasing the
+    # startup gate, so even cleanup has no repair-only SH admission window.
+    stack.callback(startup_gate.close)
     stack.callback(os.close, fd)
     info = os.fstat(fd)
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
             or info.st_nlink != 1 or info.st_mode & 0o022):
         raise Blocked("工作区锁的类型、所有者或链接数量异常，未清理。")
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if allow_cli:
+            if name != ".session.lock" or workspace_root is None or config_path is None:
+                raise Blocked("共享工作区锁缺少所属工作区，未清理。")
+            from .sessions import assert_no_stop_failures
+            # Retain EX when idle, including stop_workspace callers that
+            # already own the account gate. Do not downgrade across a gap.
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                from .workspaces import account_lock
+                # A repair-only SH holder must never let another launcher
+                # mistake it for a healthy session and skip orphan checks.
+                # Keep the startup gate even if the last real CLI exits.
+                startup_gate.enter_context(account_lock(config_path, exclusive=True))
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                assert_no_stop_failures(workspace_root, include_pending=False)
+            else:
+                assert_no_stop_failures(workspace_root)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise Blocked("专用浏览器、Claude 或工作区操作仍在运行；请先正常退出后再修复。") from None
+        raise Blocked("专用浏览器、授权或工作区操作仍在运行；请先正常退出后再修复。") from None
     path_info = _lstat(root_fd, name)
     if path_info is None or _identity(path_info) != _identity(info):
         raise Blocked("工作区锁在检查期间发生变化，未清理。")
@@ -492,7 +519,11 @@ def repair(config_path: Path, name: str) -> dict:
             workspaces_fd = _directory(stack, "workspaces", base_fd)
             root_fd = _directory(stack, name, workspaces_fd)
             data_fd = _directory(stack, "data", root_fd)
-            locks = {key: _lock(stack, root_fd, key) for key in _RUNTIME_LOCKS}
+            # Retain every lease, including the account gate when sharing the
+            # workspace with existing CLI sessions, through moves and rollback.
+            locks = {key: _lock(stack, root_fd, key, allow_cli=key == ".session.lock",
+                               workspace_root=root_path, config_path=config_path)
+                     for key in _RUNTIME_LOCKS}
             profile_fds = {}
             profiles = {key: root_path / "data" / key for key in _PROFILES}
             # Keep original identities, not timestamps, for directories whose

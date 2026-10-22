@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from surge_cc import browser_locks as locks
+from surge_cc import sessions
+from surge_cc import guard, workspaces
 from surge_cc.core import Blocked
 
 
@@ -113,28 +115,122 @@ class BrowserLockTests(unittest.TestCase):
             locks.repair(self.config, "A")
         self.assertEqual((self.browser / "SingletonLock").read_text(), "not a link")
 
-    def test_active_session_oauth_or_browser_flock_rejects_without_changes(self):
+    def test_exclusive_workspace_or_active_browser_leases_reject_without_changes(self):
         self.stale()
-        for name in (".session.lock", ".oauth.lock", ".browser.lock"):
-            with self.subTest(name=name), (self.root / name).open("a") as handle:
-                fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        for name, mode in ((".session.lock", fcntl.LOCK_EX),
+                           (".oauth.lock", fcntl.LOCK_SH), (".oauth.lock", fcntl.LOCK_EX),
+                           (".browser.lock", fcntl.LOCK_SH), (".browser.lock", fcntl.LOCK_EX)):
+            with self.subTest(name=name, mode=mode), (self.root / name).open("a") as handle:
+                fcntl.flock(handle, mode | fcntl.LOCK_NB)
                 with self.assertRaises(Blocked):
                     locks.repair(self.config, "A")
             self.assertTrue((self.browser / "SingletonLock").is_symlink())
 
-    def test_repair_holds_all_exclusive_locks_through_the_move(self):
+    def test_repair_allows_unrelated_cli_shared_session_without_signaling(self):
         self.stale()
+        marker = sessions.begin_owned_session(self.root)
+        with (self.root / ".session.lock").open("a") as cli_session:
+            fcntl.flock(cli_session, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with patch.object(locks.os, "kill") as kill:
+                result = locks.repair(self.config, "A")
+            kill.assert_not_called()
+            with (self.root / ".session.lock").open("a") as observer:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(observer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertEqual(result["status"], "repaired")
+        self.assertEqual(result["removed_count"], 3)
+        self.assertFalse(os.path.lexists(self.browser / "SingletonLock"))
+        self.assertEqual((self.browser / "Default/Cookies").read_text(), "do not touch")
+        self.assertTrue(marker.exists())
+
+    def test_repair_and_recovery_do_not_admit_a_sole_pending_orphan(self):
+        self.stale()
+        marker = sessions.begin_owned_session(self.root)
+        for operation in (locks.repair, locks.recover):
+            with self.subTest(operation=operation.__name__), patch.object(locks.os, "kill") as kill:
+                with self.assertRaisesRegex(Blocked, "未确认退出"):
+                    operation(self.config, "A")
+                kill.assert_not_called()
+            self.assertTrue(marker.exists())
+            self.assertTrue((self.browser / "SingletonLock").is_symlink())
+        self.assertFalse((self.base / "browser-lock-backups").exists())
+
+    def test_explicit_stop_failure_blocks_even_with_another_shared_cli_owner(self):
+        self.stale()
+        marker = sessions.begin_owned_session(self.root)
+        sessions.mark_stop_failed(marker)
+        with (self.root / ".session.lock").open("a") as cli_session:
+            fcntl.flock(cli_session, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            for operation in (locks.repair, locks.recover):
+                with self.subTest(operation=operation.__name__), self.assertRaisesRegex(Blocked, "未确认退出"):
+                    operation(self.config, "A")
+        self.assertTrue(marker.exists())
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_repair_holds_workspace_and_browser_leases_through_move(self):
+        original_rename = os.rename
+        for active_cli in (False, True):
+            with self.subTest(active_cli=active_cli), (self.root / ".session.lock").open("a") as cli_session:
+                self.stale()
+                checks = []
+                if active_cli:
+                    fcntl.flock(cli_session, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                def inspect(source, destination, **kwargs):
+                    if source not in ("SingletonSocket", "SingletonCookie", "SingletonLock"):
+                        return original_rename(source, destination, **kwargs)
+                    for name in (".session.lock", ".oauth.lock", ".browser.lock"):
+                        with (self.root / name).open("a") as handle:
+                            if name == ".session.lock" and active_cli:
+                                fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                                fcntl.flock(handle, fcntl.LOCK_UN)
+                                mode = fcntl.LOCK_EX
+                            else:
+                                mode = fcntl.LOCK_SH
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(handle, mode | fcntl.LOCK_NB)
+                        checks.append((source, name))
+                    if active_cli:
+                        with self.assertRaisesRegex(Blocked, "正在切换工作区或准备启动"):
+                            with workspaces.account_session(self.config, {}):
+                                self.fail("a launcher entered during shared-session repair")
+                    return original_rename(source, destination, **kwargs)
+                with patch.object(locks.os, "rename", side_effect=inspect):
+                    locks.repair(self.config, "A")
+                self.assertEqual(len(checks), 9)
+
+    def test_last_cli_exit_during_shared_repair_does_not_admit_a_new_launcher(self):
+        self.stale()
+        marker = sessions.begin_owned_session(self.root)
         checks = []
-        def inspect():
-            for name in (".session.lock", ".oauth.lock", ".browser.lock"):
-                with (self.root / name).open("a") as handle:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                checks.append(name)
-            return [(1, 0, "/sbin/launchd")]
-        with patch.object(locks, "_processes", side_effect=inspect):
-            locks.repair(self.config, "A")
-        self.assertGreaterEqual(len(checks), 12)
+        with (self.root / ".session.lock").open("a") as cli_session:
+            fcntl.flock(cli_session, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            def inspect():
+                if not checks:
+                    # Simulate the last CLI disappearing without confirming
+                    # child exit. Repair now supplies the sole SH holder.
+                    fcntl.flock(cli_session, fcntl.LOCK_UN)
+                with self.assertRaisesRegex(Blocked, "正在切换工作区或准备启动"):
+                    with workspaces.account_session(self.config, {}):
+                        self.fail("a launcher entered through the repair-only SH holder")
+                checks.append(True)
+                return [(1, 0, "/sbin/launchd")]
+            with patch.object(locks, "_processes", side_effect=inspect):
+                result = locks.repair(self.config, "A")
+        self.assertEqual(result["status"], "repaired")
+        self.assertGreaterEqual(len(checks), 5)
+        self.assertTrue(marker.exists())
+        with self.assertRaisesRegex(Blocked, "未确认退出"):
+            with guard.session_lock(self.root / ".session.lock"):
+                self.fail("the orphan latch was bypassed after repair")
+
+    def test_idle_repair_retains_exclusive_session_under_existing_account_gate(self):
+        self.stale()
+        # stop_workspace already owns this gate and verifies that sessions have
+        # ended before invoking repair. The idle EX path must not nest the gate.
+        with workspaces.account_switch(self.config):
+            sessions.stop_workspace(self.config, "A")
+        self.assertFalse(os.path.lexists(self.browser / "SingletonLock"))
+        self.assertEqual(len(list((self.base / "browser-lock-backups").glob("*/manifest.json"))), 1)
 
     def test_symlink_or_hardlink_flock_files_block(self):
         self.stale()
@@ -367,10 +463,11 @@ class BrowserRecoveryTests(unittest.TestCase):
             (str(executable), "--user-data-dir=" + str(profile or self.browser),
              "--proxy-server=http://127.0.0.1:6152", "https://claude.ai/"))
 
-    def test_recovery_closes_only_verified_browser_and_keeps_profile_data(self):
+    def test_recovery_closes_only_verified_browser_with_cli_shared_session(self):
         executable = self.runtime()
         self.stale()
         process = self.process(executable)
+        marker = sessions.begin_owned_session(self.root)
         alive = {process.pid}
         def snapshot(pid):
             return process if pid in alive else None
@@ -378,10 +475,15 @@ class BrowserRecoveryTests(unittest.TestCase):
             self.assertEqual((pid, sig), (54321, signal.SIGTERM))
             self.assertTrue((self.browser / "SingletonLock").is_symlink())
             alive.remove(pid)
-        with patch.object(locks, "_process_snapshot", side_effect=snapshot), \
-                patch.object(locks, "_pid_absent", side_effect=lambda pid: pid not in alive), \
-                patch.object(locks.os, "kill", side_effect=stop) as kill:
-            result = locks.recover(self.config, "A")
+        with (self.root / ".session.lock").open("a") as cli_session:
+            fcntl.flock(cli_session, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with patch.object(locks, "_process_snapshot", side_effect=snapshot), \
+                    patch.object(locks, "_pid_absent", side_effect=lambda pid: pid not in alive), \
+                    patch.object(locks.os, "kill", side_effect=stop) as kill:
+                result = locks.recover(self.config, "A")
+            with (self.root / ".session.lock").open("a") as observer:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(observer, fcntl.LOCK_EX | fcntl.LOCK_NB)
         kill.assert_called_once_with(54321, signal.SIGTERM)
         self.assertEqual(result["status"], "recovered")
         self.assertEqual(result["stopped_profiles"], ["Browser"])
@@ -389,6 +491,7 @@ class BrowserRecoveryTests(unittest.TestCase):
         self.assertTrue(Path(result["backup_path"]).is_dir())
         self.assertEqual((self.browser / "Default/Cookies").read_text(), "do not touch")
         self.assertEqual((self.browser / "Default/Preferences").read_text(), '{"keep":"settings"}')
+        self.assertTrue(marker.exists())
 
     def test_custom_dedicated_runtime_is_supported(self):
         executable = self.runtime(custom=True)
@@ -593,14 +696,30 @@ class BrowserRecoveryTests(unittest.TestCase):
         kill.assert_called_once_with(54321, signal.SIGTERM)
         self.assertTrue((self.browser / "SingletonLock").is_symlink())
 
-    def test_cli_shared_lock_is_not_bypassed_or_terminated(self):
+    def test_stale_recovery_allows_cli_shared_session_without_signaling(self):
         self.stale()
+        marker = sessions.begin_owned_session(self.root)
         with (self.root / ".session.lock").open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            with patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "先结束该会话"):
-                locks.recover(self.config, "A", timeout=0.001)
+            with patch.object(locks.os, "kill") as kill:
+                result = locks.recover(self.config, "A", timeout=0.001)
         kill.assert_not_called()
-        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+        self.assertEqual(result["status"], "repaired")
+        self.assertEqual(result["removed_count"], 3)
+        self.assertEqual(result["stopped_profiles"], [])
+        self.assertFalse(os.path.lexists(self.browser / "SingletonLock"))
+        self.assertTrue(marker.exists())
+
+    def test_recovery_still_blocks_exclusive_workspace_and_active_browser_leases(self):
+        self.stale()
+        for name in (".session.lock", ".oauth.lock", ".browser.lock"):
+            with self.subTest(name=name), (self.root / name).open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.object(locks.os, "kill") as kill, \
+                        self.assertRaisesRegex(Blocked, "先结束该操作"):
+                    locks.recover(self.config, "A", timeout=0.001)
+                kill.assert_not_called()
+            self.assertTrue((self.browser / "SingletonLock").is_symlink())
 
     def test_pending_browser_launch_lease_blocks_recovery_before_chromium_starts(self):
         # A launcher owns the shared profile before Chromium creates any
@@ -608,7 +727,7 @@ class BrowserRecoveryTests(unittest.TestCase):
         with (self.root / ".browser.lock").open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with patch.object(locks.os, "kill") as kill, patch.object(locks, "repair") as repair:
-                with self.assertRaisesRegex(Blocked, "先结束该会话"):
+                with self.assertRaisesRegex(Blocked, "先结束该操作"):
                     locks.recover(self.config, "A", timeout=0.001)
             kill.assert_not_called()
             repair.assert_not_called()
