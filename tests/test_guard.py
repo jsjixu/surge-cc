@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from surge_cc import guard
+from surge_cc import core, guard, workspaces
 from surge_cc.core import Blocked
 from test_core import config, FakeSurge
 
@@ -23,8 +23,10 @@ class RuntimeCheckerTests(unittest.TestCase):
     def setUp(self):
         self.surge = FakeSurge()
         self.listener = Mock(return_value=True)
+        self.preflight = Mock(return_value={"ok": True})
         self.checker = guard.RuntimeChecker(config(), process="/test/claude",
-                                           surge=self.surge, listener=self.listener)
+                                           surge=self.surge, listener=self.listener,
+                                           preflight=self.preflight)
 
     def test_valid_snapshot_and_all_routes(self):
         self.checker.check(include_exit=False)
@@ -34,9 +36,110 @@ class RuntimeCheckerTests(unittest.TestCase):
         self.assertEqual(self.surge.exit_calls, 1)
 
     def test_mode_change_blocks(self):
-        self.surge.status_value["mode"] = "global"
+        for mode in ("direct", "global", None):
+            with self.subTest(mode=mode):
+                self.surge.status_value["mode"] = mode
+                with self.assertRaises(Blocked):
+                    self.checker.check()
+
+    def test_global_mode_suspends_without_rule_or_exit_checks(self):
+        self.surge.status_value["mode"] = "proxy"
+        before = self.surge.group_calls
+        self.checker.check(include_exit=True)
+        self.assertIs(self.checker.suspended, True)
+        self.assertEqual(self.surge.group_calls, before)
+        self.assertEqual(self.surge.route_calls, [])
+        self.assertEqual(self.surge.exit_calls, 0)
+        self.listener.assert_not_called()
+
+    def test_global_start_does_not_need_fixed_topology(self):
+        self.surge.status_value.update(mode="proxy", **{"profile-path": "/test/other.conf"})
+        self.surge.group_value = None
+        checker = guard.RuntimeChecker(config(), process="/test/claude", surge=self.surge,
+                                       listener=self.listener, preflight=self.preflight)
+        checker.check(include_exit=True)
+        self.assertTrue(checker.suspended)
+        self.assertIsNone(checker.digest)
+        self.assertEqual(self.surge.group_calls, 1)  # only setUp's rule-mode baseline
+        self.listener.assert_not_called()
+
+    def test_rule_resume_rechecks_full_gate_and_exit_before_restoring_protection(self):
+        self.surge.status_value["mode"] = "proxy"
+        self.checker.check()
+        self.surge.status_value["mode"] = "rule"
+        self.checker.check(include_exit=False)
+        self.assertFalse(self.checker.suspended)
+        self.preflight.assert_called_once_with(config(), surge=self.surge,
+                                               claude_path=Path("/test/claude"))
+        self.assertEqual(self.surge.exit_calls, 1)
+
+    def test_first_rule_resume_builds_baseline_only_after_full_checks(self):
+        self.surge.status_value["mode"] = "proxy"
+        checker = guard.RuntimeChecker(config(), process="/test/claude", surge=self.surge,
+                                       listener=self.listener, preflight=self.preflight)
+        self.surge.status_value["mode"] = "rule"
+        self.surge.exit_value = False
+        with self.assertRaises(Blocked):
+            checker.check()
+        self.assertIsNone(checker.digest)
+        self.assertTrue(checker.suspended)
+        self.surge.exit_value = True
+        checker.check()
+        self.assertIsNotNone(checker.digest)
+        self.assertFalse(checker.suspended)
+
+    def test_resume_rejects_failed_full_gate_changed_baseline_and_direct_mode(self):
+        for change in ("preflight", "profile", "direct", "unknown"):
+            with self.subTest(change=change):
+                self.setUp()
+                self.surge.status_value["mode"] = "proxy"
+                self.checker.check()
+                self.surge.status_value["mode"] = "rule"
+                if change == "preflight":
+                    self.preflight.return_value = {"ok": False}
+                elif change == "profile":
+                    self.surge.profile_value += "\n[General]\nipv6=true\n"
+                else:
+                    self.surge.status_value["mode"] = "direct" if change == "direct" else "unknown"
+                with self.assertRaises(Blocked):
+                    self.checker.check()
+
+    def test_switch_to_global_during_exit_probe_suspends_instead_of_stopping(self):
+        def switch(cfg):
+            self.surge.status_value["mode"] = "proxy"
+            return False
+        self.surge.exit_matches = switch
+        self.checker.check(include_exit=True)
+        self.assertTrue(self.checker.suspended)
+
+    def test_switch_to_global_during_route_or_scope_probe_suspends(self):
+        def switch(*args):
+            self.surge.status_value["mode"] = "proxy"
+            raise Blocked("rule changed during probe")
+        self.surge.route = switch
+        self.checker.check()
+        self.assertTrue(self.checker.suspended)
+
+    def test_switch_to_global_during_initial_snapshot_suspends(self):
+        def switch(*args):
+            self.surge.status_value["mode"] = "proxy"
+            raise Blocked("group unavailable")
+        self.surge.group = switch
+        checker = guard.RuntimeChecker(config(), process="/test/claude", surge=self.surge)
+        self.assertTrue(checker.suspended)
+        self.assertIsNone(checker.digest)
+
+    def test_switch_to_global_at_final_snapshot_suspends(self):
+        self.surge.final_mode = "proxy"
+        self.surge.status_calls = 0
+        self.checker.check()
+        self.assertTrue(self.checker.suspended)
+
+    def test_malformed_global_status_does_not_suspend(self):
+        self.surge.status_value.update(mode="proxy", features=None)
         with self.assertRaises(Blocked):
             self.checker.check()
+        self.assertFalse(self.checker.suspended)
 
     def test_unknown_status_blocks(self):
         self.surge.status = Mock(side_effect=Blocked("offline"))
@@ -183,6 +286,7 @@ class StopTests(unittest.TestCase):
 
 class RunGuardTests(unittest.TestCase):
     def run_fixture(self, directory, **changes):
+        command = changes.pop("command", None)
         child = Mock(pid=78201)
         child.poll.return_value = None
         checker = Mock()
@@ -193,7 +297,11 @@ class RunGuardTests(unittest.TestCase):
                        checker=checker, popen=Mock(return_value=child),
                        monitor=Mock(return_value=0), stop=Mock())
         options.update(changes)
-        result = guard.run_guarded(["/test/claude", "SECRET_ARGUMENT"], **options)
+        if options["target"] == "web":
+            loc = workspaces.paths(Path(directory) / "config.json", "A")
+            options.setdefault("lock_path", loc["lock"])
+            command = command or core.chrome_args(options["config"], loc["browser"])
+        result = guard.run_guarded(command or ["/test/claude", "SECRET_ARGUMENT"], **options)
         return result, options, child
 
     def test_starts_only_after_checks_and_owns_separate_session(self):
@@ -212,6 +320,38 @@ class RunGuardTests(unittest.TestCase):
             self.assertEqual(result, 2)
             options["popen"].assert_not_called()
             self.assertFalse(json.loads(options["receipt_path"].read_text())["ok"])
+
+    def test_explicit_global_exception_launches_but_receipt_does_not_claim_protection(self):
+        surge = FakeSurge()
+        surge.status_value["mode"] = "proxy"
+        report = core.run_checks(config(), surge=surge)
+        checker = Mock(suspended=True)
+        def monitor(child, checked, **kwargs):
+            status = json.loads(kwargs["status_path"].read_text())
+            self.assertEqual(status["state"], "suspended")
+            self.assertIs(status["ok"], False)
+            self.assertIn("挂起", status["detail"])
+            return 0
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+            result, options, child = self.run_fixture(
+                directory, preflight=Mock(return_value=report), checker=checker, monitor=monitor)
+            self.assertEqual(result, 0)
+            options["popen"].assert_called_once()
+            receipt = json.loads(options["receipt_path"].read_text())
+            self.assertEqual(receipt["state"], "running")
+            self.assertIs(receipt["ok"], True)
+            self.assertIn("保护已挂起", receipt["detail"])
+            self.assertIs(receipt["suspended"], True)
+            self.assertIs(receipt["protection_active"], False)
+
+    def test_old_pause_or_incomplete_exception_never_launches(self):
+        for report in ({"ok": False, "paused": True, "pause_reason": "surge-mode"},
+                       {"ok": False, "paused": True, "launch_allowed": True,
+                        "protection_active": False, "surge_mode": "proxy"}):
+            with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+                result, options, child = self.run_fixture(directory, preflight=Mock(return_value=report))
+                self.assertEqual(result, 2)
+                options["popen"].assert_not_called()
 
     def test_oauth_owner_hook_receives_the_live_owned_child(self):
         with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
@@ -272,6 +412,39 @@ class RunGuardTests(unittest.TestCase):
             options["monitor"].assert_not_called()
             self.assertFalse(json.loads(options["receipt_path"].read_text())["ok"])
 
+    def test_web_browser_lease_held_from_preferences_through_owned_process_exit(self):
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+            root = Path(directory)
+            loc = workspaces.paths(root / "config.json", "A")
+            child = Mock(pid=78201)
+            child.poll.return_value = None
+            child.wait.side_effect = subprocess.TimeoutExpired("browser", .8)
+            def inspect_lease(*args, **kwargs):
+                self.assertTrue((loc["browser"] / "Default/Preferences").exists())
+                with self.assertRaisesRegex(Blocked, "关闭专用窗口"):
+                    workspaces.prepare_oauth_browser(root / "config.json", config())
+                return 0
+            result, options, _ = self.run_fixture(
+                directory, target="web", popen=Mock(return_value=child),
+                preflight=Mock(side_effect=lambda cfg: (inspect_lease() or {"ok": True})),
+                monitor=Mock(side_effect=inspect_lease), stop=Mock(side_effect=inspect_lease))
+            self.assertEqual(result, 0)
+            self.assertIn("--profile-directory=Default", options["popen"].call_args.args[0])
+            with workspaces.browser_session(loc["root"], config()):
+                pass
+
+    def test_web_rejects_empty_or_changed_profile_before_spawn(self):
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+            loc = workspaces.paths(Path(directory) / "config.json", "A")
+            original = core.chrome_args(config(), loc["browser"])
+            for command in ([v.replace("=Default", "=Profile 1") for v in original],
+                            core.chrome_args(config(), loc["data"] / "OAuthBrowser"),
+                            original + ["--user-data-dir=/private/empty"]):
+                with self.subTest(command=command):
+                    result, options, _ = self.run_fixture(directory, target="web", command=command)
+                    self.assertEqual(result, 2)
+                    options["popen"].assert_not_called()
+
     def test_invalid_interval_does_not_launch(self):
         with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
             result, options, child = self.run_fixture(directory, interval=0)
@@ -303,6 +476,26 @@ class SuperviseTests(unittest.TestCase):
         self.assertEqual([call.kwargs for call in checker.check.call_args_list],
                          [{"include_exit": False}, {"include_exit": False}, {"include_exit": True}])
 
+    def test_supervision_records_suspended_then_resumes_without_stopping_child(self):
+        current = [0.0]
+        child = Mock()
+        child.poll.side_effect = lambda: 0 if current[0] >= 2.2 else None
+        def sleep(seconds):
+            current[0] += seconds
+        checker = Mock(suspended=False)
+        def check(**kwargs):
+            checker.suspended = current[0] < 2
+        checker.check.side_effect = check
+        with patch.object(guard, "write_state") as record:
+            result = guard.supervise(child, checker, target="web", interval=1, exit_interval=3,
+                                     clock=lambda: current[0], sleep=sleep)
+        self.assertEqual(result, 0)
+        states = [call.kwargs for call in record.call_args_list]
+        self.assertEqual([s["state"] for s in states], ["suspended", "running", "exited"])
+        self.assertFalse(states[0]["ok"])
+        self.assertTrue(states[1]["ok"])
+        child.terminate.assert_not_called()
+
     def test_check_failure_is_not_swallowed(self):
         child = Mock()
         child.poll.return_value = None
@@ -314,6 +507,43 @@ class SuperviseTests(unittest.TestCase):
         with self.assertRaises(Blocked):
             guard.supervise(child, checker, target="web", interval=1, exit_interval=3,
                             clock=lambda: current[0], sleep=sleep)
+
+    def test_real_owned_child_survives_global_transition_and_resumes_rule_checks(self):
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+            surge = FakeSurge()
+            full = Mock(return_value={"ok": True})
+            checker = guard.RuntimeChecker(config(), process=sys.executable, surge=surge,
+                                           listener=Mock(return_value=True), preflight=full)
+            started = [None]
+            status = surge.status
+            def changing_status():
+                elapsed = time.monotonic() - started[0] if started[0] is not None else 0
+                surge.status_value["mode"] = "proxy" if .02 <= elapsed < .08 else "rule"
+                return status()
+            surge.status = changing_status
+            children = []
+            def spawn(command, **kwargs):
+                child = subprocess.Popen(command, **kwargs)
+                children.append(child)
+                started[0] = time.monotonic()
+                return child
+            states = []
+            writer = guard.write_state
+            def capture(path, **kwargs):
+                states.append(kwargs["state"])
+                return writer(path, **kwargs)
+            with patch.object(guard, "write_state", side_effect=capture):
+                result = guard.run_guarded(
+                    [sys.executable, "-c", "import time; time.sleep(.18)"],
+                    env=dict(os.environ), cwd=Path(directory), config=config(), target="code",
+                    preflight=Mock(return_value={"ok": True}), checker=checker,
+                    popen=spawn, interval=.01, exit_interval=.03)
+            self.assertEqual(result, 0)
+            self.assertEqual(children[0].returncode, 0)
+            self.assertIn("suspended", states)
+            self.assertIn("running", states[states.index("suspended") + 1:])
+            full.assert_called_once()
+            self.assertFalse(checker.suspended)
 
     def test_live_owned_process_stopped_without_touching_other_process(self):
         with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:

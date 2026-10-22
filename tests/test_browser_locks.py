@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import stat
 import subprocess
 import sys
@@ -112,20 +113,20 @@ class BrowserLockTests(unittest.TestCase):
             locks.repair(self.config, "A")
         self.assertEqual((self.browser / "SingletonLock").read_text(), "not a link")
 
-    def test_active_session_or_oauth_flock_rejects_without_changes(self):
+    def test_active_session_oauth_or_browser_flock_rejects_without_changes(self):
         self.stale()
-        for name in (".session.lock", ".oauth.lock"):
+        for name in (".session.lock", ".oauth.lock", ".browser.lock"):
             with self.subTest(name=name), (self.root / name).open("a") as handle:
                 fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 with self.assertRaises(Blocked):
                     locks.repair(self.config, "A")
             self.assertTrue((self.browser / "SingletonLock").is_symlink())
 
-    def test_repair_holds_both_exclusive_locks_through_the_move(self):
+    def test_repair_holds_all_exclusive_locks_through_the_move(self):
         self.stale()
         checks = []
         def inspect():
-            for name in (".session.lock", ".oauth.lock"):
+            for name in (".session.lock", ".oauth.lock", ".browser.lock"):
                 with (self.root / name).open("a") as handle:
                     with self.assertRaises(BlockingIOError):
                         fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -133,7 +134,7 @@ class BrowserLockTests(unittest.TestCase):
             return [(1, 0, "/sbin/launchd")]
         with patch.object(locks, "_processes", side_effect=inspect):
             locks.repair(self.config, "A")
-        self.assertGreaterEqual(len(checks), 8)
+        self.assertGreaterEqual(len(checks), 12)
 
     def test_symlink_or_hardlink_flock_files_block(self):
         self.stale()
@@ -343,6 +344,341 @@ class SocketProbeTests(unittest.TestCase):
             factory.return_value.__enter__.return_value.connect.side_effect = ConnectionRefusedError(errno.ECONNREFUSED, "refused")
             with self.assertRaises(Blocked):
                 locks._socket_state(self.path)
+
+
+class BrowserRecoveryTests(unittest.TestCase):
+    setUp = BrowserLockTests.setUp
+    stale = BrowserLockTests.stale
+
+    def runtime(self, custom=False):
+        folder = self.base / ("Applications" if custom else "Browser Runtime")
+        app = folder / "Surge CC Browser.app"
+        executable = app / "Contents/MacOS/Google Chrome"
+        helper = app / "Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
+        for path in (executable, helper):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("test fixture, never executed")
+            path.chmod(0o700)
+        self.config.write_text(json.dumps({"browser_path": str(executable)}))
+        return executable
+
+    def process(self, executable, profile=None, pid=54321):
+        return locks._BrowserProcess(pid, os.getuid(), (123, 456), str(executable),
+            (str(executable), "--user-data-dir=" + str(profile or self.browser),
+             "--proxy-server=http://127.0.0.1:6152", "https://claude.ai/"))
+
+    def test_recovery_closes_only_verified_browser_and_keeps_profile_data(self):
+        executable = self.runtime()
+        self.stale()
+        process = self.process(executable)
+        alive = {process.pid}
+        def snapshot(pid):
+            return process if pid in alive else None
+        def stop(pid, sig):
+            self.assertEqual((pid, sig), (54321, signal.SIGTERM))
+            self.assertTrue((self.browser / "SingletonLock").is_symlink())
+            alive.remove(pid)
+        with patch.object(locks, "_process_snapshot", side_effect=snapshot), \
+                patch.object(locks, "_pid_absent", side_effect=lambda pid: pid not in alive), \
+                patch.object(locks.os, "kill", side_effect=stop) as kill:
+            result = locks.recover(self.config, "A")
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["stopped_profiles"], ["Browser"])
+        self.assertEqual(result["removed_count"], 3)
+        self.assertTrue(Path(result["backup_path"]).is_dir())
+        self.assertEqual((self.browser / "Default/Cookies").read_text(), "do not touch")
+        self.assertEqual((self.browser / "Default/Preferences").read_text(), '{"keep":"settings"}')
+
+    def test_custom_dedicated_runtime_is_supported(self):
+        executable = self.runtime(custom=True)
+        self.stale()
+        process = self.process(executable)
+        with patch.object(locks, "_pid_absent", side_effect=[False, True, True, True, True, True, True, True]), \
+                patch.object(locks, "_process_snapshot", side_effect=[process, process, None]), \
+                patch.object(locks.os, "kill") as kill:
+            result = locks.recover(self.config, "A")
+        self.assertEqual(result["status"], "recovered")
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+
+    def test_web_and_oauth_are_stopped_without_signaling_the_cli_or_persisting_urls(self):
+        executable = self.runtime()
+        for profile in (self.browser, self.oauth):
+            self.stale(profile)
+        (self.oauth / "SingletonLock").unlink()
+        (self.oauth / "SingletonLock").symlink_to("test-host-54322")
+        web = self.process(executable)
+        oauth = self.process(executable, profile=self.oauth, pid=54322)
+        oauth = locks._BrowserProcess(oauth.pid, oauth.uid, oauth.started, oauth.executable,
+                                      oauth.argv[:-1] + ("https://example.test/auth?code=private-test-code",))
+        alive = {54321: web, 54322: oauth}
+        with patch.object(locks, "_pid_absent", side_effect=lambda pid: pid not in alive), \
+                patch.object(locks, "_process_snapshot", side_effect=lambda pid: alive.get(pid)), \
+                patch.object(locks.os, "kill", side_effect=lambda pid, sig: alive.pop(pid)) as kill:
+            result = locks.recover(self.config, "A")
+        self.assertEqual(kill.call_args_list[0].args, (54321, signal.SIGTERM))
+        self.assertEqual(kill.call_args_list[1].args, (54322, signal.SIGTERM))
+        self.assertEqual(kill.call_count, 2)
+        self.assertEqual(result["stopped_profiles"], ["Browser", "OAuthBrowser"])
+        self.assertEqual(result["removed_count"], 6)
+        output = json.dumps(result) + (Path(result["backup_path"]) / "manifest.json").read_text()
+        self.assertNotIn("private-test-code", output)
+        self.assertEqual((self.oauth / "Default/Cookies").read_text(), "do not touch")
+
+    def test_shutdown_permission_failure_keeps_runtime_links_and_profile(self):
+        executable = self.runtime()
+        self.stale()
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", return_value=self.process(executable)), \
+                patch.object(locks.os, "kill", side_effect=PermissionError) as kill:
+            with self.assertRaisesRegex(Blocked, "系统未允许"):
+                locks.recover(self.config, "A")
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+        self.assertFalse((self.base / "browser-lock-backups").exists())
+
+    def test_unreadable_kernel_process_identity_never_signals(self):
+        self.runtime()
+        self.stale()
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", side_effect=Blocked("无法可靠验证")), \
+                patch.object(locks.os, "kill") as kill, self.assertRaises(Blocked):
+            locks.recover(self.config, "A")
+        kill.assert_not_called()
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_private_chrome_config_is_not_accepted_even_with_matching_profile_flag(self):
+        self.config.write_text(json.dumps({"browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}))
+        self.stale()
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks.os, "kill") as kill, self.assertRaises(Blocked):
+            locks.recover(self.config, "A")
+        kill.assert_not_called()
+
+    def test_new_browser_after_exit_blocks_cleanup_without_closing_new_process(self):
+        executable = self.runtime()
+        self.stale()
+        process = self.process(executable)
+        alive = {54321: process}
+        with patch.object(locks, "_pid_absent", side_effect=lambda pid: pid not in alive), \
+                patch.object(locks, "_process_snapshot", side_effect=lambda pid: alive.get(pid)), \
+                patch.object(locks.os, "kill", side_effect=lambda pid, sig: alive.pop(pid)) as kill, \
+                patch.object(locks, "_processes", return_value=[(54322, 1,
+                    str(executable) + " --user-data-dir=" + str(self.browser))]), self.assertRaises(Blocked):
+            locks.recover(self.config, "A")
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_stale_only_recovery_does_not_require_configured_browser_or_signal(self):
+        self.stale()
+        with patch.object(locks.os, "kill") as kill, patch.object(locks, "_process_snapshot") as snapshot:
+            result = locks.recover(self.config, "A")
+        self.assertEqual(result["status"], "repaired")
+        self.assertEqual(result["stopped_profiles"], [])
+        snapshot.assert_not_called()
+        kill.assert_not_called()
+
+    def test_personal_browser_other_workspace_helper_and_wrong_user_are_not_signaled(self):
+        executable = self.runtime()
+        self.stale()
+        expected = self.process(executable)
+        cases = [
+            self.process(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")),
+            self.process(executable, profile=self.base / "workspaces/B/data/Browser"),
+            locks._BrowserProcess(expected.pid, expected.uid + 1, expected.started, expected.executable, expected.argv),
+            locks._BrowserProcess(expected.pid, expected.uid, expected.started, expected.executable, expected.argv + ("--type=renderer",)),
+            locks._BrowserProcess(expected.pid, expected.uid, expected.started, expected.executable,
+                expected.argv + ("--user-data-dir=" + str(self.oauth),)),
+        ]
+        for process in cases:
+            with self.subTest(process=process), patch.object(locks, "_pid_absent", return_value=False), \
+                    patch.object(locks, "_process_snapshot", return_value=process), \
+                    patch.object(locks.os, "kill") as kill:
+                with self.assertRaisesRegex(Blocked, "不属于当前工作区"):
+                    locks.recover(self.config, "A")
+                kill.assert_not_called()
+                self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_all_candidates_are_validated_before_closing_any_window(self):
+        executable = self.runtime()
+        self.stale(self.browser)
+        self.stale(self.oauth)
+        (self.oauth / "SingletonLock").unlink()
+        (self.oauth / "SingletonLock").symlink_to("test-host-54322")
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", side_effect=[self.process(executable),
+                    self.process(executable, profile=self.base / "workspaces/B/data/Browser", pid=54322)]), \
+                patch.object(locks.os, "kill") as kill, self.assertRaises(Blocked):
+            locks.recover(self.config, "A")
+        kill.assert_not_called()
+
+    def test_changed_start_identity_before_signal_is_rejected(self):
+        executable = self.runtime()
+        self.stale()
+        before = self.process(executable)
+        reused = locks._BrowserProcess(before.pid, before.uid, (999, 1), before.executable, before.argv)
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", side_effect=[before, reused]), \
+                patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "进程身份"):
+            locks.recover(self.config, "A")
+        kill.assert_not_called()
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_pid_reused_while_waiting_never_receives_second_signal_or_lock_cleanup(self):
+        executable = self.runtime()
+        self.stale()
+        before = self.process(executable)
+        reused = locks._BrowserProcess(before.pid, before.uid, (999, 1), before.executable, before.argv)
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", side_effect=[before, before, reused]), \
+                patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "进程身份"):
+            locks.recover(self.config, "A")
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_stubborn_browser_is_not_force_killed_and_locks_are_preserved(self):
+        executable = self.runtime()
+        self.stale()
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", return_value=self.process(executable)), \
+                patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "未强制结束"):
+            locks.recover(self.config, "A", timeout=0.001)
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+        self.assertFalse((self.base / "browser-lock-backups").exists())
+
+    def test_temporarily_unreadable_exited_browser_is_waited_for_until_reaped(self):
+        executable = self.runtime()
+        self.stale()
+        process = self.process(executable)
+        observations = [process, process, Blocked("unreaped child"), None]
+        with patch.object(locks, "_pid_absent", side_effect=[False] + [True] * 20), \
+                patch.object(locks, "_process_snapshot", side_effect=observations) as snapshot, \
+                patch.object(locks.time, "sleep"), patch.object(locks.os, "kill") as kill:
+            result = locks.recover(self.config, "A")
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["stopped_profiles"], ["Browser"])
+        self.assertEqual(snapshot.call_count, 4)
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertFalse(os.path.lexists(self.browser / "SingletonLock"))
+
+    def test_permanently_unreadable_browser_times_out_without_clearing_locks(self):
+        executable = self.runtime()
+        self.stale()
+        process = self.process(executable)
+        calls = []
+        def snapshot(pid):
+            calls.append(pid)
+            if len(calls) > 2:
+                raise Blocked("unreadable child")
+            return process
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", side_effect=snapshot), \
+                patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "未强制结束"):
+            locks.recover(self.config, "A", timeout=0.001)
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+        self.assertFalse((self.base / "browser-lock-backups").exists())
+
+    def test_unreadable_then_reused_pid_is_blocked_without_more_signals(self):
+        executable = self.runtime()
+        self.stale()
+        before = self.process(executable)
+        reused = locks._BrowserProcess(before.pid, before.uid, (999, 1), before.executable, before.argv)
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", side_effect=[before, before,
+                    Blocked("unreadable child"), reused]), patch.object(locks.time, "sleep"), \
+                patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "进程身份"):
+            locks.recover(self.config, "A")
+        kill.assert_called_once_with(54321, signal.SIGTERM)
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_cli_shared_lock_is_not_bypassed_or_terminated(self):
+        self.stale()
+        with (self.root / ".session.lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "先结束该会话"):
+                locks.recover(self.config, "A", timeout=0.001)
+        kill.assert_not_called()
+        self.assertTrue((self.browser / "SingletonLock").is_symlink())
+
+    def test_pending_browser_launch_lease_blocks_recovery_before_chromium_starts(self):
+        # A launcher owns the shared profile before Chromium creates any
+        # Singleton links. No PID or socket evidence exists at this stage.
+        with (self.root / ".browser.lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(locks.os, "kill") as kill, patch.object(locks, "repair") as repair:
+                with self.assertRaisesRegex(Blocked, "先结束该会话"):
+                    locks.recover(self.config, "A", timeout=0.001)
+            kill.assert_not_called()
+            repair.assert_not_called()
+        self.assertFalse((self.base / "browser-lock-backups").exists())
+        self.assertEqual((self.browser / "Default/Cookies").read_text(), "do not touch")
+
+    def test_recovery_waits_for_pending_browser_lease_to_release_before_cleanup(self):
+        self.stale()
+        with (self.root / ".browser.lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(locks.time, "sleep", side_effect=lambda _: fcntl.flock(handle, fcntl.LOCK_UN)) as wait, \
+                    patch.object(locks.os, "kill") as kill:
+                result = locks.recover(self.config, "A", timeout=1)
+        self.assertEqual(wait.call_count, 1)
+        kill.assert_not_called()
+        self.assertEqual(result["status"], "repaired")
+        self.assertEqual(result["removed_count"], 3)
+        self.assertEqual((self.browser / "Default/Preferences").read_text(), '{"keep":"settings"}')
+
+    def test_unknown_or_missing_runtime_links_are_not_used_to_close_processes(self):
+        with patch.object(locks, "_processes", return_value=[(54321, 1,
+                "Chrome --user-data-dir=" + str(self.browser))]), patch.object(locks.os, "kill") as kill:
+            with self.assertRaises(Blocked):
+                locks.recover(self.config, "A")
+        kill.assert_not_called()
+
+    def test_foreign_host_links_and_symlinked_config_never_signal(self):
+        self.runtime()
+        self.stale()
+        (self.browser / "SingletonLock").unlink()
+        (self.browser / "SingletonLock").symlink_to("other-host-54321")
+        with patch.object(locks.os, "kill") as kill, self.assertRaises(Blocked):
+            locks.recover(self.config, "A")
+        kill.assert_not_called()
+        (self.browser / "SingletonLock").unlink()
+        (self.browser / "SingletonLock").symlink_to("test-host-54321")
+        alternate = self.base / "other.json"
+        self.config.rename(alternate)
+        self.config.symlink_to(alternate)
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks.os, "kill") as kill, self.assertRaises(Blocked):
+            locks.recover(self.config, "A")
+        kill.assert_not_called()
+
+    def test_profile_lock_change_before_signal_prevents_shutdown(self):
+        executable = self.runtime()
+        self.stale()
+        def changed(pid):
+            (self.browser / "SingletonCookie").unlink()
+            (self.browser / "SingletonCookie").symlink_to("999")
+            return self.process(executable)
+        with patch.object(locks, "_pid_absent", return_value=False), \
+                patch.object(locks, "_process_snapshot", side_effect=changed), \
+                patch.object(locks.os, "kill") as kill, self.assertRaisesRegex(Blocked, "运行锁"):
+            locks.recover(self.config, "A")
+        kill.assert_not_called()
+
+
+class KernelArgumentTests(unittest.TestCase):
+    def test_arguments_with_spaces_remain_exact_and_environment_is_excluded(self):
+        args = ["/Some path/Google Chrome", "--user-data-dir=/Some profile", "https://example.test/"]
+        raw = len(args).to_bytes(4, sys.byteorder, signed=True) + b"/executable\0\0\0"
+        raw += b"\0".join(os.fsencode(arg) for arg in args) + b"\0SECRET=not-an-argument\0"
+        self.assertEqual(locks._decode_argv(raw), tuple(args))
+
+    def test_malformed_kernel_arguments_are_rejected(self):
+        for raw in (b"", (0).to_bytes(4, sys.byteorder),
+                    (3).to_bytes(4, sys.byteorder) + b"/x\0a\0"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                locks._decode_argv(raw)
 
 
 class ProcessQueryTests(unittest.TestCase):

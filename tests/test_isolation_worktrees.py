@@ -271,6 +271,33 @@ class LinkedWorktreeTests(unittest.TestCase):
         with self.assertRaises(core.Blocked):
             self.command(project)
 
+    def test_auto_trust_runs_only_after_final_worktree_validation(self):
+        from surge_cc import isolated_trust
+        project = self.discover()
+        (self.admin / "gitdir").write_text(str(self.main / ".git") + "\n")
+        with patch.object(isolated_trust, "prepare") as trust:
+            with self.assertRaises(core.Blocked):
+                self.command(project)
+            trust.assert_not_called()
+
+    def test_auto_trust_keeps_same_sandbox_environment_and_native_arguments(self):
+        project = self.discover()
+        before = self.command(project)
+        env = isolation.environment(project, "http://127.0.0.1:62919", {}, token_auth=True)
+        trust_file = self.base / ".runtime/trust.json"
+        trust_file.write_text(json.dumps({"schema": 1, "enabled": True, "projects": [
+            {"id": project.name, "path": str(self.main)}]}))
+        trust_file.chmod(0o600)
+        after = self.command(project)
+        self.assertEqual(before, after)
+        self.assertEqual(env, isolation.environment(project, "http://127.0.0.1:62919", {}, token_auth=True))
+        data = json.loads((project.config / ".claude.json").read_text())
+        self.assertEqual(data, {"projects": {str(self.main): {"hasTrustDialogAccepted": True}}})
+        self.assertFalse((project.config / ".credentials.json").exists())
+        self.assertFalse((project.config / "projects").exists())
+        self.assertNotIn(str(trust_file), after[2])
+        self.assertNotIn('(subpath ' + json.dumps(str(trust_file.parent)) + ')', after[2])
+
     def test_command_rejects_substituted_main_home(self):
         project = replace(self.discover(), home=self.main_home)
         with self.assertRaises(core.Blocked):

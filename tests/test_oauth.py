@@ -73,6 +73,7 @@ class URLTests(unittest.TestCase):
         self.assertEqual(args[0], config()["browser_path"])
         self.assertEqual(args[-1], value)
         self.assertIn("--user-data-dir=/private/profile with spaces", args)
+        self.assertEqual(args.count("--profile-directory=Default"), 1)
         self.assertIn("--proxy-server=http://127.0.0.1:62919", args)
         self.assertIn("--proxy-bypass-list=<-loopback>;http://localhost:49152;http://127.0.0.1:49152", args)
         self.assertNotIn("open", args)
@@ -117,7 +118,7 @@ class SessionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.config_path = self.root / "config.json"
-        self.profile = self.root / "workspaces/A/data/OAuthBrowser"
+        self.profile = self.root / "workspaces/A/data/Browser"
         self.profile.mkdir(parents=True)
         self.checker = Mock(return_value={"ok": True})
         self.child = Mock(pid=12345)
@@ -138,8 +139,6 @@ class SessionTests(unittest.TestCase):
         self.addCleanup(self.patches.close)
         self.stop = self.patches.enter_context(patch.object(oauth, "stop_owned_child", side_effect=stop))
         self.owner = self.patches.enter_context(patch.object(oauth, "callback_owned_by", return_value=True))
-        self.prepare = self.patches.enter_context(patch.object(
-            workspaces, "prepare_oauth_browser", create=True, return_value=self.profile))
 
     def session(self):
         return oauth.OAuthSession(config(), self.config_path, checker=self.checker, popen=self.spawn)
@@ -165,8 +164,87 @@ class SessionTests(unittest.TestCase):
         self.stop.assert_called_once_with(self.browsers[0])
         self.child.terminate.assert_not_called()
 
+    def test_oauth_reuses_canonical_logged_in_profile_without_touching_legacy_data(self):
+        default = self.profile / "Default"
+        default.mkdir()
+        cookies = default / "Cookies"
+        cookies.write_bytes(b"opaque existing login sentinel")
+        legacy = self.profile.parent / "OAuthBrowser"
+        legacy.mkdir()
+        (legacy / "Preferences").write_text("legacy sentinel")
+        with self.session() as session:
+            session.set_child(self.child)
+            session._open_authorization(url())
+            args = self.spawn.call_args.args[0]
+            self.assertIn("--user-data-dir=" + str(self.profile), args)
+            self.assertEqual(args.count("--profile-directory=Default"), 1)
+            self.assertFalse(any("OAuthBrowser" in arg for arg in args))
+        self.assertEqual(cookies.read_bytes(), b"opaque existing login sentinel")
+        self.assertEqual((legacy / "Preferences").read_text(), "legacy sentinel")
+
+    def test_web_lease_blocks_oauth_before_chrome_creates_singleton_lock(self):
+        with workspaces.browser_session(self.profile.parent.parent, config()):
+            with self.session() as session:
+                session.set_child(self.child)
+                with self.assertRaisesRegex(Blocked, "关闭专用窗口"):
+                    session._open_authorization(url())
+                self.assertIsNone(session._profile)
+                self.assertIsNone(session._locks)
+        self.spawn.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_oauth_lease_blocks_web_and_releases_after_failed_postcheck(self):
+        self.checker.side_effect = [{"ok": True}, {"ok": False}]
+        def spawn(*args, **kwargs):
+            with self.assertRaisesRegex(Blocked, "关闭专用窗口"):
+                workspaces.prepare_browser_language(self.config_path, config())
+            browser = Mock(pid=23456)
+            browser.poll.return_value = None
+            browser.wait.side_effect = subprocess.TimeoutExpired("browser", .8)
+            self.browsers.append(browser)
+            return browser
+        self.spawn.side_effect = spawn
+        with self.session() as session:
+            session.set_child(self.child)
+            with self.assertRaises(Blocked):
+                session._open_authorization(url())
+            with workspaces.browser_session(self.profile.parent.parent, config()) as profile:
+                self.assertEqual(profile, self.profile)
+        self.stop.assert_called_once_with(self.browsers[0])
+
+    def test_browser_spawn_failure_releases_profile_for_retry(self):
+        self.spawn.side_effect = OSError("fixture launch failed")
+        with self.session() as session:
+            session.set_child(self.child)
+            with self.assertRaises(OSError):
+                session._open_authorization(url())
+            with workspaces.browser_session(self.profile.parent.parent, config()):
+                pass
+            self.assertIsNone(session._locks)
+
     def test_initial_failed_check_never_spawns(self):
         self.checker.return_value = {"ok": False}
+        with self.session() as session:
+            session.set_child(self.child)
+            with self.assertRaises(Blocked):
+                session._open_authorization(url())
+        self.spawn.assert_not_called()
+
+    def test_global_suspension_preserves_dedicated_browser_and_callback_check(self):
+        from test_cli import suspended_report
+        self.checker.return_value = suspended_report()
+        with self.session() as session:
+            session.set_child(self.child)
+            session._open_authorization(url())
+            self.assertIsNotNone(session.browser)
+            self.assertIn("--user-data-dir=" + str(self.profile), self.spawn.call_args.args[0])
+            self.assertIn("--proxy-server=" + config()["proxy_url"], self.spawn.call_args.args[0])
+        self.assertGreaterEqual(self.owner.call_count, 2)
+
+    def test_global_suspension_never_skips_callback_ownership(self):
+        from test_cli import suspended_report
+        self.checker.return_value = suspended_report()
+        self.owner.return_value = False
         with self.session() as session:
             session.set_child(self.child)
             with self.assertRaises(Blocked):
@@ -217,7 +295,7 @@ class SessionTests(unittest.TestCase):
             first.set_child(self.child)
             second.set_child(self.child)
             first._open_authorization(url())
-            with self.assertRaises(BlockingIOError):
+            with self.assertRaisesRegex(Blocked, "关闭专用窗口"):
                 second._open_authorization(url(49153))
             self.assertIsNotNone(first.browser)
             self.assertIsNone(second.browser)
@@ -343,6 +421,19 @@ class SessionTests(unittest.TestCase):
             self.assertNotIn("state", result.stderr)
             self.assertNotIn(url(), result.stderr)
             self.spawn.assert_not_called()
+
+    def test_real_generated_hook_busy_is_actionable_without_sensitive_details(self):
+        with workspaces.browser_session(self.profile.parent.parent, config()):
+            with self.session() as session:
+                session.set_child(self.child)
+                result = subprocess.run([str(session.browser_hook), url()], capture_output=True,
+                                        text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("关闭专用窗口后重试", result.stderr)
+                self.assertNotIn(url(), result.stderr)
+                self.assertNotIn(session._token, result.stderr)
+                self.assertNotIn(str(self.profile), result.stderr)
+                self.spawn.assert_not_called()
 
     def test_bind_rejects_exited_child_and_repeat_binding(self):
         with self.session() as session:

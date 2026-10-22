@@ -275,6 +275,98 @@ class GateTests(unittest.TestCase):
         probe.assert_not_called()
         self.assertEqual(surge.exit_calls, 0)
 
+    def test_known_non_rule_modes_pause_without_probes_or_policy_reads(self):
+        for mode in ("proxy", "direct"):
+            with self.subTest(mode=mode):
+                surge, probe = FakeSurge(), Mock()
+                surge.status_value["mode"] = mode
+                outcome = self.gate(surge, probe)
+                self.assertFalse(outcome["ok"])
+                self.assertTrue(outcome["paused"])
+                self.assertEqual(outcome["pause_reason"], "surge-global-mode" if mode == "proxy" else "surge-mode")
+                self.assertEqual(core.global_mode_allowed(outcome), mode == "proxy")
+                if mode == "direct":
+                    self.assertNotIn("launch_allowed", outcome)
+                self.assertEqual(outcome["surge_mode"], mode)
+                self.assertEqual(outcome["checks"][-1]["id"], "mode")
+                self.assertEqual(outcome["checks"][-1]["status"], "fail")
+                probe.assert_not_called()
+                self.assertEqual((surge.group_calls, surge.route_calls, surge.exit_calls), (0, [], 0))
+
+    def test_global_allows_launch_without_claiming_protection_or_profile_match(self):
+        surge = FakeSurge()
+        surge.status_value.update(mode="proxy", **{"profile-path": "/other/global.conf"})
+        surge.group_value = None
+        surge.profile_value = "invalid for rule mode"
+        probe = Mock()
+        report = self.gate(surge, probe)
+        self.assertTrue(core.global_mode_allowed(report))
+        self.assertIs(report["ok"], False)
+        self.assertIs(report["protection_active"], False)
+        self.assertIn("保护已挂起", report["summary"])
+        probe.assert_not_called()
+        self.assertEqual(surge.group_calls, 0)
+
+    def test_global_exception_requires_exact_typed_explicit_report(self):
+        surge = FakeSurge()
+        surge.status_value["mode"] = "proxy"
+        valid = self.gate(surge)
+        for changes in ({"schema": True}, {"schema": 2}, {"ok": True}, {"ok": 0},
+                        {"paused": 1}, {"launch_allowed": 1}, {"launch_allowed": False},
+                        {"protection_active": 0}, {"protection_active": True},
+                        {"surge_mode": "direct"}, {"pause_reason": "surge-mode"},
+                        {"checks": []}, {"checks": {}}, {"checks": [None]},
+                        {"checks": [{"id": "mode", "status": []}]}):
+            with self.subTest(changes=changes):
+                report = deepcopy(valid)
+                report.update(changes)
+                self.assertFalse(core.global_mode_allowed(report))
+        for key in ("ok", "paused", "launch_allowed", "protection_active", "surge_mode", "pause_reason"):
+            report = deepcopy(valid)
+            report.pop(key)
+            self.assertFalse(core.global_mode_allowed(report))
+
+    def test_global_exception_cannot_hide_other_required_failures_or_duplicate_rows(self):
+        surge = FakeSurge()
+        surge.status_value["mode"] = "proxy"
+        valid = self.gate(surge)
+        for extra in (core.row("error", "Error", False, "failed"),
+                      core.row("mode", "Mode", False, "duplicate"),
+                      {"id": "extra", "status": "unknown"}):
+            report = deepcopy(valid)
+            report["checks"].append(extra)
+            self.assertFalse(core.global_mode_allowed(report))
+        for index, change in ((0, {"status": "fail"}), (0, {"required": False}),
+                              (1, {"status": "pass"}), (1, {"required": False}),
+                              (1, {"required": 1})):
+            report = deepcopy(valid)
+            report["checks"][index].update(change)
+            self.assertFalse(core.global_mode_allowed(report))
+        for remove in (0, 1):
+            report = deepcopy(valid)
+            report["checks"].pop(remove)
+            self.assertFalse(core.global_mode_allowed(report))
+
+    def test_unknown_modes_are_errors_not_normal_pauses(self):
+        for mode in (None, "", "global", "unexpected", 0, [], {}):
+            with self.subTest(mode=mode):
+                surge, probe = FakeSurge(), Mock()
+                surge.status_value["mode"] = mode
+                outcome = self.gate(surge, probe)
+                self.assertFalse(outcome["ok"])
+                self.assertNotIn("paused", outcome)
+                probe.assert_not_called()
+
+    def test_returning_to_rule_requires_fresh_complete_check(self):
+        surge = FakeSurge()
+        surge.status_value["mode"] = "proxy"
+        self.assertTrue(self.gate(surge)["paused"])
+        surge.status_value["mode"] = "rule"
+        outcome = self.gate(surge)
+        self.assertTrue(outcome["ok"])
+        self.assertNotIn("paused", outcome)
+        self.assertGreater(surge.exit_calls, 0)
+
     def test_wrong_profile_fails(self):
         surge = FakeSurge()
         surge.status_value["profile-path"] = "/test/other.conf"
@@ -303,6 +395,73 @@ class GateTests(unittest.TestCase):
                 surge = FakeSurge()
                 setattr(surge, key, value)
                 self.assertFalse(self.gate(surge)["ok"])
+
+    def test_global_transition_during_route_exit_or_profile_failure_allows_suspension(self):
+        for stage in ("route", "exit", "profile", "group", "probe", "final-status"):
+            with self.subTest(stage=stage):
+                surge = FakeSurge()
+                probe = Mock(return_value=(True, "connected"))
+                if stage == "route":
+                    def route_to_global(*args):
+                        surge.status_value["mode"] = "proxy"
+                        return {"final": "DIRECT"}
+                    surge.route = route_to_global
+                elif stage == "exit":
+                    def exit_to_global(*args):
+                        surge.status_value["mode"] = "proxy"
+                        return False
+                    surge.exit_matches = exit_to_global
+                elif stage == "profile":
+                    def profile_to_global():
+                        surge.status_value["mode"] = "proxy"
+                        raise core.Blocked("profile changed while checking")
+                    surge.profile = profile_to_global
+                elif stage == "group":
+                    def group_to_global(*args):
+                        surge.status_value["mode"] = "proxy"
+                        value = group()
+                        value["selected"] = "Other"
+                        return value
+                    surge.group = group_to_global
+                elif stage == "probe":
+                    def probe_to_global(*args):
+                        surge.status_value["mode"] = "proxy"
+                        return False, "changed during connect"
+                    probe = probe_to_global
+                else:
+                    surge.final_mode = "proxy"
+                report = self.gate(surge, probe)
+                self.assertTrue(core.global_mode_allowed(report))
+                self.assertFalse(report["ok"])
+                self.assertEqual([r["id"] for r in report["checks"]], ["surge", "mode"])
+
+    def test_failed_fresh_mode_read_preserves_original_failure(self):
+        for failure in (core.Blocked("status offline"), RuntimeError("unavailable")):
+            with self.subTest(failure=type(failure)):
+                surge = FakeSurge()
+                initial = surge.status()
+                surge.status = Mock(side_effect=[initial, failure])
+                surge.route_value["final"] = "DIRECT"
+                report = self.gate(surge)
+                self.assertFalse(core.global_mode_allowed(report))
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["checks"][-1]["id"], "route")
+                self.assertEqual(report["checks"][-1]["status"], "fail")
+
+    def test_fresh_rule_direct_unknown_or_malformed_mode_cannot_bless_failure(self):
+        for status in ({"mode": "rule", "features": {}},
+                       {"mode": "direct", "features": {}},
+                       {"mode": "unknown", "features": {}},
+                       {"mode": "proxy", "features": None}, None, []):
+            with self.subTest(status=status):
+                surge = FakeSurge()
+                initial = surge.status()
+                surge.status = Mock(side_effect=[initial, status])
+                surge.profile = Mock(side_effect=core.Blocked("original profile failure"))
+                report = self.gate(surge)
+                self.assertFalse(core.global_mode_allowed(report))
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["checks"][-1]["detail"], "original profile failure")
 
     def test_non_api_domain_route_change_during_check_blocks(self):
         surge = FakeSurge()
@@ -351,7 +510,7 @@ class EnvironmentAndBrowserTests(unittest.TestCase):
         self.assertIn("--proxy-bypass-list=<-loopback>", args)
         self.assertIn("--disable-quic", args)
         self.assertFalse(any("direct://" in a.lower() for a in args))
-        self.assertFalse(any("--profile-directory=Default" == a for a in args))
+        self.assertEqual(args.count("--profile-directory=Default"), 1)
 
     def test_config_cannot_remove_baseline_domains(self):
         value = config()

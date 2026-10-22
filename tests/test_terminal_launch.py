@@ -48,8 +48,10 @@ class TerminalLaunchContracts(unittest.TestCase):
         self.stdin_data = None
         self.stream_output = ''
         self.child_exit = 0
+        self.child = Mock(name='owned-claude-child')
 
     def completed_guard(self, command, **kwargs):
+        kwargs['on_started'](self.child)
         self.stdin_data = sys.stdin.read() if isinstance(sys.stdin, io.StringIO) else None
         if self.stream_output:
             sys.stdout.write(self.stream_output)
@@ -65,9 +67,10 @@ class TerminalLaunchContracts(unittest.TestCase):
 
     def main(self, args=None):
         out, err, input_stream = io.StringIO(), io.StringIO(), io.StringIO('{"type":"user","message":"hello"}\n')
-        def protected(config, config_path, target, terminal, arguments):
+        def protected(config, config_path, target, terminal, arguments, *, startup_release):
             return self.original_launch(config, config_path, target, terminal, arguments,
-                                        checker=self.checker, guarded=self.guarded)
+                                        checker=self.checker, guarded=self.guarded,
+                                        startup_release=startup_release)
         with patch.object(cli, 'launch', side_effect=protected), patch.object(sys, 'stdin', input_stream), redirect_stdout(out), redirect_stderr(err):
             code = cli.main(['--config', str(self.config_path), 'launch', 'code', '--passthrough', '--', *(args or [])])
         return code, out.getvalue(), err.getvalue()
@@ -123,7 +126,7 @@ class TerminalLaunchContracts(unittest.TestCase):
         actual = self.guarded.call_args.args[0]
         self.assertEqual(actual[:2], [str(self.native), '--settings'])
         merged = json.loads(actual[2])
-        self.assertEqual(merged, {**json.loads(settings), 'remoteControlAtStartup': False})
+        self.assertEqual(merged, {**json.loads(settings), 'remoteControlAtStartup': False, 'forceLoginMethod': 'claudeai'})
         self.assertEqual(actual[3:], args[:-2])
         env = self.guarded.call_args.kwargs['env']
         self.assertEqual(env['BROWSER'], str(self.oauth.browser_hook))
@@ -133,7 +136,7 @@ class TerminalLaunchContracts(unittest.TestCase):
         self.assertEqual(env['NO_PROXY'], '')
         self.assertEqual(env['DISABLE_AUTOUPDATER'], '1')
         self.assertEqual(env['DISABLE_UPDATES'], '1')
-        self.assertEqual(self.guarded.call_args.kwargs['on_started'], self.oauth.set_child)
+        self.oauth.set_child.assert_called_once_with(self.child)
         self.assertNotIn('BROWSER', os.environ)
         self.assertNotIn('HTTP_PROXY', os.environ)
 
@@ -143,18 +146,23 @@ class TerminalLaunchContracts(unittest.TestCase):
             self.assertTrue(self.launch([])['launched'])
         self.assertEqual(self.guarded.call_args.kwargs['env']['CLAUDE_CONFIG_DIR'], selected)
 
-    def test_different_workspace_environment_is_refused_before_checks(self):
-        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.root / 'other-workspace')}):
-            with self.assertRaises(core.Blocked):
-                self.launch([])
-        self.checker.assert_not_called()
-        self.guarded.assert_not_called()
+    def test_inherited_other_workspace_is_replaced_with_active_account(self):
+        inherited = str(self.root / 'other-workspace')
+        selected = str(self.root / 'workspaces/A/data/Claude')
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': inherited}):
+            self.assertTrue(self.launch([])['launched'])
+            self.assertEqual(os.environ['CLAUDE_CONFIG_DIR'], inherited)
+        self.checker.assert_called_once_with(self.config)
+        self.assertEqual(self.guarded.call_args.kwargs['env']['CLAUDE_CONFIG_DIR'], selected)
+        self.assertEqual(self.settings_check.call_args.args[2]['CLAUDE_CONFIG_DIR'], selected)
 
-    def test_relative_workspace_environment_is_not_silently_replaced(self):
+    def test_inherited_relative_workspace_cannot_select_child_account(self):
+        selected = str(self.root / 'workspaces/A/data/Claude')
         with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': 'custom-config'}):
-            with self.assertRaises(core.Blocked):
-                self.launch([])
-        self.guarded.assert_not_called()
+            self.assertTrue(self.launch([])['launched'])
+            self.assertEqual(os.environ['CLAUDE_CONFIG_DIR'], 'custom-config')
+        self.assertEqual(self.guarded.call_args.kwargs['env']['CLAUDE_CONFIG_DIR'], selected)
+        self.assertEqual(self.settings_check.call_args.args[2]['CLAUDE_CONFIG_DIR'], selected)
 
     def test_maintenance_commands_with_leading_flags_are_refused(self):
         for args in (['--debug', 'update'], ['--verbose', 'install'], ['--debug', 'upgrade'],
@@ -208,9 +216,12 @@ class TerminalLaunchContracts(unittest.TestCase):
 
     def test_oauth_login_keeps_arguments_and_installs_private_browser_hook(self):
         self.assertTrue(self.launch(['auth', 'login'])['launched'])
-        self.assertEqual(self.guarded.call_args.args[0], [str(self.native), '--settings', '{"remoteControlAtStartup":false}', 'auth', 'login'])
+        actual = self.guarded.call_args.args[0]
+        self.assertEqual(actual[:2], [str(self.native), '--settings'])
+        self.assertEqual(json.loads(actual[2]), {'remoteControlAtStartup': False, 'forceLoginMethod': 'claudeai'})
+        self.assertEqual(actual[3:], ['auth', 'login'])
         self.assertEqual(self.guarded.call_args.kwargs['env']['BROWSER'], str(self.oauth.browser_hook))
-        self.assertIs(self.guarded.call_args.kwargs['on_started'], self.oauth.set_child)
+        self.oauth.set_child.assert_called_once_with(self.child)
 
     def test_remote_startup_user_file_is_overridden_without_writing(self):
         folder = self.root / '.claude'
@@ -222,7 +233,7 @@ class TerminalLaunchContracts(unittest.TestCase):
         self.assertTrue(self.real_settings_check(self.config, self.root, {'CLAUDE_CONFIG_DIR': str(self.root / 'isolated')}))
         self.launch([])
         actual = self.guarded.call_args.args[0]
-        self.assertEqual(json.loads(actual[2]), {'remoteControlAtStartup': False})
+        self.assertEqual(json.loads(actual[2]), {'remoteControlAtStartup': False, 'forceLoginMethod': 'claudeai'})
         self.assertEqual(path.read_text(), original)
 
     def test_settings_merge_preserves_orca_hooks_and_env(self):
@@ -238,6 +249,7 @@ class TerminalLaunchContracts(unittest.TestCase):
         self.assertEqual(merged['model'], 'sonnet')
         self.assertEqual(merged['permissionMode'], 'default')
         self.assertIs(merged['remoteControlAtStartup'], False)
+        self.assertEqual(merged['forceLoginMethod'], 'claudeai')
         self.assertEqual(actual[3:], ['--print', '--setting-sources', 'user,project', '--output-format', 'stream-json'])
         self.assertEqual(actual.count('--settings'), 1)
 

@@ -56,6 +56,69 @@ def result(checks: list[dict], config: dict | None = None, summary: str | None =
             "checked_at": now(), "checks": checks, "settings": config or {}}
 
 
+def global_mode_allowed(report: dict) -> bool:
+    """Recognize only the explicit global-mode exception; never bless a failed gate."""
+    if (not isinstance(report, dict) or type(report.get("schema")) is not int or
+            report.get("schema") != 1 or report.get("ok") is not False or
+            report.get("paused") is not True or
+            report.get("pause_reason") != "surge-global-mode" or
+            report.get("surge_mode") != "proxy" or
+            report.get("launch_allowed") is not True or
+            report.get("protection_active") is not False):
+        return False
+    checks = report.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return False
+    indexed = {}
+    for item in checks:
+        if (not isinstance(item, dict) or not isinstance(item.get("id"), str) or
+                not item["id"] or item["id"] in indexed or
+                type(item.get("required", True)) is not bool or
+                not isinstance(item.get("status"), str) or
+                item.get("status") not in {"pass", "fail", "warn", "unknown", "info"}):
+            return False
+        indexed[item["id"]] = item
+        if (item["id"] != "mode" and item.get("required", True) and
+                item["status"] != "pass"):
+            return False
+    return (indexed.get("surge", {}).get("status") == "pass" and
+            indexed.get("surge", {}).get("required", True) is True and
+            indexed.get("mode", {}).get("status") == "fail" and
+            indexed.get("mode", {}).get("required", True) is True)
+
+
+def _global_mode_report(config: dict) -> dict:
+    checks = [row("surge", "Surge 连接", True, "已通过本机控制接口连接。"),
+              row("mode", "规则模式", False,
+                  "Surge 当前为全局代理模式；固定出口保护已挂起，允许启动并跟随 Surge 全局出口；此状态不代表线路检查通过。")]
+    report = result(checks, config)
+    report.update(paused=True, pause_reason="surge-global-mode", surge_mode="proxy",
+                  launch_allowed=True, protection_active=False,
+                  summary="保护已挂起：允许启动，流量跟随 Surge 全局代理；固定出口与断线阻断保护未生效。")
+    return report
+
+
+def fresh_global_mode_report(config: dict, surge) -> dict | None:
+    """Re-observe a deliberate mode change without turning ordinary failure into pass."""
+    try:
+        status = surge.status()
+    except Exception:
+        # This is only an optional, fresh global-mode observation after failure.
+        # Preserve the original failure whenever the observation is unavailable.
+        return None
+    if (isinstance(status, dict) and isinstance(status.get("features"), dict)
+            and status.get("mode") == "proxy"):
+        return _global_mode_report(config)
+    return None
+
+
+def _finish_checks(checks: list[dict], config: dict, surge) -> dict:
+    report = result(checks, config)
+    if report["ok"] is not True:
+        return fresh_global_mode_report(config, surge) or report
+    return report
+
+
 def safe_name(value: str) -> bool:
     return isinstance(value, str) and 0 < len(value) <= 160 and not any(ord(c) < 32 for c in value)
 
@@ -420,13 +483,26 @@ def run_checks(config: dict, surge: Surge | None = None, probe=local_proxy_check
         if not isinstance(initial.get("features"), dict):
             raise Blocked("Surge 状态缺少必要字段。")
         active_path = initial.get("profile-path")
-        if config["profile_path"] and active_path != config["profile_path"]:
-            raise Blocked("Surge 当前使用的配置文件与指定配置不同。")
         checks.append(row("surge", "Surge 连接", True, "已通过本机控制接口连接。"))
         mode_ok = initial.get("mode") == "rule"
-        checks.append(row("mode", "规则模式", mode_ok, "使用规则模式。" if mode_ok else "当前不是规则模式。"))
+        mode = initial.get("mode")
+        mode_label = {"proxy": "全局代理", "direct": "直连"}.get(mode) if isinstance(mode, str) else None
+        detail = ("使用规则模式。" if mode_ok else
+                  "Surge 当前为全局代理模式；固定出口保护已挂起，允许启动并跟随 Surge 全局出口；此状态不代表线路检查通过。"
+                  if mode == "proxy" else
+                  "Surge 当前为直连模式，已阻止启动；请切回规则模式或全局代理模式。"
+                  if mode_label else "无法确认 Surge 出站模式，已阻止启动。")
+        checks.append(row("mode", "规则模式", mode_ok, detail))
         if not mode_ok:
-            return result(checks, config)
+            if mode == "proxy":
+                return _global_mode_report(config)
+            report = result(checks, config)
+            if mode_label:
+                report.update(paused=True, pause_reason="surge-mode", surge_mode=mode,
+                              summary="已阻止启动：Surge 当前为直连模式。")
+            return report
+        if config["profile_path"] and active_path != config["profile_path"]:
+            raise Blocked("Surge 当前使用的配置文件与指定配置不同。")
         group = surge.group(config["group"])
         profile_text = surge.profile()
         validate_topology(profile_text, group, config)
@@ -434,7 +510,7 @@ def run_checks(config: dict, surge: Surge | None = None, probe=local_proxy_check
         checks.append(row("definition", "固定节点定义", True, "仅一个已启用节点，无自动候补或底层代理链。"))
         checks.append(row("group", "当前选择", selected, "已选中指定节点。" if selected else "当前选中的不是指定节点。"))
         if not selected:
-            return result(checks, config)
+            return _finish_checks(checks, config, surge)
         processes = [str(claude_path or default_claude()), str(browser_executable(config)), "/usr/bin/curl"]
         mismatches = []
         for host in config["hosts"]:
@@ -446,11 +522,11 @@ def run_checks(config: dict, surge: Surge | None = None, probe=local_proxy_check
                           f"已核对 {len(config['hosts'])} 个域名及 CLI、浏览器、检测请求。"
                           if not mismatches else "以下域名没有固定到指定组：" + "、".join(mismatches)))
         if mismatches:
-            return result(checks, config)
+            return _finish_checks(checks, config, surge)
         connected, detail = probe(config)
         checks.append(row("proxy", "本地代理入口", connected, detail))
         if not connected:
-            return result(checks, config)
+            return _finish_checks(checks, config, surge)
         matches = surge.exit_matches(config)
         checks.append(row("exit", "固定出口", matches,
                           "指定节点的实际出口与保存的 IP 一致。" if matches else "出口不匹配或查询失败；不会自动接受新 IP。"))
@@ -468,7 +544,7 @@ def run_checks(config: dict, surge: Surge | None = None, probe=local_proxy_check
                           "检查期间未检测到策略或配置切换。" if stable else "检查期间配置发生变化，请重新检查。"))
     except Blocked as exc:
         checks.append(row("error", "检查中断", False, str(exc)))
-    return result(checks, config)
+    return _finish_checks(checks, config, surge)
 
 
 def provider_environment_ok(env: dict) -> bool:
@@ -483,6 +559,7 @@ def chrome_args(config: dict, profile_dir: Path) -> list[str]:
     args = [
         str(browser_executable(config)), f"--user-data-dir={profile_dir}",
         f"--proxy-server={config['proxy_url']}", "--proxy-bypass-list=<-loopback>",
+        "--profile-directory=Default",
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-quic", "--no-first-run", "--no-default-browser-check", "--new-window",
         "https://claude.ai/",

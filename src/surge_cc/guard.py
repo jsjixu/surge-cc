@@ -17,7 +17,7 @@ import threading
 import time
 
 from .core import (
-    Blocked, Surge, listener_is_surge, load_config, now, proxy_env,
+    Blocked, Surge, chrome_args, global_mode_allowed, listener_is_surge, load_config, now, proxy_env,
     route_is_fixed, run_checks, validate_config, validate_topology,
 )
 
@@ -30,20 +30,41 @@ class Interrupted(Exception):
 class RuntimeChecker:
     """Keep baseline material in memory; never persist an effective profile."""
 
-    def __init__(self, config: dict, *, process: str, surge=None, listener=listener_is_surge):
+    def __init__(self, config: dict, *, process: str, surge=None,
+                 listener=listener_is_surge, preflight=run_checks):
         self.config = validate_config(config)
         self.process = process
         self.surge = surge or Surge()
         self.listener = listener
-        status, group, digest = self._snapshot()
-        self.path = status.get("profile-path")
-        self.group = group
-        self.digest = digest
+        self.preflight = preflight
+        self.suspended = False
+        self.path = self.group = self.digest = None
+        try:
+            snapshot = self._snapshot()
+            if snapshot is not None:
+                status, self.group, self.digest = snapshot
+                self.path = status.get("profile-path")
+        except Blocked:
+            if not self._suspend_if_global():
+                raise
+
+    def _suspend_if_global(self, status=None):
+        # This is an explicit user exception for proxy mode, never a general
+        # error bypass. An unavailable/malformed/direct status stays blocked.
+        status = self.surge.status() if status is None else status
+        if (isinstance(status, dict) and isinstance(status.get("features"), dict)
+                and status.get("mode") == "proxy"):
+            self.suspended = True
+            return True
+        return False
 
     def _snapshot(self):
         status = self.surge.status()
-        if not isinstance(status.get("features"), dict) or status.get("mode") != "rule":
-            raise Blocked("运行期间 Surge 状态未知或已离开规则模式。")
+        if self._suspend_if_global(status):
+            return None
+        if (not isinstance(status, dict) or not isinstance(status.get("features"), dict)
+                or status.get("mode") != "rule"):
+            raise Blocked("运行期间 Surge 状态未知或进入直连模式。")
         if self.config.get("browser_path") and status["features"].get("enhanced-mode") is not True:
             raise Blocked("专用浏览器的增强模式接管已停止或无法确认。")
         active_path = status.get("profile-path")
@@ -60,28 +81,58 @@ class RuntimeChecker:
         return status, group, digest
 
     def check(self, *, include_exit: bool = False) -> None:
-        status, group, digest = self._snapshot()
-        if self.config.get("browser_path"):
-            from .containment import validate_scope
-            validate_scope(self.config, self.surge)
-        if (status.get("profile-path") != self.path or group != self.group or
-                digest != self.digest):
-            raise Blocked("运行期间 Surge 策略或生效配置发生变化。")
-        if not self.listener(self.config):
-            raise Blocked("运行期间本地代理入口不再属于 Surge，或无法确认入口。")
-        for host in self.config["hosts"]:
-            if not route_is_fixed(self.surge.route(host, self.config, self.process), self.config):
-                raise Blocked("运行期间 Claude 域名不再固定到指定线路。")
-        if include_exit and self.surge.exit_matches(self.config) is not True:
-            raise Blocked("运行期间出口变化或出口检测无法确认。")
-        # Re-read after asynchronous route/exit checks rather than bless stale state.
-        status, group, digest = self._snapshot()
-        if (status.get("profile-path") != self.path or group != self.group or
-                digest != self.digest):
-            raise Blocked("运行期间检查尚未结束，Surge 配置已发生变化。")
+        was_suspended = self.suspended
+        try:
+            snapshot = self._snapshot()
+            if snapshot is None:
+                return
+            if was_suspended:
+                # Always re-run the full gate before resuming protection, even
+                # when the periodic exit-probe interval has not elapsed.
+                report = self.preflight(self.config, surge=self.surge,
+                                        claude_path=Path(self.process))
+                if not isinstance(report, dict) or report.get("ok") is not True:
+                    raise Blocked("切回规则模式后的完整线路检查未通过。")
+                snapshot = self._snapshot()
+                if snapshot is None:
+                    return
+            status, group, digest = snapshot
+            baseline = (self.path, self.group, self.digest)
+            current = (status.get("profile-path"), group, digest)
+            first_baseline = self.digest is None
+            if not first_baseline and current != baseline:
+                raise Blocked("运行期间 Surge 策略或生效配置发生变化。")
+            if self.config.get("browser_path"):
+                from .containment import validate_scope
+                validate_scope(self.config, self.surge)
+            if not self.listener(self.config):
+                raise Blocked("运行期间本地代理入口不再属于 Surge，或无法确认入口。")
+            for host in self.config["hosts"]:
+                if not route_is_fixed(self.surge.route(host, self.config, self.process), self.config):
+                    raise Blocked("运行期间 Claude 域名不再固定到指定线路。")
+            if ((include_exit or was_suspended or first_baseline) and
+                    self.surge.exit_matches(self.config) is not True):
+                raise Blocked("运行期间出口变化或出口检测无法确认。")
+            # Re-read after asynchronous checks; a deliberate global-mode
+            # transition suspends protection instead of stopping the session.
+            final = self._snapshot()
+            if final is None:
+                return
+            final_status, final_group, final_digest = final
+            if (final_status.get("profile-path"), final_group, final_digest) != current:
+                raise Blocked("运行期间检查尚未结束，Surge 配置已发生变化。")
+            if first_baseline:
+                self.path, self.group, self.digest = current
+            self.suspended = False
+        except Blocked:
+            # A mode change can happen while a rule/containment/exit check is
+            # running. Re-observe the authoritative mode before stopping.
+            if not self._suspend_if_global():
+                raise
 
 
-def write_state(path: Path | None, *, target: str, state: str, ok: bool, detail: str) -> None:
+def write_state(path: Path | None, *, target: str, state: str, ok: bool, detail: str,
+                protection_active: bool | None = None, suspended: bool | None = None) -> None:
     """Write a small private receipt without config, command arguments, or PID."""
     if path is None:
         return
@@ -94,6 +145,11 @@ def write_state(path: Path | None, *, target: str, state: str, ok: bool, detail:
         raise Blocked("守护状态文件位置无效。")
     payload = {"schema": 1, "target": target, "state": state, "ok": bool(ok),
                "checked_at": now(), "detail": detail}
+    for key, value in (("protection_active", protection_active), ("suspended", suspended)):
+        if value is not None:
+            if type(value) is not bool:
+                raise Blocked("守护保护状态必须为布尔值。")
+            payload[key] = value
     fd, temporary = tempfile.mkstemp(prefix=".surge-cc-guard-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -127,9 +183,23 @@ def session_lock(path: Path | None):
             raise Blocked("工作区锁文件的类型或所有者异常。")
         os.fchmod(fd, 0o600)
         try:
+            if path.name == ".session.lock":
+                from .sessions import assert_no_stop_failures
+                # An abandoned ownership marker is only distinguishable from
+                # another healthy CLI owner while nobody holds the workspace.
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    assert_no_stop_failures(path.parent)
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             raise Blocked("工作区正在备份或恢复，暂时不能启动。") from None
+        if path.name == ".session.lock":
+            # A failed owner blocks new sessions even if a second healthy CLI
+            # still holds a shared lock. Normal parallel CLI sessions are fine.
+            assert_no_stop_failures(path.parent, include_pending=False)
         yield
     finally:
         if fd is not None:
@@ -201,6 +271,11 @@ def supervise(child, checker, *, target: str, status_path: Path | None = None,
     last_exit = clock()
     next_check = clock() + interval
     while True:
+        # Account switches must also stop sessions while global mode has
+        # suspended route checks. This is independent of the network gate.
+        stop_check = getattr(checker, "check_stop", None)
+        if stop_check is not None:
+            stop_check()
         code = child.poll()
         if code is not None:
             write_state(status_path, target=target, state="exited", ok=code == 0,
@@ -212,8 +287,11 @@ def supervise(child, checker, *, target: str, status_path: Path | None = None,
             checker.check(include_exit=full)
             if full:
                 last_exit = clock()
-            write_state(status_path, target=target, state="running", ok=True,
-                        detail="运行期线路检查通过；轮询检测不保证即时阻断网络流量。")
+            suspended = getattr(checker, "suspended", False) is True
+            write_state(status_path, target=target,
+                        state="suspended" if suspended else "running", ok=not suspended,
+                        detail=("保护已挂起；程序继续运行，流量跟随 Surge 全局代理，固定出口保护未生效。"
+                                if suspended else "运行期线路检查通过；轮询检测不保证即时阻断网络流量。"))
             next_check = clock() + interval
         else:
             sleep(min(0.2, next_check - current))
@@ -233,6 +311,7 @@ def run_guarded(command: list[str], *, env: dict | None, cwd: Path,
     state = "blocked"
     code = 2
     locks = ExitStack()
+    ownership_marker = None
     try:
         config = validate_config(config)
         if target not in {"code", "web"}:
@@ -247,18 +326,42 @@ def run_guarded(command: list[str], *, env: dict | None, cwd: Path,
         if not 0 < interval <= 60 or not interval <= exit_interval <= 300:
             raise Blocked("守护检查间隔无效。")
         locks.enter_context(session_lock(lock_path))
+        session_generation = None
+        if lock_path is not None:
+            from .sessions import generation
+            session_generation = generation(Path(lock_path).parent)
+        if target == "web":
+            # The worker uses a temporary config under sessions/. The original
+            # workspace comes only from its explicitly supplied session lock.
+            if lock_path is None or Path(lock_path).name != ".session.lock":
+                raise Blocked("专用浏览器缺少工作区锁，未启动。")
+            from . import workspaces
+            root = Path(lock_path).parent
+            if command != chrome_args(config, root / "data/Browser"):
+                raise Blocked("专用浏览器启动参数与当前工作区不一致，未启动。")
+            locks.enter_context(workspaces.browser_session(root, config))
         report = preflight(config)
-        if not isinstance(report, dict) or report.get("ok") is not True:
+        if (not isinstance(report, dict) or
+                (report.get("ok") is not True and not global_mode_allowed(report))):
             raise Blocked("启动前线路检查未通过，已阻止启动。")
         checker = checker or RuntimeChecker(config, process=command[0])
+        if session_generation is not None:
+            from .sessions import SessionChecker
+            checker = SessionChecker(checker, Path(lock_path).parent, session_generation)
         checker.check(include_exit=True)
         # Verify state paths before starting a program. Failure to report must not
         # leave a detached unmonitored child behind.
-        write_state(status_path, target=target, state="starting", ok=True,
-                    detail="线路检查通过，正在启动受监控程序。")
+        suspended = getattr(checker, "suspended", False) is True
+        write_state(status_path, target=target,
+                    state="suspended" if suspended else "starting", ok=not suspended,
+                    detail=("保护已挂起，正在通过 Surge 全局代理启动程序。"
+                            if suspended else "线路检查通过，正在启动受监控程序。"))
         with child_signals(lambda: child):
             # Seatbelt cannot revoke access through already-open descriptors.
             # Keep only the explicitly intended terminal stdin/stdout/stderr.
+            if lock_path is not None:
+                from .sessions import begin_owned_session
+                ownership_marker = begin_owned_session(Path(lock_path).parent)
             child = popen(command, env=env, cwd=str(cwd), start_new_session=True, close_fds=True)
             if on_started is not None:
                 on_started(child)
@@ -272,9 +375,14 @@ def run_guarded(command: list[str], *, env: dict | None, cwd: Path,
                 else:
                     raise Blocked("专用浏览器未保持运行；没有建立受监控会话。")
             launched = True
-            detail = "已启动并开始运行期线路监控；检测存在轮询间隔。"
-            write_state(receipt_path, target=target, state="running", ok=True, detail=detail)
-            write_state(status_path, target=target, state="running", ok=True, detail=detail)
+            detail = ("已启动；保护已挂起，流量跟随 Surge 全局代理；仍监护进程生命周期和模式变化。"
+                      if suspended else "已启动并开始运行期线路监控；检测存在轮询间隔。")
+            # A successful receipt acknowledges process startup only. Runtime
+            # state separately records that fixed-exit protection is suspended.
+            write_state(receipt_path, target=target, state="running", ok=True, detail=detail,
+                        protection_active=not suspended, suspended=suspended)
+            write_state(status_path, target=target,
+                        state="suspended" if suspended else "running", ok=not suspended, detail=detail)
             code = monitor(child, checker, target=target, status_path=status_path,
                            interval=interval, exit_interval=exit_interval)
             state = "exited"
@@ -291,10 +399,40 @@ def run_guarded(command: list[str], *, env: dict | None, cwd: Path,
         # Do not expose command arguments, subprocess output or profile material.
         state, detail = "blocked", "运行期监控发生未知错误，已按失败处理并停止受监控程序。"
     finally:
+        confirmed_exit = False
         try:
             stop(child)
-        except Exception:
-            state, detail, code = "stop_failed", "无法确认受监控程序已退出，请手动关闭本工具启动的窗口。", 2
+            confirmed_exit = True
+        except BaseException:
+            state, detail, code = "stop_failed", "无法确认受监控程序已退出，正在等待手动关闭；在确认退出前不能切换账号。", 2
+            try:
+                from .sessions import mark_stop_failed
+                mark_stop_failed(ownership_marker)
+            except BaseException:
+                # The pre-spawn marker still blocks account switching even if
+                # its more descriptive failed state cannot be saved.
+                pass
+            try:
+                write_state(status_path, target=target, state=state, ok=False, detail=detail)
+            except Exception:
+                pass
+            if child is not None:
+                try:
+                    from .sessions import await_owned_exit
+                    await_owned_exit(child)
+                    confirmed_exit = True
+                    detail = "停止过程未完成，但已确认原程序随后退出；请重新执行账号切换。"
+                except BaseException:
+                    # Signals or an interrupted manual wait must not make an
+                    # orphan look stopped merely because flock is released.
+                    # Its persisted ownership latch remains fail-closed.
+                    pass
+        if confirmed_exit:
+            try:
+                from .sessions import confirm_owned_exit
+                confirm_owned_exit(ownership_marker)
+            except Exception:
+                state, detail, code = "stop_failed", "程序已退出，但退出标记无法安全清理；已保留阻止切换的状态，请人工核实。", 2
         try:
             write_state(status_path, target=target, state=state, ok=state == "exited" and code == 0,
                         detail=detail)

@@ -47,6 +47,17 @@ class WorkerLaunchTests(unittest.TestCase):
         self.assertTrue(spawn.call_args.kwargs["start_new_session"])
         self.worker.terminate.assert_not_called()
 
+    def test_suspended_runtime_receipt_acknowledges_launch_without_claiming_protection(self):
+        payload = {"schema": 1, "target": "web", "state": "running", "ok": True,
+                   "suspended": True, "protection_active": False,
+                   "detail": "Started; fixed-exit protection is suspended."}
+        outcome = cli.start_web_guard(
+            config(), self.path, ["/test/Chrome"], self.loc,
+            popen=self.spawn_with_receipt(payload), timeout=0.1)
+        self.assertEqual(outcome, payload)
+        self.assertIs(outcome["protection_active"], False)
+        self.worker.terminate.assert_not_called()
+
     def test_unknown_receipt_never_succeeds_and_stops_owned_worker(self):
         for payload in ([], None, {}, {"schema": 1, "target": "web", "ok": True, "state": "unknown"},
                         {"schema": 2, "target": "web", "ok": True, "state": "running"},

@@ -1,22 +1,28 @@
 """Conservative recovery of stopped, app-owned Chromium singleton links.
 
-This is deliberately not a browser stopper or a profile reset. The two Surge CC
-locks exclude cooperating launchers; process/PID/socket checks also reject a
-manually launched browser. Only recognized stale symlinks are moved, with a
-private manifest, and all browser databases and personal Chrome are untouched.
+``repair`` only moves stale links. ``recover`` can first request a normal stop
+of a verified, current-workspace dedicated browser. Neither resets a profile.
+The Surge CC session, OAuth and shared-browser locks exclude cooperating
+launchers, including those preparing a profile before Chromium has started;
+browser databases and personal Chrome are untouched.
 """
 from __future__ import annotations
 
 from contextlib import ExitStack
+import ctypes
+from dataclasses import dataclass
 import errno
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import stat
 import subprocess
+import sys
+import time
 import uuid
 
 from .core import Blocked, now
@@ -24,7 +30,254 @@ from .workspaces import name_ok
 
 _LINKS = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 _PROFILES = ("Browser", "OAuthBrowser")
+_RUNTIME_LOCKS = (".session.lock", ".oauth.lock", ".browser.lock")
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+@dataclass(frozen=True)
+class _BrowserProcess:
+    pid: int
+    uid: int
+    started: tuple[int, int]
+    executable: str
+    argv: tuple[str, ...]
+
+
+class _BSDInfo(ctypes.Structure):
+    # macOS SDK sys/proc_info.h: PROC_PIDTBSDINFO / struct proc_bsdinfo.
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid",
+        "rgid", "svuid", "svgid", "reserved")] + [
+        ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)] + [
+        (name, ctypes.c_uint32) for name in ("nfiles", "pgid", "jobc", "tdev", "tpgid")] + [
+        ("nice", ctypes.c_int32), ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+
+
+def _decode_argv(raw: bytes) -> tuple[str, ...]:
+    """Decode only argc arguments; never include the following environment."""
+    if len(raw) < 5:
+        raise ValueError("short process arguments")
+    argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+    if not 1 <= argc <= 4096:
+        raise ValueError("invalid argument count")
+    position = raw.index(b"\0", 4) + 1  # kernel executable path, then padding
+    while position < len(raw) and raw[position] == 0:
+        position += 1
+    args = []
+    for _ in range(argc):
+        end = raw.index(b"\0", position)
+        args.append(os.fsdecode(raw[position:end]))
+        position = end + 1
+    return tuple(args)
+
+
+def _process_snapshot(pid: int) -> _BrowserProcess | None:
+    """Read kernel executable, start identity and argv, rather than parse ps text.
+
+    A process can disappear during the read. Any other failure is unknown, not
+    permission to signal a PID. OAuth URLs may be in argv, so these snapshots
+    remain memory-only and must never be written to logs or recovery manifests.
+    """
+    if sys.platform != "darwin" or type(pid) is not int or not 2 <= pid <= 2**31 - 1:
+        raise Blocked("无法可靠验证专用浏览器进程；请正常退出专用窗口后重试。")
+    try:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                     ctypes.c_void_p, ctypes.c_int]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        lib.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        lib.proc_pidpath.restype = ctypes.c_int
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                                ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                                ctypes.c_void_p, ctypes.c_size_t]
+        libc.sysctl.restype = ctypes.c_int
+        before, after = _BSDInfo(), _BSDInfo()
+        if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(before), ctypes.sizeof(before)) != ctypes.sizeof(before):
+            raise OSError("process identity unavailable")
+        path = ctypes.create_string_buffer(4096)
+        if lib.proc_pidpath(pid, path, len(path)) <= 0:
+            raise OSError("process executable unavailable")
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN / KERN_PROCARGS2
+        size = ctypes.c_size_t()
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) or not 5 <= size.value <= 1024 * 1024:
+            raise OSError("process arguments unavailable")
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0):
+            raise OSError("process arguments unavailable")
+        argv = _decode_argv(bytes(buffer[:size.value]))
+        if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(after), ctypes.sizeof(after)) != ctypes.sizeof(after):
+            raise OSError("process identity unavailable")
+        fields = ("pid", "uid", "ruid", "start_sec", "start_usec")
+        if any(getattr(before, key) != getattr(after, key) for key in fields) or before.pid != pid:
+            raise OSError("process changed during observation")
+        if before.uid != before.ruid:
+            raise OSError("unexpected process ownership")
+        return _BrowserProcess(pid, before.uid, (before.start_sec, before.start_usec),
+                               os.fsdecode(path.value), argv)
+    except (OSError, ValueError, AttributeError):
+        if _pid_absent(pid):
+            return None
+        raise Blocked("无法可靠验证专用浏览器进程；未关闭任何无法确认的程序，请正常退出专用窗口。") from None
+
+
+def _lock_pid(links: dict) -> int | None:
+    if not links:
+        return None
+    value = links.get("SingletonLock", {}).get("target", "")
+    match = re.fullmatch(r"([^/\x00]+)-([0-9]{1,10})", value)
+    if (not match or match[1].casefold().rstrip(".") not in _local_hosts()
+            or not 2 <= int(match[2]) <= 2**31 - 1):
+        raise Blocked("专用浏览器锁来源或进程编号无法确认；未关闭程序，请正常退出专用窗口后重试。")
+    return int(match[2])
+
+
+def _owned_browser(process: _BrowserProcess, executable: Path, profile: Path) -> bool:
+    return (process.uid == os.getuid() and process.executable == str(executable)
+            and process.argv and process.argv[0] == str(executable)
+            and [arg for arg in process.argv if arg.startswith("--user-data-dir")] ==
+                ["--user-data-dir=" + str(profile)]
+            and not any(arg.startswith("--type=") for arg in process.argv))
+
+
+def _configured_browser(stack: ExitStack, base_fd: int, base: Path, config_path: Path) -> Path:
+    fd = os.open(config_path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=base_fd)
+    stack.callback(os.close, fd)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 1024 * 1024):
+        raise Blocked("专用浏览器配置无法安全读取，未关闭程序。")
+    try:
+        config = json.loads(os.read(fd, info.st_size + 1))
+    except (ValueError, UnicodeError):
+        raise Blocked("专用浏览器配置无法完整读取，未关闭程序。") from None
+    from .containment import _browser_identity
+    if not isinstance(config, dict):
+        raise Blocked("专用浏览器配置无法完整读取，未关闭程序。")
+    expected, _, _ = _browser_identity(config, require_files=True)
+    directory = _open_base(stack, expected.parent)
+    executable = _lstat(directory, expected.name)
+    if (executable is None or not stat.S_ISREG(executable.st_mode)
+            or executable.st_uid != os.getuid() or executable.st_mode & 0o022
+            or not executable.st_mode & 0o111):
+        raise Blocked("专用浏览器程序的类型、权限或所有者异常，未关闭程序。")
+    return expected
+
+
+def recover(config_path: Path, name: str, *, timeout: float = 8) -> dict:
+    """Normally stop only verified dedicated windows, then back up stale locks.
+
+    SingletonLock supplies a candidate, not authority to kill it. The candidate
+    must match kernel executable/UID/start identity and exact profile argv. No
+    guard, terminal, CLI, helper, personal Chrome or other workspace is signaled.
+    SIGTERM is the only shutdown request; a timeout preserves all runtime links.
+    As with any PID-based OS API, the identity is checked immediately before the
+    signal; callers must not treat this as a hostile same-user security boundary.
+    """
+    name_ok(name)
+    if not 0 < timeout <= 30:
+        raise Blocked("浏览器恢复等待时间无效。")
+    config_path = Path(config_path).absolute()
+    base = config_path.parent
+    root = base / "workspaces" / name
+    stopped = []
+    try:
+        with ExitStack() as stack:
+            base_fd = _open_base(stack, base)
+            workspaces_fd = _directory(stack, "workspaces", base_fd)
+            root_fd = _directory(stack, name, workspaces_fd)
+            data_fd = _directory(stack, "data", root_fd)
+            _lock(stack, root_fd, ".browser-recovery.lock")
+            profiles = {key: root / "data" / key for key in _PROFILES}
+            descriptors, links, candidates = {}, {}, {}
+            executable = None
+            for key in _PROFILES:
+                if _lstat(data_fd, key) is None:
+                    continue
+                descriptors[key] = _directory(stack, key, data_fd)
+                links[key] = _read_links(descriptors[key])
+                pid = _lock_pid(links[key])
+                if pid is None or _pid_absent(pid):
+                    continue
+                if executable is None:
+                    executable = _configured_browser(stack, base_fd, base, config_path)
+                process = _process_snapshot(pid)
+                if process is None:
+                    continue
+                if not _owned_browser(process, executable, profiles[key]):
+                    raise Blocked("浏览器锁指向的程序不属于当前工作区专用窗口；未关闭它，请正常退出对应窗口后重试。")
+                candidates[key] = process
+
+            def recheck(key: str) -> None:
+                with ExitStack() as verify:
+                    current = _open_base(verify, profiles[key])
+                    actual, expected = os.fstat(current), os.fstat(descriptors[key])
+                    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+                        raise Blocked("浏览器目录在恢复期间发生变化，已停止；请重新检查。")
+                if _read_links(descriptors[key]) != links[key]:
+                    raise Blocked("浏览器运行锁在恢复期间发生变化，已停止；请重新检查。")
+
+            # Validate every candidate before any shutdown, so a mismatched
+            # OAuth PID does not partially close an otherwise healthy web tab.
+            for key, process in candidates.items():
+                recheck(key)
+                current = _process_snapshot(process.pid)
+                if current is None:
+                    continue
+                if current != process:
+                    raise Blocked("浏览器进程身份在恢复期间发生变化，未发送关闭请求；请重新检查。")
+                try:
+                    os.kill(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    continue
+                except OSError:
+                    raise Blocked("系统未允许关闭专用窗口；请保存工作并正常退出该窗口后重试。") from None
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    try:
+                        current = _process_snapshot(process.pid)
+                    except Blocked:
+                        # An exited but not yet reaped child can still satisfy
+                        # kill(pid, 0) while macOS no longer exposes its argv or
+                        # executable. Unknown is not stopped: let its owner reap
+                        # it within the same bounded wait, without more signals.
+                        time.sleep(0.1)
+                        continue
+                    if current is None:
+                        stopped.append(key)
+                        break
+                    if current != process:
+                        raise Blocked("浏览器进程身份已变化，未继续关闭或清锁；请重新检查。")
+                    time.sleep(0.1)
+                else:
+                    raise Blocked("专用浏览器未在等待期限内退出；请保存工作并正常退出专用窗口，再点击恢复。未强制结束或清锁。")
+
+            # The existing owner releases its locks after noticing browser exit.
+            # A running CLI may legitimately keep .session.lock: never stop it.
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    with ExitStack() as held:
+                        for lock in _RUNTIME_LOCKS:
+                            _lock(held, root_fd, lock)
+                    break
+                except Blocked as exc:
+                    if "仍在运行" not in str(exc):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise Blocked("当前工作区仍有 Claude 会话、授权或备份操作占用；请先结束该会话再恢复。专用窗口已请求正常关闭，登录资料未清理。") from None
+                    time.sleep(0.1)
+            if executable is not None:
+                _assert_stopped(base, dict(profiles, runtime=executable.parents[2]))
+            result = repair(config_path, name)
+            result["stopped_profiles"] = stopped
+            if stopped:
+                result.update(status="recovered", message="已正常关闭当前工作区专用窗口并检查残留锁；登录资料已保留。可以重新检查线路。")
+            return result
+    except Blocked:
+        raise
+    except OSError:
+        raise Blocked("无法安全访问专用浏览器恢复目录，未继续操作；请正常退出专用窗口后重试。") from None
 
 
 def _identity(info: os.stat_result) -> tuple:
@@ -239,7 +492,7 @@ def repair(config_path: Path, name: str) -> dict:
             workspaces_fd = _directory(stack, "workspaces", base_fd)
             root_fd = _directory(stack, name, workspaces_fd)
             data_fd = _directory(stack, "data", root_fd)
-            locks = {key: _lock(stack, root_fd, key) for key in (".session.lock", ".oauth.lock")}
+            locks = {key: _lock(stack, root_fd, key) for key in _RUNTIME_LOCKS}
             profile_fds = {}
             profiles = {key: root_path / "data" / key for key in _PROFILES}
             # Keep original identities, not timestamps, for directories whose

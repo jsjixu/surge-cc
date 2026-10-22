@@ -3,11 +3,15 @@
 @main
 private enum GUIContractTests {
     static func report(_ rows: [[String: Any]], ok: Bool = true,
-                       recoveryAction: Any? = nil) throws -> BackendResponse {
+                       recoveryAction: Any? = nil, paused: Any? = nil,
+                       pauseReason: Any? = nil, metadata: [String: Any] = [:]) throws -> BackendResponse {
         var document: [String: Any] = [
             "schema": 1, "ok": ok, "summary": "测试结果", "checks": rows, "settings": [:]
         ]
         if let recoveryAction { document["recovery_action"] = recoveryAction }
+        if let paused { document["paused"] = paused }
+        if let pauseReason { document["pause_reason"] = pauseReason }
+        for (key, value) in metadata { document[key] = value }
         let data = try JSONSerialization.data(withJSONObject: document)
         return try JSONDecoder().decode(BackendResponse.self, from: data)
     }
@@ -39,6 +43,90 @@ private enum GUIContractTests {
         try expect(report([good], ok: false), .blocked)
         try expect(report([good]), .blocked, exitCode: 2)
         try expect(report([good, check("malformed", "surprise", required: false)]), .blocked)
+
+        let modeFailure = check("mode", "fail")
+        let pausedMode = try report([good, modeFailure], ok: false, paused: true, pauseReason: "surge-mode")
+        expect(pausedMode, .paused, exitCode: 1)
+        precondition(pausedMode.paused == true && pausedMode.pauseReason == "surge-mode")
+        precondition(pausedMode.launched != true && pausedMode.recoveryAction == nil)
+        expect(pausedMode, .blocked, exitCode: 0)
+        try expect(report([good, modeFailure], ok: false, paused: true, pauseReason: "unknown"), .blocked, exitCode: 1)
+        try expect(report([good, modeFailure], ok: false, paused: true), .blocked, exitCode: 1)
+        try expect(report([good, modeFailure], ok: false, pauseReason: "surge-mode"), .blocked, exitCode: 1)
+        try expect(report([good], paused: true, pauseReason: "surge-mode"), .blocked)
+        try expect(report([good, modeFailure], paused: true, pauseReason: "surge-mode"), .blocked, exitCode: 1)
+        try expect(report([good], ok: false, paused: true, pauseReason: "surge-mode"), .blocked, exitCode: 1)
+        try expect(report([good, check("mode", "fail", required: false)], ok: false,
+                          paused: true, pauseReason: "surge-mode"), .blocked, exitCode: 1)
+        try expect(report([modeFailure, modeFailure], ok: false,
+                          paused: true, pauseReason: "surge-mode"), .blocked, exitCode: 1)
+        do {
+            _ = try report([modeFailure], ok: false, paused: "true", pauseReason: "surge-mode")
+            preconditionFailure("Malformed pause metadata must not decode")
+        } catch is DecodingError {}
+
+        // Global mode allows launch without claiming a successful protected route.
+        let globalGood = check("surge", "pass")
+        let globalMetadata: [String: Any] = ["paused": true, "pause_reason": "surge-global-mode",
+            "surge_mode": "proxy", "launch_allowed": true, "protection_active": false]
+        let suspendedCheck = try report([globalGood, modeFailure], ok: false, metadata: globalMetadata)
+        expect(suspendedCheck, .suspended, exitCode: 2)
+        expect(suspendedCheck, .blocked, exitCode: 0)
+        expect(suspendedCheck, .blocked, exitCode: 1)
+        for target in ["web", "code-terminal"] {
+            var launchMetadata = globalMetadata
+            launchMetadata["launched"] = true
+            launchMetadata["target"] = target
+            let launchedSuspended = try report([globalGood, modeFailure], metadata: launchMetadata)
+            expect(launchedSuspended, .suspended)
+            expect(launchedSuspended, .blocked, exitCode: 2)
+            try expect(report([globalGood, modeFailure], ok: false, metadata: launchMetadata), .blocked, exitCode: 2)
+        }
+        for missing in globalMetadata.keys {
+            var incomplete = globalMetadata
+            incomplete.removeValue(forKey: missing)
+            try expect(report([globalGood, modeFailure], ok: false, metadata: incomplete), .blocked, exitCode: 2)
+        }
+        let invalidFields: [(String, Any)] = [("paused", false), ("pause_reason", "unknown"),
+            ("surge_mode", "direct"), ("surge_mode", "rule"), ("surge_mode", "unknown"),
+            ("launch_allowed", false), ("protection_active", true), ("schema", 2)]
+        for (field, invalid) in invalidFields {
+            var malformed = globalMetadata
+            malformed[field] = invalid
+            try expect(report([globalGood, modeFailure], ok: false, metadata: malformed), .blocked, exitCode: 2)
+        }
+        for field in ["paused", "launch_allowed", "protection_active"] {
+            var malformed = globalMetadata
+            malformed[field] = "true"
+            do {
+                _ = try report([globalGood, modeFailure], ok: false, metadata: malformed)
+                preconditionFailure("Global protection metadata must have exact types")
+            } catch is DecodingError {}
+        }
+        for rows in [[good], [modeFailure], [modeFailure, modeFailure],
+                     [modeFailure, check("surge", "pass", required: false)],
+                     [good, check("mode", "fail", required: false)],
+                     [modeFailure, check("surge", "fail")],
+                     [modeFailure, check("unknown", "surprise", required: false)]] {
+            try expect(report(rows, ok: false, metadata: globalMetadata), .blocked, exitCode: 2)
+        }
+        // A paused result with ok:true needs an actual successful known launch.
+        try expect(report([globalGood, modeFailure], metadata: globalMetadata), .blocked)
+        for invalidTarget in ["", "code", "login", "unknown"] {
+            var malformedLaunch = globalMetadata
+            malformedLaunch["launched"] = true
+            malformedLaunch["target"] = invalidTarget
+            try expect(report([globalGood, modeFailure], metadata: malformedLaunch), .blocked)
+        }
+        try expect(report([good], metadata: ["launch_allowed": true]), .blocked)
+        try expect(report([good], metadata: ["protection_active": false]), .blocked)
+        for claimedMode in ["proxy", "direct", "rule", "unknown", ""] {
+            try expect(report([good], metadata: ["surge_mode": claimedMode]), .blocked)
+        }
+        try expect(report([globalGood, modeFailure], ok: false, paused: true, pauseReason: "surge-mode",
+                          metadata: ["surge_mode": "direct"]), .paused, exitCode: 2)
+        try expect(report([globalGood, modeFailure], ok: false, paused: true, pauseReason: "surge-mode",
+                          metadata: ["surge_mode": "proxy"]), .blocked, exitCode: 2)
 
         let legacy = try report([good]).checks!.first!
         precondition(legacy.evidence.isEmpty && legacy.evidenceScope == nil)
@@ -89,7 +177,56 @@ private enum GUIContractTests {
         precondition(envelope.document["guard"]?.object["running"]?.bool == false)
         precondition(envelope.document["plan_id"]?.string == "plan-1")
 
-        // Only the named browser-lock operation can expose a repair button.
+        // Workspace previews report route/auth separately and never claim an
+        // OAuth mode selection proves an account is logged in.
+        let accountResponse = try report([], metadata: ["workspaces": [
+            ["name": "A", "route": ["group": "Claude A", "policy": "Home A", "expected_ip": "203.0.113.7"],
+             "auth": ["mode": "token", "configured": true], "browser": ["has_profile": true]],
+            ["name": "B", "route": NSNull(), "auth": ["mode": "oauth", "configured": false],
+             "browser": ["has_profile": false]]
+        ]])
+        let accountItems = accountResponse.document["workspaces"]!.array
+        let accountA = WorkspaceSummary(accountItems[0])!
+        let accountB = WorkspaceSummary(accountItems[1])!
+        precondition(accountA.routeConfigured && accountA.policy == "Home A" && accountA.authConfigured)
+        precondition(accountA.hasBrowserProfile == true)
+        precondition(!accountB.routeConfigured && accountB.policy.isEmpty && accountB.expectedIP.isEmpty)
+        precondition(!accountB.authConfigured && accountB.hasBrowserProfile == false)
+        precondition(accountB.authDescription.contains("尚未设置"))
+        let oauthSelected = try report([], metadata: ["workspaces": [["name": "B",
+            "auth": ["mode": "oauth", "configured": true]]]])
+        let oauthSummary = WorkspaceSummary(oauthSelected.document["workspaces"]!.array[0])!
+        precondition(oauthSummary.authDescription.contains("是否已登录"))
+        precondition(oauthSummary.hasBrowserProfile == nil && !oauthSummary.routeConfigured)
+        for name in ["A", "B"] {
+            precondition(WorkspaceCommand.use(name) ==
+                ["workspace", "use", "--name", name, "--close-sessions", "--json"])
+            precondition(WorkspaceCommand.auth("store", workspace: name) ==
+                ["workspace-auth", "store", "--workspace", name, "--stdin", "--json"])
+            precondition(WorkspaceCommand.auth("oauth", workspace: name) ==
+                ["workspace-auth", "oauth", "--workspace", name, "--json"])
+        }
+        for name in ["", "../A", "B --json", "C"] {
+            precondition(WorkspaceCommand.use(name) == nil)
+            precondition(WorkspaceCommand.auth("store", workspace: name) == nil)
+        }
+        precondition(WorkspaceCommand.auth("delete-all", workspace: "A") == nil)
+        let unconfiguredB = try report([], metadata: ["settings": ["workspace": "B"]])
+        precondition(WorkspaceCommand.refreshedSettings(unconfiguredB, exitCode: 0)?.workspace == "B")
+        precondition(WorkspaceCommand.refreshedSettings(unconfiguredB, exitCode: 0)?.isComplete == false)
+        precondition(WorkspaceCommand.refreshedSettings(unconfiguredB, exitCode: 1) == nil)
+        let emptyErrorSettings = try report([], ok: false)
+        precondition(WorkspaceCommand.refreshedSettings(emptyErrorSettings, exitCode: 1) == nil)
+        let omittedWorkspace = try report([], metadata: ["settings": [:]])
+        precondition(WorkspaceCommand.refreshedSettings(omittedWorkspace, exitCode: 0) == nil)
+        let secretFixture = "token-fixture-never-in-arguments"
+        precondition(WorkspaceCommand.tokenInput(" \(secretFixture)\n") == Data((secretFixture + "\n").utf8))
+        precondition(!WorkspaceCommand.auth("store", workspace: "A")!.contains(secretFixture))
+        for invalidToken in ["", " ", "line1\nline2", "has space", String(repeating: "x", count: 16_385)] {
+            precondition(WorkspaceCommand.tokenInput(invalidToken) == nil)
+        }
+
+        // Only named, allowlisted operations can expose recovery buttons.
         let blockedLocks = try report([check("operation", "fail")], ok: false,
                                       recoveryAction: "repair-browser-locks")
         precondition(blockedLocks.recoveryAction == .repairBrowserLocks)
@@ -101,10 +238,30 @@ private enum GUIContractTests {
                      ["browser-locks", "repair", "--workspace", "B", "--json"])
         for invalidWorkspace in ["", "../A", "A --launch", "C"] {
             precondition(recovery?.arguments(workspace: invalidWorkspace) == nil)
+            precondition(BrowserRecoveryAction.recoverDedicatedBrowser.arguments(workspace: invalidWorkspace) == nil)
         }
+        let liveBrowserRecovery = try report([check("operation", "fail")], ok: false,
+                                            recoveryAction: "recover-browser")
+        precondition(liveBrowserRecovery.recoveryAction == .recoverDedicatedBrowser)
+        precondition(BrowserRecoveryAction.after(liveBrowserRecovery, exitCode: 1) == .recoverDedicatedBrowser)
+        precondition(BrowserRecoveryAction.recoverDedicatedBrowser.arguments(workspace: "A") ==
+                     ["browser-locks", "recover", "--workspace", "A", "--json"])
+        precondition(BrowserRecoveryAction.recoverDedicatedBrowser.arguments(workspace: "B") ==
+                     ["browser-locks", "recover", "--workspace", "B", "--json"])
+        let wrongMode = try report([check("mode", "fail")], ok: false,
+                                   recoveryAction: "restore-rule-mode")
+        // Mode changes are not a recovery command; the app never switches Surge mode.
+        precondition(wrongMode.recoveryAction == nil)
+        precondition(BrowserRecoveryAction.after(wrongMode, exitCode: 1) == nil)
         let unknownAction = try report([], ok: false, recoveryAction: "launch web --json")
         precondition(unknownAction.recoveryAction == nil)
         precondition(BrowserRecoveryAction.after(unknownAction, exitCode: 1) == nil)
+        let noMetadata = try JSONDecoder().decode(BackendResponse.self, from: Data(
+            #"{"schema":1,"ok":false,"summary":"recover-browser restore-rule-mode","checks":[],"settings":{}}"#.utf8))
+        precondition(BrowserRecoveryAction.after(noMetadata, exitCode: 1) == nil)
+        // A fresh check does not retain an action from a previous failed repair.
+        let freshFailure = try report([], ok: false)
+        precondition(BrowserRecoveryAction.after(freshFailure, exitCode: 1) == nil)
         precondition(envelope.recoveryAction == nil)
         // Maintenance is reachable without a previous failure, and targets the
         // configured workspace rather than a not-yet-applied picker selection.
@@ -112,6 +269,8 @@ private enum GUIContractTests {
         maintenanceSettings.workspace = "B"
         precondition(BrowserRecoveryAction.repairBrowserLocks.arguments(workspace: maintenanceSettings.workspace) ==
                      ["browser-locks", "repair", "--workspace", "B", "--json"])
+        precondition(BrowserRecoveryAction.recoverDedicatedBrowser.arguments(workspace: maintenanceSettings.workspace) ==
+                     ["browser-locks", "recover", "--workspace", "B", "--json"])
         let repairFailed = try report([], ok: false)
         precondition(BrowserRecoveryAction.after(repairFailed, exitCode: 1,
                                                  retrying: recovery) == recovery)
@@ -131,6 +290,15 @@ private enum GUIContractTests {
         let repairWithOldRows = try report([liveBrowserFailure])
         precondition(BrowserRecoveryAction.checksAfterRepair(repairWithOldRows, exitCode: 0).isEmpty)
         precondition(BrowserRecoveryAction.checksAfterRepair(repairWithOldRows, exitCode: 1).count == 1)
+        for action in [BrowserRecoveryAction.repairBrowserLocks, .recoverDedicatedBrowser] {
+            precondition(action.completion(repaired, exitCode: 0) == .recheck)
+            precondition(action.completion(repairWithOldRows, exitCode: 0) == .recheck)
+            precondition(action.completion(repaired, exitCode: 1) == .showFailure)
+            precondition(action.completion(refusedRepair, exitCode: 0) == .showFailure)
+            precondition(BrowserRecoveryAction.after(refusedRepair, exitCode: 1, retrying: action) == action)
+            precondition(BrowserRecoveryAction.after(nil, exitCode: 1, retrying: action) == action)
+            precondition(BrowserRecoveryAction.after(repaired, exitCode: 0, retrying: action) == nil)
+        }
         // A lock repair cannot become a passing network assessment or auto-launch.
         expect(repaired, .blocked)
         precondition(repaired.launched != true)
@@ -138,6 +306,6 @@ private enum GUIContractTests {
             _ = try report([], ok: false, recoveryAction: ["repair-browser-locks"])
             preconditionFailure("Malformed recovery metadata must not be interpreted as a command")
         } catch is DecodingError {}
-        print("GUI contract: gating, evidence, summaries, settings, recovery allowlist and repair retry/reset passed")
+        print("GUI contract: gating, strict global suspension/launch metadata, evidence, summaries, settings, recovery allowlist, retry/reset and automatic recheck passed")
     }
 }

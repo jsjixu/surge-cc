@@ -126,13 +126,49 @@ private indirect enum JSONValue: Decodable, Sendable {
 
 private enum BrowserRecoveryAction: String, Sendable {
     case repairBrowserLocks = "repair-browser-locks"
+    case recoverDedicatedBrowser = "recover-browser"
+
+    enum Completion: Equatable {
+        case recheck, showFailure
+    }
 
     func arguments(workspace: String) -> [String]? {
         guard ["A", "B"].contains(workspace) else { return nil }
         switch self {
         case .repairBrowserLocks:
             return ["browser-locks", "repair", "--workspace", workspace, "--json"]
+        case .recoverDedicatedBrowser:
+            return ["browser-locks", "recover", "--workspace", workspace, "--json"]
         }
+    }
+
+    var title: String {
+        switch self {
+        case .repairBrowserLocks: return "仅清理已退出窗口的残留锁"
+        case .recoverDedicatedBrowser: return "关闭专用窗口并修复"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .repairBrowserLocks:
+            return "仅处理当前专用工作区已退出窗口的残留锁，先备份再清理。保留登录资料和个人 Chrome；若仍有进程运行，会提示你先退出。修复后自动重新检查线路。"
+        case .recoverDedicatedBrowser:
+            return "会关闭当前工作区的专用浏览器，中断其中网页和授权，再备份并清理残留锁。保留登录资料，个人 Chrome 不受影响。完成后自动重新检查，不会自动打开网页或登录。"
+        }
+    }
+
+    var progressMessage: String {
+        switch self {
+        case .repairBrowserLocks: return "正在确认专用浏览器已退出，并备份、清理残留锁…"
+        case .recoverDedicatedBrowser: return "正在关闭当前工作区的专用浏览器，并备份、清理残留锁…"
+        }
+    }
+
+    func completion(_ response: BackendResponse, exitCode: Int32) -> Completion {
+        // Browser repair returns maintenance results, which must never pass the
+        // route gate. Only a new complete check can establish the route status.
+        return response.ok && exitCode == 0 ? .recheck : .showFailure
     }
 
     // Recovery is an explicit allowlist, never a backend-supplied command line.
@@ -161,11 +197,20 @@ private struct BackendResponse: Decodable, Sendable {
     let launched: Bool?
     let target: String?
     let recoveryAction: BrowserRecoveryAction?
+    let paused: Bool?
+    let pauseReason: String?
+    let surgeMode: String?
+    let launchAllowed: Bool?
+    let protectionActive: Bool?
     let document: [String: JSONValue]
 
     private enum CodingKeys: String, CodingKey {
-        case schema, ok, summary, checked_at, checks, settings, launched, target
+        case schema, ok, summary, checked_at, checks, settings, launched, target, paused
         case recoveryAction = "recovery_action"
+        case pauseReason = "pause_reason"
+        case surgeMode = "surge_mode"
+        case launchAllowed = "launch_allowed"
+        case protectionActive = "protection_active"
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -179,19 +224,50 @@ private struct BackendResponse: Decodable, Sendable {
         target = try c.decodeIfPresent(String.self, forKey: .target)
         recoveryAction = try c.decodeIfPresent(String.self, forKey: .recoveryAction)
             .flatMap(BrowserRecoveryAction.init(rawValue:))
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused)
+        pauseReason = try c.decodeIfPresent(String.self, forKey: .pauseReason)
+        surgeMode = try c.decodeIfPresent(String.self, forKey: .surgeMode)
+        launchAllowed = try c.decodeIfPresent(Bool.self, forKey: .launchAllowed)
+        protectionActive = try c.decodeIfPresent(Bool.self, forKey: .protectionActive)
         document = try JSONValue(from: decoder).object
     }
 }
 
 private enum CheckAssessment: Equatable {
-    case passed, caution, blocked
+    case passed, caution, blocked, paused, suspended
     static func assess(_ response: BackendResponse, exitCode: Int32) -> CheckAssessment {
         let rows = response.checks ?? []
         let required = rows.filter(\.required)
         let knownStatuses = Set(["pass", "fail", "unknown", "warn", "info"])
-        guard response.ok, exitCode == 0, !rows.isEmpty, !required.isEmpty,
+        guard response.schema == 1, !rows.isEmpty, !required.isEmpty,
               Set(rows.map(\.id)).count == rows.count,
-              rows.allSatisfy({ knownStatuses.contains($0.status) }),
+              rows.allSatisfy({ knownStatuses.contains($0.status) }) else { return .blocked }
+        if response.paused == true {
+            guard required.contains(where: { $0.id == "mode" && $0.status == "fail" }) else { return .blocked }
+            if response.pauseReason == "surge-global-mode" {
+                // Suspension is an explicit mode choice, not a successful route
+                // check. Accept only this exact contract, including launch result.
+                guard response.surgeMode == "proxy", response.launchAllowed == true,
+                      response.protectionActive == false,
+                      required.contains(where: { $0.id == "surge" && $0.status == "pass" }),
+                      required.filter({ $0.id != "mode" }).allSatisfy({ $0.status == "pass" }) else { return .blocked }
+                if response.ok {
+                    guard exitCode == 0, response.launched == true,
+                          ["web", "code-terminal"].contains(response.target ?? "") else { return .blocked }
+                } else {
+                    guard exitCode == 2, response.launched != true, response.target == nil else { return .blocked }
+                }
+                return .suspended
+            }
+            // Legacy/direct-mode pauses still block startup.
+            guard !response.ok, exitCode != 0, response.pauseReason == "surge-mode",
+                  response.surgeMode == nil || response.surgeMode == "direct",
+                  response.launchAllowed != true, response.protectionActive != true,
+                  response.launched != true else { return .blocked }
+            return .paused
+        }
+        guard response.pauseReason == nil, response.surgeMode == nil, response.launchAllowed == nil,
+              response.protectionActive == nil, response.ok, exitCode == 0,
               required.allSatisfy({ $0.status == "pass" }) else { return .blocked }
         return rows.contains { !$0.required && !["pass", "info"].contains($0.status) } ? .caution : .passed
     }
@@ -218,6 +294,76 @@ private struct Snapshot: Identifiable, Sendable {
     let id: String
     let label: String
     let date: String
+}
+
+// Only public status fields are decoded here; credentials never enter report models.
+private struct WorkspaceSummary: Sendable {
+    let name: String
+    let policy: String
+    let expectedIP: String
+    let group: String
+    let routeConfigured: Bool
+    let hasBrowserProfile: Bool?
+    let authMode: String
+    let authConfigured: Bool
+
+    init?(_ value: JSONValue) {
+        let object = value.object
+        guard let name = object["name"]?.string, ["A", "B"].contains(name) else { return nil }
+        self.name = name
+        let route = object["route"]?.object ?? [:]
+        policy = route["policy"]?.string ?? ""
+        expectedIP = route["expected_ip"]?.string ?? ""
+        group = route["group"]?.string ?? ""
+        routeConfigured = !policy.isEmpty && !expectedIP.isEmpty && !group.isEmpty
+        hasBrowserProfile = object["browser"]?.object["has_profile"]?.bool
+        let auth = object["auth"]?.object ?? [:]
+        authMode = auth["mode"]?.string ?? "unconfigured"
+        authConfigured = auth["configured"]?.bool ?? false
+    }
+
+    var browserDescription: String {
+        switch hasBrowserProfile {
+        case true: return "专用资料已保存；网页登录和 OAuth 共用此资料，登录状态以页面为准。"
+        case false: return "尚未建立专用浏览器资料；首次打开时创建，不复制其他工作区登录。"
+        case nil: return "浏览器状态尚未确认，请刷新工作区。"
+        }
+    }
+
+    var authDescription: String {
+        switch (authMode, authConfigured) {
+        case ("token", true): return "本工作区已绑定钥匙串 Token；不会使用其他工作区的 Token。"
+        case ("oauth", true): return "使用本工作区的 OAuth 登录；是否已登录，请在 Claude Code 内确认。"
+        case ("oauth", false), ("unconfigured", _): return "尚未设置独立 CLI 凭据；可选择 OAuth 登录，或保存此账号的 Token。"
+        case ("token", false): return "本工作区 Token 尚不可用，请重新保存或选择 OAuth。"
+        default: return "CLI 凭据状态未确认，请刷新工作区。"
+        }
+    }
+}
+
+private enum WorkspaceCommand {
+    static func use(_ name: String) -> [String]? {
+        guard ["A", "B"].contains(name) else { return nil }
+        return ["workspace", "use", "--name", name, "--close-sessions", "--json"]
+    }
+    static func auth(_ action: String, workspace: String) -> [String]? {
+        guard ["A", "B"].contains(workspace), ["store", "oauth"].contains(action) else { return nil }
+        var arguments = ["workspace-auth", action, "--workspace", workspace]
+        if action == "store" { arguments.append("--stdin") }
+        return arguments + ["--json"]
+    }
+    static func refreshedSettings(_ response: BackendResponse, exitCode: Int32) -> Settings? {
+        guard response.ok, exitCode == 0, let settings = response.settings,
+              let explicitWorkspace = response.document["settings"]?.object["workspace"]?.string,
+              ["A", "B"].contains(explicitWorkspace), settings.workspace == explicitWorkspace else { return nil }
+        return settings
+    }
+    static func tokenInput(_ text: String) -> Data? {
+        let token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty, token.utf8.count <= 16_384,
+              !token.contains(where: { $0.isWhitespace || $0.isNewline }) else { return nil }
+        return Data((token + "\n").utf8)
+    }
 }
 
 private struct RepairAction: Identifiable, Sendable {
@@ -258,7 +404,7 @@ private enum Backend {
         return FileManager.default.fileExists(atPath: development.path) ? development : nil
     }
 
-    static func run(_ arguments: [String], workingDirectory: URL) -> CommandResult {
+    static func run(_ arguments: [String], workingDirectory: URL, standardInput: Data? = nil) -> CommandResult {
         guard let script = scriptURL() else {
             return CommandResult(response: nil, exitCode: 1, error: "找不到配套程序，请重新构建或安装 Surge CC。")
         }
@@ -275,7 +421,10 @@ private enum Backend {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output
-        process.standardInput = FileHandle.nullDevice
+        // Token entry is passed through stdin, never process arguments, environment,
+        // user defaults, reports, or a temporary file.
+        let input = standardInput == nil ? nil : Pipe()
+        process.standardInput = input?.fileHandleForReading ?? FileHandle.nullDevice
 
         let deadline: TimeInterval = 180
         let watchdog = DispatchWorkItem {
@@ -288,6 +437,15 @@ private enum Backend {
             return CommandResult(response: nil, exitCode: 1, error: "无法启动检查程序：\(error.localizedDescription)")
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + deadline, execute: watchdog)
+        if let input, let standardInput {
+            do {
+                try input.fileHandleForWriting.write(contentsOf: standardInput)
+                try input.fileHandleForWriting.close()
+            } catch {
+                try? input.fileHandleForWriting.close()
+                if process.isRunning { process.terminate() }
+            }
+        }
         // Drain while the process runs, so a full pipe cannot deadlock waitUntilExit.
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
@@ -307,7 +465,7 @@ private enum Backend {
 }
 
 private enum DisplayState {
-    case idle, busy, passed, caution, blocked, saved, launched, message
+    case idle, busy, passed, caution, blocked, paused, suspended, saved, launched, message
 
     var title: String {
         switch self {
@@ -316,6 +474,8 @@ private enum DisplayState {
         case .passed: return "本次检查通过"
         case .caution: return "基础检查通过，部分项目待确认"
         case .blocked: return "尚未通过"
+        case .paused: return "已暂停启动"
+        case .suspended: return "保护已挂起"
         case .saved: return "配置已保存"
         case .launched: return "已启动"
         case .message: return "操作完成"
@@ -326,14 +486,14 @@ private enum DisplayState {
         switch self {
         case .passed, .launched: return .green
         case .busy: return .blue
-        case .blocked, .caution: return .orange
+        case .blocked, .caution, .paused, .suspended: return .orange
         case .saved, .idle, .message: return .secondary
         }
     }
 }
 
-private enum Operation {
-    case check, configure, workspaceList, workspaceUse, snapshot, restore, repairPlan, repair, guardStatus, browserLockRepair
+private enum Operation: Equatable {
+    case check, configure, workspaceList, workspaceUse, workspaceAuth, snapshot, restore, repairPlan, repair, guardStatus, recovery
 }
 
 @MainActor
@@ -351,6 +511,14 @@ private final class ViewModel: ObservableObject {
     @Published var selectedWorkspace = "A"
     @Published var currentWorkspace = ""
     @Published var workspaceSnapshots: [String: [Snapshot]] = [:]
+    @Published var workspaceDetails: [String: WorkspaceSummary] = [:]
+    @Published var confirmingWorkspaceSwitch = false
+    @Published var pendingWorkspace = ""
+    @Published var showingTokenEntry = false
+    @Published var confirmingOAuth = false
+    @Published var credentialWorkspace = ""
+    @Published var tokenDraft = ""
+    @Published var credentialError = ""
     @Published var selectedSnapshot = ""
     @Published var snapshotLabel = ""
     @Published var showingRepair = false
@@ -358,6 +526,8 @@ private final class ViewModel: ObservableObject {
     @Published var repairPlanID = ""
     @Published var browserRecoveryAction: BrowserRecoveryAction?
     @Published var guardRunning: Bool?
+    @Published var guardSuspended = false
+    @Published var suspendedSessions = 0
     @Published var guardDetail = "尚未读取保护状态。"
     @Published var guardCheckedAt = ""
     @Published var guardInterval: Int?
@@ -386,16 +556,19 @@ private final class ViewModel: ObservableObject {
         showingSettings = true
     }
 
+    var activeWorkspace: String { currentWorkspace.isEmpty ? settings.workspace : currentWorkspace }
+    var selectedWorkspaceDetails: WorkspaceSummary? { workspaceDetails[selectedWorkspace] }
     var snapshots: [Snapshot] { workspaceSnapshots[selectedWorkspace] ?? [] }
     var selectedSnapshotLabel: String { snapshots.first { $0.id == selectedSnapshot }?.label ?? selectedSnapshot }
 
     func perform(_ arguments: [String], message: String, operation: Operation = .check,
-                 workingDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+                 workingDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+                 standardInput: Data? = nil) {
         guard !busy else { return }
         let id = UUID()
         requestID = id
-        let retryingRecovery = operation == .browserLockRepair ? browserRecoveryAction : nil
-        if operation != .browserLockRepair { browserRecoveryAction = nil }
+        let retryingRecovery = operation == .recovery ? browserRecoveryAction : nil
+        if operation != .recovery { browserRecoveryAction = nil }
         state = .busy
         summary = message
         checks = []
@@ -403,13 +576,15 @@ private final class ViewModel: ObservableObject {
         settingsError = ""
         if operation == .guardStatus {
             guardRunning = nil
+            guardSuspended = false
+            suspendedSessions = 0
             guardDetail = "正在读取保护状态…"
             guardCheckedAt = ""
             guardInterval = nil
         }
         Task {
             let result = await Task.detached(priority: .userInitiated) {
-                Backend.run(arguments, workingDirectory: workingDirectory)
+                Backend.run(arguments, workingDirectory: workingDirectory, standardInput: standardInput)
             }.value
             guard self.requestID == id else { return }
             self.browserRecoveryAction = BrowserRecoveryAction.after(
@@ -418,29 +593,66 @@ private final class ViewModel: ObservableObject {
                 self.state = .blocked
                 self.summary = result.error ?? "无法确认当前线路。"
                 if operation == .configure { self.settingsError = self.summary }
+                if operation == .workspaceAuth { self.credentialError = self.summary }
                 if operation == .guardStatus { self.guardDetail = self.summary }
                 return
             }
-            if let settings = response.settings, settings.isComplete { self.settings = settings }
+            if let settings = response.settings, settings.isComplete {
+                self.settings = settings
+                self.currentWorkspace = settings.workspace
+            } else if [.workspaceList, .workspaceUse, .workspaceAuth].contains(operation),
+                      let settings = WorkspaceCommand.refreshedSettings(response, exitCode: result.exitCode) {
+                // An explicit, successful unconfigured target must replace the
+                // previous route too. Error settings:{} must never reset it to A.
+                self.settings = settings
+                self.currentWorkspace = settings.workspace
+            }
             self.summary = response.summary
             if operation == .configure {
                 if response.ok && result.exitCode == 0 {
                     self.state = .saved
                     self.summary = "配置已保存，尚未检查。"
                     self.showingSettings = false
+                    if self.selectedTab == 1 {
+                        self.refreshWorkspaces()
+                    }
                 } else {
                     self.state = .blocked
                     self.settingsError = response.summary
                 }
                 return
             }
-            if operation != .check {
+            if operation == .recovery, let action = retryingRecovery {
+                switch action.completion(response, exitCode: result.exitCode) {
+                case .recheck:
+                    // Leave busy before starting the new check. It clears the old
+                    // repair action and obtains fresh evidence without auto-launch.
+                    self.state = .message
+                    self.check()
+                    return
+                case .showFailure:
+                    self.state = .blocked
+                    self.checks = BrowserRecoveryAction.checksAfterRepair(response, exitCode: result.exitCode)
+                    return
+                }
+            }
+            if operation != .check && operation != .recovery {
                 self.state = response.ok && result.exitCode == 0 ? .message : .blocked
                 if operation == .guardStatus && self.state == .blocked { self.guardDetail = response.summary }
                 if response.ok && result.exitCode == 0 {
                     switch operation {
-                    case .workspaceList, .workspaceUse, .snapshot, .restore:
+                    case .workspaceList, .workspaceUse, .workspaceAuth, .snapshot, .restore:
                         self.consumeWorkspaces(response)
+                        if operation == .workspaceUse {
+                            self.selectedWorkspace = self.activeWorkspace
+                            self.selectedSnapshot = ""
+                            self.guardRunning = nil
+                            self.guardDetail = "工作区已切换，请重新检查线路后启动。"
+                        }
+                        if operation == .workspaceAuth {
+                            self.showingTokenEntry = false
+                            self.credentialError = ""
+                        }
                     case .repairPlan:
                         self.consumeRepairPlan(response)
                     case .repair:
@@ -449,14 +661,13 @@ private final class ViewModel: ObservableObject {
                         self.repairPlanID = ""
                     case .guardStatus:
                         self.consumeGuard(response)
-                    case .browserLockRepair:
-                        self.summary += " 请重新检查线路后再启动；本次修复没有打开浏览器或登录账号。"
                     default: break
                     }
                 }
-                self.checks = operation == .browserLockRepair
-                    ? BrowserRecoveryAction.checksAfterRepair(response, exitCode: result.exitCode)
-                    : (response.checks ?? [])
+                if operation == .workspaceAuth && self.state == .blocked {
+                    self.credentialError = response.summary
+                }
+                self.checks = response.checks ?? []
                 return
             }
             let rows = response.checks ?? []
@@ -468,6 +679,10 @@ private final class ViewModel: ObservableObject {
                 self.state = response.launched == true ? .launched : .passed
             case .caution:
                 self.state = .caution
+            case .paused:
+                self.state = .paused
+            case .suspended:
+                self.state = .suspended
             case .blocked:
                 self.state = .blocked
                 if !uniqueIDs || rows.isEmpty {
@@ -486,12 +701,12 @@ private final class ViewModel: ObservableObject {
     }
 
     func launchWeb() {
-        perform(["launch", "web", "--json"], message: "重新检查后打开 Claude 专用浏览器…")
+        perform(["launch", "web", "--json"], message: "正在读取 Surge 模式并准备专用浏览器…")
     }
 
     func launchCode() {
         perform(["launch", "code", "--terminal", "--json"],
-                message: "重新检查后在终端启动 Claude Code…",
+                message: "正在读取 Surge 模式并准备 Claude Code…",
                 workingDirectory: projectDirectory)
     }
 
@@ -499,10 +714,47 @@ private final class ViewModel: ObservableObject {
         perform(["workspace", "list", "--json"], message: "正在读取本地工作区…", operation: .workspaceList)
     }
 
+    func requestWorkspaceSwitch() {
+        guard !busy, WorkspaceCommand.use(selectedWorkspace) != nil,
+              selectedWorkspace != activeWorkspace else { return }
+        pendingWorkspace = selectedWorkspace
+        confirmingWorkspaceSwitch = true
+    }
+
     func useWorkspace() {
-        guard ["A", "B"].contains(selectedWorkspace) else { return }
-        perform(["workspace", "use", "--name", selectedWorkspace, "--json"],
-                message: "正在切换本地工作区…", operation: .workspaceUse)
+        guard let arguments = WorkspaceCommand.use(pendingWorkspace) else { return }
+        perform(arguments, message: "正在结束当前专用会话并切换账号工作区…", operation: .workspaceUse)
+    }
+
+    func openTokenEntry() {
+        guard !busy, WorkspaceCommand.auth("store", workspace: selectedWorkspace) != nil else { return }
+        credentialWorkspace = selectedWorkspace
+        tokenDraft = ""
+        credentialError = ""
+        showingTokenEntry = true
+    }
+
+    func storeToken() {
+        guard let arguments = WorkspaceCommand.auth("store", workspace: credentialWorkspace),
+              let input = WorkspaceCommand.tokenInput(tokenDraft) else {
+            credentialError = "请输入有效的单行 Token。"
+            return
+        }
+        tokenDraft = ""
+        perform(arguments, message: "正在保存工作区 \(credentialWorkspace) 的独立钥匙串凭据…",
+                operation: .workspaceAuth, standardInput: input)
+    }
+
+    func requestOAuth() {
+        guard !busy, WorkspaceCommand.auth("oauth", workspace: selectedWorkspace) != nil else { return }
+        credentialWorkspace = selectedWorkspace
+        confirmingOAuth = true
+    }
+
+    func useOAuth() {
+        guard let arguments = WorkspaceCommand.auth("oauth", workspace: credentialWorkspace) else { return }
+        perform(arguments, message: "正在设置工作区 \(credentialWorkspace) 的独立 OAuth 登录…",
+                operation: .workspaceAuth)
     }
 
     func snapshotWorkspace() {
@@ -538,23 +790,32 @@ private final class ViewModel: ObservableObject {
     }
 
     func repairBrowserLocks() {
+        recover(.repairBrowserLocks)
+    }
+
+    func recoverDedicatedBrowser() {
+        recover(.recoverDedicatedBrowser)
+    }
+
+    func recover(_ action: BrowserRecoveryAction) {
         // The workspace maintenance entry remains available after an app restart,
         // without provoking a launch error or opening any authentication page.
-        let action = BrowserRecoveryAction.repairBrowserLocks
         guard !busy, let arguments = action.arguments(workspace: settings.workspace) else { return }
         browserRecoveryAction = action
-        perform(arguments, message: "正在确认专用浏览器已退出，并备份、清理残留锁…",
-                operation: .browserLockRepair)
+        perform(arguments, message: action.progressMessage, operation: .recovery)
     }
 
     private func consumeWorkspaces(_ response: BackendResponse) {
         if let current = response.document["current_workspace"]?.string, ["A", "B"].contains(current) {
             currentWorkspace = current
         }
+        guard response.document["workspaces"] != nil else { return }
         var collected: [String: [Snapshot]] = [:]
+        var details: [String: WorkspaceSummary] = [:]
         for item in response.document["workspaces"]?.array ?? [] {
             let object = item.object
             guard let name = object["name"]?.string, ["A", "B"].contains(name) else { continue }
+            details[name] = WorkspaceSummary(item)
             var seen = Set<String>()
             collected[name] = (object["snapshots"]?.array ?? []).compactMap { value in
                 let snapshot = value.object
@@ -565,6 +826,7 @@ private final class ViewModel: ObservableObject {
             }
         }
         workspaceSnapshots = collected
+        workspaceDetails = details
         if !snapshots.contains(where: { $0.id == selectedSnapshot }) { selectedSnapshot = "" }
     }
 
@@ -587,6 +849,12 @@ private final class ViewModel: ObservableObject {
     private func consumeGuard(_ response: BackendResponse) {
         let guardInfo = response.document["guard"]?.object ?? [:]
         guardRunning = guardInfo["running"]?.bool
+        guardSuspended = guardInfo["state"]?.string == "suspended"
+            && guardRunning == false && guardInfo["protection_active"]?.bool == false
+            && guardInfo["suspended"]?.bool == true
+        let reportedSessions = guardInfo["suspended_sessions"]?.number ?? 0
+        suspendedSessions = reportedSessions.isFinite && reportedSessions >= 0
+            && reportedSessions <= 100_000 ? Int(reportedSessions) : 0
         guardInterval = guardInfo["interval"]?.number.map(Int.init)
         guardDetail = guardInfo["detail"]?.string ?? response.summary
         guardCheckedAt = Self.displayTime(guardInfo["last_checked_at"]?.string)
@@ -605,7 +873,7 @@ private final class ViewModel: ObservableObject {
             checks = []
             checkedAt = ""
             state = .idle
-            summary = "已选择项目，启动时将重新检查线路和项目设置。"
+            summary = "已选择项目，启动时将读取 Surge 模式并核验项目设置。"
         }
     }
 
@@ -621,7 +889,7 @@ private final class ViewModel: ObservableObject {
             return
         }
         var args = [
-            "configure", "--group", cleaned.group, "--policy", cleaned.policy,
+            "configure", "--expected-workspace", draft.workspace, "--group", cleaned.group, "--policy", cleaned.policy,
             "--expected-ip", cleaned.expected_ip, "--proxy-url", cleaned.proxy_url
         ]
         // Pass an empty optional path too, so clearing the field clears old configuration.
@@ -697,13 +965,13 @@ private struct ContentView: View {
                 }.padding(6)
             }
 
-            if vm.browserRecoveryAction != nil {
+            if let action = vm.browserRecoveryAction {
                 VStack(alignment: .leading, spacing: 7) {
-                    Button { vm.repairBrowserLocks() } label: {
-                        Label("检查并修复浏览器锁", systemImage: "wrench.and.screwdriver")
+                    Button { vm.recover(action) } label: {
+                        Label(action.title, systemImage: "wrench.and.screwdriver")
                     }
-                    .disabled(vm.busy)
-                    Text("仅处理已退出专用窗口的残留锁；先备份再清理，保留登录资料和个人 Chrome。若仍有进程运行，会提示你正常退出。")
+                    .disabled(vm.busy || action.arguments(workspace: vm.settings.workspace) == nil)
+                    Text(action.detail)
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -715,6 +983,9 @@ private struct ContentView: View {
                 protectionTab.tabItem { Label("保护", systemImage: "shield.lefthalf.filled") }.tag(2)
             }
             .frame(minHeight: 320, maxHeight: .infinity)
+            .onChange(of: vm.selectedTab) { tab in
+                if tab == 1 && !vm.busy { vm.refreshWorkspaces() }
+            }
 
             HStack(spacing: 10) {
                 Image(systemName: "folder").foregroundStyle(.secondary)
@@ -737,18 +1008,18 @@ private struct ContentView: View {
                     Label("启动 Claude Code", systemImage: "terminal")
                         .frame(maxWidth: .infinity)
                 }
-                .help("在所选项目中启动 Claude Code；登录授权会检查线路后自动进入专用授权窗口。")
+                .help("在所选项目中启动 Claude Code，OAuth 使用专用授权窗口。规则模式检查线路；全局代理模式挂起固定出口保护。")
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .disabled(vm.busy || !vm.settings.isComplete)
 
             Text(vm.settings.browser_path.isEmpty
-                 ? "每次启动都会重新检查。工作区分别保存本地 CLI 与浏览器数据，不代表身份隔离；启动检查和进程保护不能替代网络防火墙。"
-                 : "可从这里启动 Claude；安装终端接管后，Ghostty / Orca 中的 claude 也会先检查线路。专用入口只走指定节点，保护需要 Surge 规则模式和增强模式保持开启。个人 Chrome 不受此隔离规则影响。")
+                 ? "启动时读取 Surge 模式。规则模式检查线路；全局代理模式挂起保护，允许启动。工作区分别保存本地 CLI 与浏览器数据，不代表身份隔离。"
+                 : "规则模式按指定出口保护；全局代理模式允许网页和 Claude Code 启动，固定出口与断线阻断挂起，流量依 Surge 全局策略。已登记的文件隔离仍保留，个人 Chrome 不变。")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("Claude Code 登录授权会自动打开专用授权窗口，先检查线路；仅本次登录的本机回调端口可绕过代理。")
+            Text("OAuth 使用专用授权窗口。规则模式授权前检查线路；全局代理模式沿用挂起状态。切回规则模式后需重新检查，才能恢复保护。")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -760,11 +1031,26 @@ private struct ContentView: View {
         .sheet(isPresented: $vm.showingRepair) {
             RepairPlanView(vm: vm)
         }
+        .sheet(isPresented: $vm.showingTokenEntry) {
+            WorkspaceTokenView(vm: vm)
+        }
+        .alert("切换到工作区 \(vm.pendingWorkspace)？", isPresented: $vm.confirmingWorkspaceSwitch) {
+            Button("取消", role: .cancel) {}
+            Button("切换并结束当前工作区会话", role: .destructive) { vm.useWorkspace() }
+        } message: {
+            Text("请先保存专用网页中的草稿和 CLI 任务。切换会结束 Surge CC 管理的当前浏览器、授权和 CLI 会话，再一起切换浏览器资料、CLI 凭据与线路设置。不会自动登录或启动任务，个人 Chrome 和其他代理服务保持不变。无法安全结束的进程会阻止切换。")
+        }
+        .alert("工作区 \(vm.credentialWorkspace) 改用 OAuth 登录？", isPresented: $vm.confirmingOAuth) {
+            Button("取消", role: .cancel) {}
+            Button("使用独立 OAuth") { vm.useOAuth() }
+        } message: {
+            Text("下次启动此工作区的 Claude Code 时使用它自己的 OAuth 登录，不再使用 Token 模式。这里只更改登录方式；不会代你登录，其他工作区不受影响。")
+        }
         .alert("保存工作区 \(vm.selectedWorkspace) 的快照？", isPresented: $vm.confirmingSnapshot) {
             Button("取消", role: .cancel) {}
             Button("保存快照") { vm.snapshotWorkspace() }
         } message: {
-            Text("快照将保存此工作区的本地 CLI 与浏览器数据。请先正常关闭该工作区的窗口和任务；当前数据会保留。")
+            Text("快照将保存此工作区的本地 CLI 与浏览器数据，不包含钥匙串 Token。请先正常关闭该工作区的窗口和任务；当前数据会保留。")
         }
         .alert("恢复工作区 \(vm.selectedWorkspace)？", isPresented: $vm.confirmingRestore) {
             Button("取消", role: .cancel) {}
@@ -791,7 +1077,10 @@ private struct ContentView: View {
                     }.frame(maxWidth: .infinity, minHeight: 180)
                 } else {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        checkSection("启动必需", subtitle: "这些检查全部通过后，才允许从本工具启动。",
+                        checkSection(vm.state == .suspended ? "保护已挂起" : "启动必需",
+                                     subtitle: vm.state == .suspended
+                                        ? "全局代理模式允许启动；下方模式状态表示固定出口与断线阻断未生效，不是线路检查通过。"
+                                        : "规则模式下这些检查全部通过后，才允许受保护启动。",
                                      rows: CheckOverview(rows: vm.checks).required)
                         checkSection("补充待确认", subtitle: "包含未实测或需注意的项目，展开可查看原因。",
                                      rows: CheckOverview(rows: vm.checks).pending)
@@ -844,19 +1133,25 @@ private struct ContentView: View {
                         Text("B").tag("B")
                     }.frame(width: 160)
                         .onChange(of: vm.selectedWorkspace) { _ in vm.selectedSnapshot = "" }
-                    Button("使用此工作区") { vm.useWorkspace() }
+                    Button(vm.selectedWorkspace == vm.activeWorkspace ? "正在使用" : "切换到此工作区…") {
+                        vm.requestWorkspaceSwitch()
+                    }.disabled(vm.selectedWorkspace == vm.activeWorkspace)
                 }
-                Text("网页和 Claude Code 将使用所选工作区各自的数据目录。切换不会登录账号，也不会改动个人 Chrome。")
+                Text("A / B 各自保存浏览器登录、Claude Code 凭据和线路设置。上方选择只预览；确认切换后，网页、OAuth 和新启动的 CLI 一起使用目标工作区。")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("系统钥匙串和服务端账号身份不属于工作区的隔离范围。")
-                    .font(.caption).foregroundStyle(.secondary)
+                workspaceAccountDetails
                 Divider()
-                Text("当前工作区 \(vm.settings.workspace) 的浏览器锁").font(.headline)
-                Button { vm.repairBrowserLocks() } label: {
-                    Label("检查并修复浏览器锁", systemImage: "wrench.and.screwdriver")
+                Text("当前工作区 \(vm.settings.workspace) 的专用浏览器").font(.headline)
+                Button { vm.recoverDedicatedBrowser() } label: {
+                    Label(BrowserRecoveryAction.recoverDedicatedBrowser.title, systemImage: "wrench.and.screwdriver")
                 }
                 .disabled(vm.busy || !["A", "B"].contains(vm.settings.workspace))
-                Text("仅检查当前工作区：确认专用浏览器已退出后，备份并清理残留锁。保留登录资料与个人 Chrome；不会启动 Claude 或打开登录页。")
+                Text(BrowserRecoveryAction.recoverDedicatedBrowser.detail)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(BrowserRecoveryAction.repairBrowserLocks.title) { vm.repairBrowserLocks() }
+                    .disabled(vm.busy || !["A", "B"].contains(vm.settings.workspace))
+                Text("若你已经正常关闭专用窗口，也可只清理残留锁。此操作不会关闭仍在运行的浏览器。")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Divider()
@@ -877,23 +1172,75 @@ private struct ContentView: View {
                     Button("恢复所选快照…") { vm.confirmingRestore = true }
                         .disabled(vm.selectedSnapshot.isEmpty || !vm.snapshots.contains { $0.id == vm.selectedSnapshot })
                 }
-                Text("快照可能包含登录状态和私人工作资料，应只保存在你控制的设备上。")
+                Text("快照可能包含网页登录和本地 CLI 资料，不包含钥匙串 Token。请只保存在你控制的设备上；恢复快照不会切换另一个工作区的凭据。")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(16)
         }.disabled(vm.busy)
+    }
+
+    private var workspaceAccountDetails: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("工作区 \(vm.selectedWorkspace) 的账号环境").font(.headline)
+            if let detail = vm.selectedWorkspaceDetails {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("浏览器登录", systemImage: "person.crop.rectangle")
+                        .font(.callout.weight(.medium))
+                    Text(detail.browserDescription).font(.caption).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("Claude Code 凭据", systemImage: "key")
+                        .font(.callout.weight(.medium))
+                    Text(detail.authDescription).font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("保存此账号的 Token…") { vm.openTokenEntry() }
+                        Button("使用独立 OAuth…") { vm.requestOAuth() }
+                    }
+                    Text("浏览器登录与 CLI 凭据需要属于同一账号；Surge CC 不会自动复制登录或读取账号资料来匹配。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("此工作区的线路", systemImage: "network")
+                        .font(.callout.weight(.medium))
+                    if detail.routeConfigured {
+                        LabeledContent("策略组", value: detail.group)
+                        LabeledContent("节点", value: detail.policy)
+                        LabeledContent("预期出口", value: detail.expectedIP)
+                    } else {
+                        Text("尚未保存线路；首次使用时复制当前线路设置，此后独立保存。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button("编辑当前工作区线路…") { vm.openSettings() }
+                        .disabled(vm.selectedWorkspace != vm.activeWorkspace)
+                    if vm.selectedWorkspace != vm.activeWorkspace {
+                        Text("先切换到此工作区，再编辑它的线路。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text("使用相同节点时出口仍相同。全局代理模式继续按 Surge 全局策略联网。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("请刷新工作区，读取此环境的浏览器、凭据和线路状态。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var protectionTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Label(vm.guardRunning == true ? "最近收到保护心跳" : (vm.guardRunning == false ? "未收到有效保护心跳" : "保护状态未确认"),
-                          systemImage: vm.guardRunning == true ? "shield.checkered" : "shield")
+                    Label(vm.guardSuspended ? "保护已挂起"
+                          : (vm.guardRunning == true ? "最近收到保护心跳" : (vm.guardRunning == false ? "未收到有效保护心跳" : "保护状态未确认")),
+                          systemImage: vm.guardSuspended ? "pause.circle" : (vm.guardRunning == true ? "shield.checkered" : "shield"))
                         .font(.headline)
                     Spacer()
                     Button("刷新保护状态") { vm.refreshGuard() }
                 }
                 Text(vm.guardDetail).font(.callout).fixedSize(horizontal: false, vertical: true)
+                if vm.suspendedSessions > 0 {
+                    Text("挂起的会话：\(vm.suspendedSessions)。这些会话当前没有固定出口或断线阻断保护。")
+                        .font(.caption).foregroundStyle(.orange)
+                }
                 if let interval = vm.guardInterval {
                     Text("检查间隔：\(interval) 秒").font(.caption).foregroundStyle(.secondary)
                 }
@@ -974,8 +1321,8 @@ private struct SettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Claude 专用线路").font(.title2.bold())
-            Text("名称需与 Surge 完全一致。保存配置只影响 Surge CC；切换节点需在主界面单独执行。")
+            Text("工作区 \(vm.draft.workspace) · Claude 专用线路").font(.title2.bold())
+            Text("线路与环境设置保存到工作区 \(vm.draft.workspace)。Surge 配置路径和程序安装位置供整机共用。名称需与 Surge 一致；保存后需重新检查线路。")
                 .font(.callout).foregroundStyle(.secondary)
             TabView(selection: $vm.settingsPane) {
                 Form {
@@ -1042,6 +1389,39 @@ private struct SettingsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             vm.draft.profile_path = url.path
         }
+    }
+}
+
+private struct WorkspaceTokenView: View {
+    @ObservedObject var vm: ViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("工作区 \(vm.credentialWorkspace) · 保存 CLI Token").font(.title2.bold())
+            Text("粘贴属于此工作区账号的 Claude Code Token。它会保存到此工作区专属的 macOS 钥匙串项目；不会写入命令参数、配置文件或快照，也不会复制到另一个工作区。")
+                .font(.callout).foregroundStyle(.secondary)
+            SecureField("Claude Code Token", text: $vm.tokenDraft)
+                .textFieldStyle(.roundedBorder)
+                .disabled(vm.busy)
+            Text("保存凭据不会替你登录网页。请确认它与这个工作区浏览器使用的账号一致。")
+                .font(.caption).foregroundStyle(.secondary)
+            if !vm.credentialError.isEmpty {
+                Text(vm.credentialError).font(.callout).foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("取消") {
+                    vm.tokenDraft = ""
+                    vm.showingTokenEntry = false
+                }.keyboardShortcut(.cancelAction)
+                Button(vm.busy ? "保存中…" : "保存到此工作区") { vm.storeToken() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(WorkspaceCommand.tokenInput(vm.tokenDraft) == nil)
+            }.disabled(vm.busy)
+        }
+        .padding(24).frame(width: 590)
+        .interactiveDismissDisabled(vm.busy)
+        .onDisappear { vm.tokenDraft = "" }
     }
 }
 

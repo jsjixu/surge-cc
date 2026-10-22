@@ -1,4 +1,6 @@
-# Surge CC 0.2.6 接口合约
+# Surge CC 0.3.0 接口合约
+
+本文对应 **v0.3.0 / Build 13**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 终端入口
 
@@ -32,19 +34,25 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 
 `cli.oauth_checks` 执行完整检查，随后 `oauth_gate.verify_proxy_exit` 经实际专用 HTTP 入口访问固定 HTTPS 回显服务。超时、重定向、非 200、未知或不一致 IP 均失败；打开前还复核当前线路状态。只在成功后创建独立授权浏览器，打开后再次检查。
 
-授权浏览器使用 `workspace/data/OAuthBrowser` 与 `.oauth.lock`。它与普通网页资料分别存储；共享工作区锁阻止备份/恢复，授权专属锁防止并发占用。回调 bypass 是 `<-loopback>` 后追加精确 HTTP host:port，其他连接仍走原专用代理。`OAuthSession` 关闭时只停止它持有的授权浏览器，未修改系统默认浏览器、Surge 配置或其他策略组。
+网页与授权浏览器统一使用 `workspace/data/Browser`，启动参数明确指定 `--profile-directory=Default`。共享工作区锁阻止备份/恢复，共同的 `.browser.lock` 排他锁覆盖偏好准备至浏览器退出；OAuth 仍持有 `.oauth.lock`。已有窗口占用时拒绝 Chrome 进程转交，提示先关闭再重试，不改用另一资料。旧 `OAuthBrowser` 保留供备份/恢复，不再作为启动路径。回调 bypass 是 `<-loopback>` 后追加精确 HTTP host:port，其他连接仍走原专用代理。`OAuthSession` 关闭时只停止它持有的授权浏览器，未修改系统默认浏览器、Surge 配置或其他策略组。
 
 此文档对应 `src/surge_cc/` 当前实现。CLI 入口为 `scripts/surge-cc`；原生 GUI 为 `app/main.swift`，通过子进程调用后端并读取 JSON。参考上游 `yoursjeyo/claude-switcher` 提交 `74ea09e2e7db14968548a5fab7b97e96b4b1b330` 的主要功能思路，独立实现 Surge 适配，并不保证与上游所有行为一致。
 
-## 专用浏览器锁修复
+## 专用浏览器恢复与锁修复
 
-`browser-locks repair --workspace A --json` 仅接受配置中当前工作区，防止界面过期后修复错误的目标。它不运行线路检查、启动程序、结束进程或修改代理。
+`browser-locks recover --workspace A --json` 与 `browser-locks repair --workspace A --json` 仅接受配置中当前工作区，防止界面过期后操作错误的目标。两个命令都不运行线路检查、启动程序、登录或修改代理。
 
-浏览器占用类错误可返回 `recovery_action:"repair-browser-locks"`；GUI 只识别这一固定白名单动作，不执行后端提供的任意命令。非当前工作区的快照/恢复错误不提供当前工作区的修复动作。工作区页提供相同的常驻入口。
+`recover` 先持有 `.browser-recovery.lock`，读取 `Browser` 与 `OAuthBrowser` 的 Chromium 运行锁。锁里的 PID 只是候选：必须匹配当前用户、配置中的专用浏览器可执行程序、进程启动身份及精确 `--user-data-dir`，并在发送信号前复核。仅向核验通过的专用浏览器主进程请求 `SIGTERM` 正常退出，不按进程名批量关闭，不向个人 Chrome、另一个工作区、CLI、终端或监控进程发信号；退出超时不升级为强杀，也不清锁。PID 核验不是针对同用户恶意并发的操作系统安全边界。
 
-修复按 session → OAuth 顺序取得排他锁，复核专用 profile 进程、SingletonLock 的本机 PID 和 SingletonSocket 状态，再将确认过期的三个顶层符号链接归档到工作区 data 以外的私有目录。权限/路径异常、活跃或无法确认的状态均拒绝操作；不处理其他锁文件、登录资料或外部 socket 目标。
+窗口退出后等待原持有者释放 session/OAuth 锁，再复用离线 `repair`。若受控 CLI、授权或备份操作仍占用工作区，会拒绝清理并要求用户正常结束该操作，不会强制终止 CLI。
 
-成功返回 `recovery:{status,workspace,removed_count,backup_path,message}`，其中 `status` 为 `repaired` 或 `no_stale_locks`。归档路径是本地私密信息，公开分享前需脱敏。操作成功只表示锁处理完成，`checks:[]`，不代表线路或保护已经通过检查。
+`repair` 本身不结束任何进程，仍可离线独立调用。它按 session → OAuth 顺序取得排他锁，复核专用 profile 进程、SingletonLock 的本机 PID 和 SingletonSocket 状态，再将确认过期的三个顶层符号链接归档到工作区 data 以外的私有目录。权限/路径异常、活跃或无法确认的状态均拒绝操作；不处理登录资料、其他锁文件或外部 socket 目标。
+
+浏览器占用类错误返回 `recovery_action:"recover-browser"`；`recover` 的拒绝结果保留该动作供重试，传统 `repair` 的拒绝结果可返回 `recovery_action:"repair-browser-locks"`。GUI 只识别这两个固定白名单动作，不执行任意后端命令，也不从摘要猜测动作。非当前工作区的快照/恢复错误不提供当前工作区动作。工作区页常驻提供恢复按钮及次要的仅清锁按钮，目标为已应用的当前工作区，而非尚未生效的选择器值。
+
+成功返回 `recovery:{status,workspace,removed_count,backup_path,message}`。离线 `repair` 的 `status` 为 `repaired` 或 `no_stale_locks`；`recover` 还附 `stopped_profiles`，实际关闭窗口时状态为 `recovered`。归档路径是本地私密信息，公开分享前需脱敏。操作成功只表示恢复完成，`checks:[]`，不代表线路或保护已经通过。
+
+GUI 调用任一命令成功后清除旧错误并自动执行新的 `check`；仅消费新检查的线路结论，不自动启动网页、CLI 或登录。失败显示具体原因并保留重试，执行期间禁用操作按钮，新检查清除上次恢复动作。CLI 使用者需自行运行 `check`。
 
 ## 设置
 
@@ -74,7 +82,9 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 | `guard_interval` | 整数，默认 `10`，范围 `2–60` 秒 |
 | `workspace` | 默认 `A`；1–32 位字母、数字、下划线或连字符，GUI 仅提供 A/B |
 
-不将时区、语言、GeoIP 或 ASN 解释为身份或实际居住地证明。浏览器已有扩展、系统钥匙串与服务端关联不在工作区隔离范围。
+线路与预期环境字段按工作区保存在 `workspaces/<name>/settings.json`：`group`、`policy`、`expected_ip`、`proxy_url`、`hosts`、`expected_timezone`、`expected_locale`、`expected_country`、`expected_asn`、`browser_language`、`privacy_strict`、`guard_interval`。`profile_path`、`browser_path`、`cli_process_paths` 是共享机器配置，切换账号不复制应用或新增系统代理。根目录 `config.json` 是当前账号的有效运行配置。
+
+不将时区、语言、GeoIP 或 ASN 解释为身份或实际居住地证明。浏览器已有扩展和服务端关联不在本地工作区分离的保证范围；认证采用下面限定的每工作区存储，并非创建独立系统钥匙串。
 
 ## 公共 CLI
 
@@ -82,17 +92,21 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 
 | 命令 | 行为与副作用 |
 | --- | --- |
-| `configure --group NAME --policy NAME --expected-ip IP --proxy-url URL [--profile PATH]` | 校验后保存本工具设置，不改 Surge；另接受上述预期环境参数、`--browser-path PATH`、`--privacy-strict true\|false` 和 `--guard-interval N`。未提供的扩展参数保留原值，`--profile` 未提供则置空 |
+| `configure --group NAME --policy NAME --expected-ip IP --proxy-url URL [--profile PATH] [--expected-workspace NAME]` | 校验后保存当前工作区及共享机器设置，不改 Surge；GUI 带工作区预期值，过期则拒绝。另接受预期环境参数、`--browser-path PATH`、`--privacy-strict true\|false` 和 `--guard-interval N`；未提供的扩展参数保留原值，`--profile` 未提供则置空 |
 | `check` / `status` / `checkdetail` | 三者都执行完整即时检查；基础线路通过后启动临时检测 Chrome，完成后结束它，不打开 Claude 登录页 |
 | `pin` | 仅在现有单节点手动组中选择配置的节点，再执行完整检查；不改 Surge 配置文本 |
-| `workspace list` | 返回 A、B、当前及已存在工作区和快照列表；可创建本工具的工作区根目录，不启动应用 |
+| `workspace list` | 返回 A、B、当前及已存在工作区、线路、浏览器资料是否存在、认证模式与快照列表；可建立私有根目录及首次旧引用迁移，不读取 Token，不启动应用 |
 | `workspace create --name NAME [--label TEXT]` | 初始化指定工作区的本地数据目录 |
-| `workspace use --name NAME` | 初始化工作区并保存当前选择；不迁移已运行会话或登录账号 |
+| `workspace use --name NAME [--close-sessions]` | 独占账号启动门，初始化并保存目标账号；提供 `--close-sessions` 时先通知当前与目标新版受控会话退出。应用目标专用线路后才提交选择；不自动登录或重新启动任务。没有该参数时活动会话仍阻止切换 |
+| `workspace-auth status --workspace NAME` | 返回模式与配置是否存在；不读取 Token，不证明已登录 |
+| `workspace-auth store --workspace NAME --stdin` | 在账号变更锁及工作区独占锁内，从标准输入读取 Token 并写入该账号钥匙串项；不接受 Token 参数 |
+| `workspace-auth oauth --workspace NAME` | 选择该工作区 OAuth 模式；不发起授权、不删除旧钥匙串值 |
 | `workspace snapshot [--name NAME] [--label TEXT]` | 默认当前工作区；要求独占锁且无 Chrome 运行锁，复制数据并核对清单与 SHA-256 |
 | `workspace restore [--name NAME] --snapshot ID` | 校验归属及完整性，先保存恢复前快照，再替换数据；保留替换前目录；GUI 有确认，CLI 命令本身表示执行 |
 | `repair-plan` | 只读观察 Surge 当前状态，返回公开动作和 `plan_id`，不写配置、不重载 |
 | `repair --plan-id ID` | 核对原计划仍匹配后执行；配置改写先备份与语法验证，失败时尝试回滚可确认的本次改动 |
 | `browser-locks repair --workspace NAME` | 离线检查当前工作区的专用浏览器运行锁，仅归档可确认过期的锁链接；不结束进程或执行线路检查 |
+| `browser-locks recover --workspace NAME` | 请求经过核验的当前专用窗口正常退出，再归档过期锁；不强杀 CLI，不执行线路检查或启动 |
 | `launch web` | 完整检查后启动所选工作区的独立 Chrome 和专属监控进程；不复用个人 Chrome |
 | `launch code --terminal` | 完整检查后打开私有 `.command`；终端内再次执行完整检查，然后启动受监控 CLI |
 | `launch code -- CLAUDE_ARGS...` | 在当前项目目录同步运行受监控 Claude Code；显式代理与工作区 `CLAUDE_CONFIG_DIR`；不对参数做 shell 求值 |
@@ -105,7 +119,7 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 
 网页入口不接受额外参数。CLI 额外参数必须放在 `--` 后。`--settings VALUE` / `--settings=VALUE` 只接受通过 `launch_settings_safe` 的内联 JSON，不接受文件路径，避免检查后文件变化；`--setting-sources` 的两种形式只接受 `user`、`project`、`local` 的非空、无重复组合。内联及磁盘 settings 均拒绝覆盖 `BROWSER`、`CLAUDE_CONFIG_DIR`，不允许解除更新禁用、设置非专用代理或非空绕过列表，也拒绝其他模型服务与远端启动冲突。Orca 命令发现使用的 `{"disableAllHooks":true}` 可以通过语义检查。启动前仍检查工作区、项目祖先目录与文件形式的托管 settings；检查不会运行其中的 hooks。
 
-`remoteControlAtStartup` 的用户/项目原设置保持不变；受保护启动只在该子进程的内联 settings 中合并 `remoteControlAtStartup:false`。显式 CLI 远端入口、内联 settings 要求开启，或企业托管 settings 强制开启时仍拒绝，不能通过覆盖用户文件绕过托管策略。
+`remoteControlAtStartup` 的用户/项目原设置保持不变；受保护启动只在该子进程的内联 settings 中合并 `remoteControlAtStartup:false`。CLI 同时设置 `forceLoginMethod:claudeai`，只支持订阅 OAuth / setup-token，阻止项目或参数改用 Console 和其他认证来源。显式 CLI 远端入口、内联 settings 要求开启，或企业托管 settings 强制开启时仍拒绝，不能通过覆盖用户文件绕过托管策略。
 
 CLI 成功返回 `0`；阻止启动、已捕获的 `Blocked` 返回 `2`；已捕获的系统操作错误返回 `1`。参数解析错误也可返回 `2`。普通报告模式将受监控 CLI 的非零结束映射为 `2`，实际退出码保留在 `child_exit_code`。终端使用的 `--passthrough` 模式会直接转发已启动子进程的退出码；信号退出转换为 `128 + 信号编号`。内部 `surge_cc.guard` 进程另返回其监控会话退出码，不是公共 GUI 控制 API。
 
@@ -141,6 +155,12 @@ CLI 成功返回 `0`；阻止启动、已捕获的 `Blocked` 返回 `2`；已捕
 GUI 每行默认显示短摘要，长说明和可选证据折叠在「查看完整说明」或「查看依据与范围」中。按必需行、补充待确认行（非必需且非 `pass`/`info`）、补充信息行分组。`unknown` 统一显示「未确认」：既可能未完成检测，也可能已有观测但无法得出结论。非必需的 `dns_egress:info` 显示「已实测」，其余 `info` 显示「信息」。顶部显示必需项通过数量与补充待确认数量，不重复响应摘要。
 
 `core.result` 的检查通过条件：检查非空、ID 不重复、包含全部基础检查 ID（`surge`、`mode`、`group`、`definition`、`route`、`proxy`、`exit`、`stable`），且所有必需行均为 `pass`。非必需的 `unknown`/`warn`/`fail` 会使摘要提示仍有待确认项目。保存、工作区、修复及读取保护状态属于操作回执，可返回 `ok:true` 与空 `checks`；这只表示该操作完成，不是线路检查通过。GUI 不应将这类操作回执转为绿色启动状态。
+
+v0.3.0 在已确认 `Surge.mode=proxy`（全局代理）时返回挂起报告：`ok:false`、必需 `mode` 行 `status:"fail"`，并包含 `paused:true`、`pause_reason:"surge-global-mode"`、`surge_mode:"proxy"`、`launch_allowed:true`、`protection_active:false`。`check` 仍退出 `2`，不执行后续浏览器/DNS 探针；但 `launch` 可按明确的全局代理分支启动。成功的 GUI 网页/Terminal 启动回执保持这些挂起字段，改为 `ok:true`、`launched:true`、`target:"web"` 或 `"code-terminal"`，退出 `0`。同步 CLI 非零结束不得当作启动成功或检查通过。全局模式流量依 Surge 全局策略，固定出口与断线阻断暂停，工作区与已登记文件隔离保留。
+
+GUI 只有在全部全局挂起字段类型和值一致、检查行非空且 ID 唯一、状态有效、必需 `surge:pass` 和 `mode:fail` 存在且其他必需项全部通过时识别「保护已挂起」。检查回执须为 `ok:false` / 退出 `2` / 未启动；成功启动须为 `ok:true` / 退出 `0` / `launched:true` / 已知 GUI 目标。缺字段、未知原因、直连冒用全局标记、矛盾退出码或其他必需失败均按阻止处理，不能变为绿色检查通过。
+
+`direct`（直连）保留 `paused:true`、`pause_reason:"surge-mode"`、`surge_mode:"direct"` 的阻止启动报告；未知或不可读取模式是一般失败。切回规则模式后重新检查恢复保护；没有自动切换 Surge 模式的命令。
 
 默认严格模式让 DNS 接管、浏览器 ICE 等无法确认项阻止启动。已观察到预期出口之外的公网 ICE 地址始终是必需 `fail`，关闭严格模式也不放行。浏览器有显式语言或时区预期时，其回执行始终必需；缺失为 `unknown`，不一致为 `warn`。系统环境和 GeoIP/ASN 的显式预期同样产生必需比较。
 
@@ -184,12 +204,12 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 ## 命令附加字段
 
 - `launch` 可带 `launched:true`、`target:web|code-terminal|code`；直接 CLI 会话还返回 `child_exit_code`。Terminal 的 `launched:true` 仅表示终端启动器已打开，不确认内部 Claude 已通过后续复核。
-- 工作区响应包含 `current_workspace` 和 `workspaces` 数组，每项为 `name`、`label`、`snapshots`；快照项为 `id`、`label`、`created_at`。
+- 工作区响应包含 `current_workspace` 和 `workspaces` 数组，每项含 `name`、`label`、`snapshots`、`route`、`route_configured`、`auth:{workspace,mode,configured,legacy_reference}`、`browser:{has_profile}`；快照项为 `id`、`label`、`created_at`。新工作区未使用时 `route` 可为 `null`。认证模式 `oauth` 的 `configured:true` 只代表显式方式记录存在，`browser.has_profile` 只代表目录存在，两者均不证明已登录。成功回执中的 `settings` 是当前有效配置；GUI 不把目标缺失设置替换为旧账号配置。
 - 保存快照另带 `snapshot:{id,name,label,created_at}`；恢复另带 `restored` 和自动备份快照 ID `backup`。
 - 修复预览返回 `plan_id` 和 `actions:[{id,title,detail}]`。`plan_id` 绑定配置、源文件、生效配置、模式、组状态和动作；执行前重算，变化则拒绝。公开回执不含完整配置文本。
 - `browser_path` 非空时，修复计划额外绑定增强模式状态；`scope` 动作恢复独立监听及置顶范围规则，`enhanced-required` 表示增强模式前提不满足，应用在任何写入前拒绝执行，不自动切换该全局开关。
 - 修复执行返回 `actions`、`backup_created`；操作完成不意味着完整线路检查通过，需重新 `check`。
-- `guard-status` 返回 `guard:{running,interval,last_checked_at,detail}` 和按时间倒序的 `guards`。这里的 `running` 是“收到近期有效运行回执”的兼容字段，**不是已验证的当前进程存活状态**。
+- `guard-status` 返回 `guard` 汇总和按时间倒序的 `guards`。`guard` 含 `running`、`interval`、`last_checked_at`、`detail`；挂起汇总包含 `state:"suspended"`、`running:false`、`protection_active:false`、`suspended:true` 和 `suspended_sessions`。保护与挂起会话混合时分别说明，不能将挂起会话显示成受保护。`running` 是“收到近期有效运行回执”的兼容字段，**不是已验证的当前进程存活状态**。
 - `terminal install` / `status` / `uninstall` 的操作回执含 `terminal:{ok,installed,summary}`；安装有效时还带本机 `command_path` 与 `original_path`，公开分享前需脱敏。`installed:true` 与 `ok:false` 表示存在但无法验证的集成，不表示可安全启动。
 
 ## 运行监控合约
@@ -200,17 +220,27 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 默认巡检目标间隔为 `guard_interval=10` 秒；出口复查为 `max(30, guard_interval)` 秒。每次检查完成后再计算下一轮，检测耗时会增加实际间隔。检查错误或未知异常触发清理；停止先 TERM，必要时核对仍属于自身后 KILL。清理失败使用 `stop_failed`，不会报告已确认停止。
 
-私有状态/回执字段：`schema`、`target`、`state`、`ok`、`checked_at`、`detail`，不存 PID、CLI 参数或配置明文。可能状态为 `starting`、`running`、`exited`、`blocked`、`stopped`、`stop_failed`。首次 `running` 回执确认启动；后续状态文件记录监控进展。`guard-status` 仅在 `state=running` 且时间差处于 `0..max(90, guard_interval*3)` 秒时视为近期回执，负时间差或过期不计入。
+运行期间，监控在轮询识别到全局代理模式后挂起固定出口与断线阻断，允许已持有会话继续运行，并记录 `suspended` 状态。切回规则模式后，监控在轮询识别到变化后重新核验保护前提，通过后恢复运行保护，失败则停止对应受控程序；直连和未知模式仍触发停止。模式切换与监控响应之间存在轮询延迟，不是切换瞬间的原子防火墙操作。挂起不修改 Surge 模式、策略或个人 Chrome，也不移除已登记文件隔离。
+
+私有状态/回执字段：`schema`、`target`、`state`、`ok`、`checked_at`、`detail`，不存 PID、CLI 参数或配置明文。可能状态为 `starting`、`running`、`suspended`、`exited`、`blocked`、`stopped`、`stop_failed`。首次有效 `running` 或 `suspended` 回执确认对应模式下的启动；`suspended` 不能作为保护已生效的证据。后续状态文件记录监控进展。`guard-status` 仅在 `state=running` 且时间差处于 `0..max(90, guard_interval*3)` 秒时视为近期回执，负时间差或过期不计入。
 
 网页使用独立监控进程，GUI 退出不自动停止它。CLI 监控在终端前台生命周期内同步执行。SIGINT/窗口大小变化可转发给子进程，正常停止会清理自有子进程；外部强杀、崩溃、系统问题或子进程脱离不构成可保证的即时网络阻断。
 
 ## 工作区、修复与安全边界
 
-工作区是本工具拥有的目录分离：`workspaces/<name>/data/Browser`、`data/OAuthBrowser` 与 `data/Claude`，不是独立系统用户、设备身份或钥匙串。快照只复制工作区 data 并校验清单，不复制工作区外项目。快照和恢复要求独占锁；活动会话持共享锁。恢复前自动备份，并保留 `previous-*` 数据。数据可能包含登录状态，必须私下保存。
+工作区分别保存 `workspaces/<name>/data/Browser`、`data/Claude` 和 `data/Auth`，旧版 `data/OAuthBrowser` 原样保留。浏览器继续使用已有 `Browser/Default`，不复制 Cookie。OAuth 的原生安全存储路径由 `auth_directory` 确定：新账号使用本账号 `data/Auth`，迁移保留的旧非 Token 账号可使用 `data/Claude`。同一工作区的普通与隔离 CLI 共用此逻辑范围，其他账号不回退到它；原生钥匙串与沙箱内文件回退不会自动同步，可能需要分别授权。每工作区的 `keychain-auth.json` 保存在 `data` 外，只记录模式和钥匙串引用；新 Token 服务为 `surge-cc.workspace-oauth-token`，账号键从配置目录与工作区派生。具体安全输入与失败边界见 [TOKEN-AUTH.md](TOKEN-AUTH.md)。
 
-`launch code` 保留 `Path.cwd()`。对没有启用下述登记文件沙箱的普通项目，独立 `CLAUDE_CONFIG_DIR` 不限制 CLI 可读取的文件，不过滤 `CLAUDE.md`、项目 `.claude`、Git 历史、恢复会话或工具输出。`--resume`、`--continue` 等参数没有被统一禁止。普通项目的 `proxy_env` 先复制调用方环境，再覆盖代理变量并清空代理绕过列表；启动分支覆盖 `CLAUDE_CONFIG_DIR`、`BROWSER` 与更新变量，不是环境白名单，也不删除所有认证凭据。调用方显式指定另一 `CLAUDE_CONFIG_DIR` 时拒绝启动，而不是静默合并。`code_settings_ok` 检查已知冲突设置，不是项目内容审计或文件沙箱。
+`migrate_accounts` 在旧全局 Token 引用上记录一次归属：只绑定迁移时当前工作区，保留旧条目，不读取 Token、不复制登录资料。新工作区第一次使用仅将当前线路值复制为独立设置；B 不继承 A 的浏览器或凭据。首次迁移时未启用旧 Token 的原工作区会记录 `native_storage="Claude"`，保留旧 `data/Claude` 及其原生钥匙串命名空间；启用旧 Token 或已有迁移记录未包含该字段时使用 `data/Auth`。无关的全机或项目共享 OAuth 存储不复制、不删除。已有 Token 继续由启动器注入普通及隔离 CLI。
 
-`workspaces.prepare_browser_language` 保留旧函数名，实际在自有工作区未运行时总是更新上述 WebRTC 偏好并清空 URL 覆盖，保留其他字段。仅显式浏览器语言非空时才同时更新 `intl.accept_languages` 与 `intl.selected_languages`；空语言不改原语言值。`prepare_oauth_browser` 对独立 OAuth 资料使用同一个偏好准备函数。两类窗口仍使用不同的资料目录，不互相复制 Cookie、localStorage 或登录信息；本工具不修改或同步网站自己的语言设置。检测进程使用新的临时空白资料和同样的 WebRTC、显式语言设置，没有复制已有工作区的扩展、策略或其他偏好，回执不能声称完全代表已保存浏览器。
+切换持有账号独占启动锁。新启动持有账号共享锁直到 CLI 监控已接管子进程（先 `oauth.set_child` 后释放启动锁）或网页监控已返回有效回执，防止在账号选择与实际启动之间切换。`--close-sessions` 写入私有停止代次，监控轮询时仅结束自己创建的程序；切换器不从回执 PID 批量杀进程。等旧及目标工作区 session 锁均可独占、确认浏览器锁无活动持有者后，才准备目标线路与账号提交。旧监控不响应、归属不明或锁未释放时拒绝切换。停止不保存网页草稿或恢复 CLI 任务，GUI 会先确认；失败时已退出的程序不自动重启。
+
+线路变化经 `workspace_routes.activate` 处理本地配置的专用入口、对应组与 Claude 域名规则，保留其他节点及无关配置。先备份与语法校验，再重载、选中目标节点并核验；失败尝试撤回可确认的本次改动。观察到外部并发更改时不强行覆盖。全局模式维持 `proxy` 状态，固定出口保护仍挂起；直连/未知状态不切换。Surge 配置路径或模式在过程中变化会阻止提交。相同线路不用重载；重载可能使其他既有连接短暂重连。
+
+快照只复制工作区 `data` 并校验清单，不包括根目录认证引用、线路设置、系统钥匙串 Token 或工作区外项目。原生 OAuth 在所选认证目录的明文回退文件（`data/Auth/.credentials.json` 或迁移保留的 `data/Claude/.credentials.json`）和浏览器登录资料可能包含在快照中，须私下保存。恢复不覆盖钥匙串引用，也不会切换另一账号；OAuth 在钥匙串中的原生值不会随文件快照恢复。快照和恢复要求工作区独占锁，恢复前自动备份并保留 `previous-*`。这些是本地账号数据分离，不是独立系统用户、设备身份或服务端不关联保证。
+
+`launch code` 保留 `Path.cwd()`。对没有启用下述登记文件沙箱的普通项目，独立 `CLAUDE_CONFIG_DIR` 不限制 CLI 可读取的文件，不过滤 `CLAUDE.md`、项目 `.claude`、Git 历史、恢复会话或工具输出。`--resume`、`--continue` 等参数没有被统一禁止。普通项目先过滤已知的认证覆盖变量，再设置固定代理并清空绕过列表；启动分支以当前工作区覆盖继承的 `CLAUDE_CONFIG_DIR`、`CLAUDE_SECURESTORAGE_CONFIG_DIR`、`BROWSER` 与更新变量，原父进程环境保持不变。Orca 继承的旧账号目录不能选择子进程账号；内联和项目 settings 若试图覆盖这些受保护字段仍拒绝。其余环境不是完整白名单，也不构成文件内容过滤。`code_settings_ok` 检查已知冲突设置，不是项目内容审计或文件沙箱。
+
+`workspaces.prepare_browser_language` 保留旧函数名，实际在共用浏览器租约内、专用浏览器未运行时更新上述 WebRTC 偏好并清空 URL 覆盖，保留其他字段。仅显式浏览器语言非空时才同时更新 `intl.accept_languages` 与 `intl.selected_languages`；空语言不改原语言值。兼容函数 `prepare_oauth_browser` 对同一份 `Browser/Default` 使用相同的偏好准备函数；真实授权和网页运行使用 `browser_session`，在进程整个生命周期持有租约。两类窗口复用同一份持久化资料，不复制 Cookie、localStorage 或登录信息；本工具不修改网站自己的语言设置。检测进程使用新的临时空白资料和同样的 WebRTC、显式语言设置，没有复制已有工作区的扩展、策略或其他偏好，回执不能声称完全代表已保存浏览器。
 
 修复只针对当前明确路径下的普通本地 Surge 配置，拒绝托管配置。修改前私有备份并语法校验，执行前重核计划；失败尝试回滚，不覆盖观察到的并发修改。修复可能重载 Surge、改变规则模式或指定组选择，不能描述为只读动作。系统时区、地区、IPv6 和其他无关系统设置不由修复工具自动改动。
 
@@ -256,6 +286,26 @@ v0.2.5 的 `isolation` 模块是可选的高级功能。只有 `launch code` 的
 
 工作树 HOME 位于 `root/.runtime/<id>/worktrees/<路径摘要>/home`，由启动器在核验后创建；它不会复制主项目 HOME、旧会话或凭据。每次启动在路径发现和生成沙箱策略前分别复核关联。主项目工作文件和其他工作树 HOME 不因此开放。
 
+### 默认目录信任
+
+默认不为新隔离 HOME 继承其他目录的信任。明确授权后，可在隔离根目录的 `.runtime/trust.json` 创建私有配置：
+
+```json
+{
+  "schema": 1,
+  "enabled": true,
+  "projects": [
+    {"id": "demo", "path": "/Users/example/Documents/Codex/Claude-Isolated/projects/demo"}
+  ]
+}
+```
+
+配置必须为当前用户拥有的普通单链接文件、权限 `600`；路径须规范化且不得经过符号链接。项目 ID 和主项目路径均精确匹配，不接受目录通配符。此文件位于子进程 HOME 外；普通目录启动不会读取它。缺失或 `{"schema":1,"enabled":false}` 表示关闭；配置损坏或权限异常会阻止隔离启动。
+
+启动器在再次核对 Git 双向关联后，仅在当前 HOME 的 `.claude/.claude.json` 中补入 `projects[主项目绝对路径].hasTrustDialogAccepted=true`。Claude Code 2.1.296 对关联工作树使用主仓库路径作为信任键。已有的 `true`、明确的 `false` 及其他字段保持不变；不复制其他 HOME 的账号、凭据、项目条目、会话或日志。信任提示与工具权限、文件沙箱和线路保护独立，此功能不扩大任何文件或网络授权。
+
+将配置设为关闭或移除项目条目，会停止之后的自动信任；已经写入当前 HOME 的信任标记会保留。若要撤销已经建立的信任，应在退出对应 Claude 会话后，将该 HOME 中对应项目的 `hasTrustDialogAccepted` 设为 `false`，启动器不会覆盖该明确选择。
+
 ### 实际限制与诊断
 
 原生 Claude 及其子进程通过 `/usr/bin/sandbox-exec` 进入 macOS Seatbelt，可信启动器、线路监控及 OAuth 代理留在沙箱外。沙箱允许当前项目和独立 HOME 读写，以及指定系统工具和必要资源读取；拒绝文件硬链接。关联工作树仅允许共享 Git 对象、引用及少量元数据读取，允许本工作树 `index` / `index.lock` 写入。代码编辑、`git status`、`git diff`、查看历史在支持范围内；提交、推送及修改共享配置须在 Orca 或普通终端中完成，后者不受该沙箱约束。已允许读取的共享 Git 对象可能包含整个仓库历史，不是内容脱敏。
@@ -266,4 +316,4 @@ v0.2.5 的 `isolation` 模块是可选的高级功能。只有 `launch code` 的
 
 在已登记目录可执行 `claude --surge-cc-isolation-check`（需已安装终端接管），或从该目录调用后端 `launch code --passthrough -- --surge-cc-isolation-check`。它先做基础线路检查，再用临时文件、Git 只读命令、原生 CLI `--help` 和网络边界探针返回诊断 JSON；不登录或向模型发送提示词。路径、项目名称及出口等回执信息分享前需脱敏。
 
-常规报告模式的隔离 CLI 会话可带 `file_isolation:{project,root,home,backend,linked_worktree}`；这些字段描述启动方式，不是持续文件审计。文件隔离目录不在 A/B `data` 快照中，需另外备份；已有浏览器与 OAuth 资料目录仍按所选 A/B 工作区管理，不随项目 HOME 复制。
+常规报告模式的隔离 CLI 会话可带 `file_isolation:{project,root,home,backend,linked_worktree}`；这些字段描述启动方式，不是持续文件审计。文件隔离目录不在 A/B `data` 快照中，需另外备份。绑定迁移时原账号的项目 HOME 原位保留；其他账号使用该项目/工作树的独立 HOME，源码保留。账号的 OAuth 存储经 `auth_directory` 选择本账号 `data/Auth` 或迁移保留的 `data/Claude`，不再跨账号共用旧项目全局认证。普通 CLI 的原生钥匙串与隔离 CLI 的文件回退可能需要分别授权；工作区 Token 模式统一注入。浏览器仍按所选工作区管理，不随项目 HOME 复制。

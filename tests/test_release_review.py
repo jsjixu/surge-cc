@@ -282,11 +282,11 @@ class BrowserLanguageReleaseReviewTests(unittest.TestCase):
         self.assertTrue(prefs.is_symlink())
         self.assertEqual(outside.read_text(), '{"fixture":"unchanged"}')
 
-    def test_running_workspace_prevents_preference_edit(self):
+    def test_running_browser_lease_prevents_preference_edit(self):
         loc, prefs = self.preferences()
         prefs.write_text('{"fixture":"unchanged"}')
-        with loc["lock"].open("a") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        with (loc["root"] / ".browser.lock").open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             with self.assertRaises(Blocked):
                 ws.prepare_browser_language(self.settings_path, self.settings)
         self.assertEqual(prefs.read_text(), '{"fixture":"unchanged"}')

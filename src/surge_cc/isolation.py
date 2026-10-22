@@ -5,7 +5,7 @@ Claude process and its descendants enter it. This is not a machine-wide policy.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import fcntl
@@ -56,6 +56,9 @@ class Project:
     root: Path
     home: Path
     worktree: LinkedWorktree | None = None
+    workspace: str | None = None
+    workspace_config: Path | None = None
+    original_home: Path | None = None
 
     @property
     def config(self) -> Path:
@@ -68,6 +71,45 @@ class Project:
     @property
     def base(self) -> Path:
         return self.registered_root.parent.parent
+
+
+def bind_workspace(project: Project, config_path: Path, workspace: str) -> Project:
+    """Bind project auth to the active account without moving legacy A data.
+
+    Existing project HOME remains with the recorded pre-migration workspace.
+    Other accounts get fresh per-project/per-worktree HOME and session data.
+    The original project source files are shared deliberately.
+    """
+    from . import keychain_auth
+    try:
+        workspace = keychain_auth._workspace(workspace)
+        config_path = Path(config_path).absolute()
+        keychain_auth._config_root(config_path)
+        owner = keychain_auth.legacy_workspace(config_path)
+        if owner is None:
+            raise ValueError("account migration must precede launch")
+        original = project.original_home or project.home
+        if project.workspace is not None and (project.workspace != workspace or project.workspace_config != config_path):
+            raise ValueError("project already bound to a different account")
+        home = original if workspace == owner else original.parent / "accounts" / workspace / "home"
+        _validate_runtime(home, project.base, create=False)
+        return replace(project, home=home, workspace=workspace,
+                       workspace_config=config_path, original_home=original)
+    except (OSError, ValueError, TypeError):
+        raise Blocked("隔离项目的工作区身份无法验证，已阻止启动；不会使用其他账号目录。") from None
+
+
+def _expected_home(project: Project, original: Path) -> Path:
+    if project.workspace is None:
+        return original
+    from . import keychain_auth
+    keychain_auth._workspace(project.workspace)
+    if project.workspace_config is None or project.original_home != original:
+        raise ValueError("invalid bound project metadata")
+    owner = keychain_auth.legacy_workspace(project.workspace_config)
+    if owner is None:
+        raise ValueError("missing account migration owner")
+    return original if project.workspace == owner else original.parent / "accounts" / project.workspace / "home"
 
 
 def _safe_file(path: Path, *, private: bool = False, limit: int = 16384) -> str:
@@ -298,7 +340,7 @@ def for_cwd(config_path: Path, cwd: Path) -> Project | None:
         raise Blocked("文件隔离注册信息无效，已阻止启动；不会退回普通启动。") from None
 
 
-def environment(project: Project, proxy: str, inherited: dict | None = None) -> dict:
+def environment(project: Project, proxy: str, inherited: dict | None = None, *, token_auth: bool = False) -> dict:
     if proxy != "http://127.0.0.1:62919":
         raise Blocked("当前文件沙箱只允许专用代理 127.0.0.1:62919；代理设置不匹配，未启动。")
     inherited = os.environ if inherited is None else inherited
@@ -320,6 +362,16 @@ def environment(project: Project, proxy: str, inherited: dict | None = None) -> 
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_ATTR_NOSYSTEM": "1",
     })
+    from . import isolated_auth
+    shared_auth = None if token_auth else isolated_auth.prepare(project)
+    if token_auth:
+        # The environment token is the sole credential. This path is denied in
+        # the child policy, so an expired token cannot fall back to disk login.
+        base["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(project.home / ".token-auth-disabled")
+    elif shared_auth is not None:
+        # Share only native secure storage, never the HOME/config/session tree.
+        # The inherited environment cannot choose a different credential store.
+        base["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(shared_auth)
     # /usr/bin/git is an xcode-select shim. Use only these already-readable
     # developer installations, avoiding access to global selection/GUI services.
     for developer in (Path("/Library/Developer/CommandLineTools"),
@@ -331,14 +383,20 @@ def environment(project: Project, proxy: str, inherited: dict | None = None) -> 
     return proxy_env(proxy, base=base)
 
 
-def arguments(values: list[str]) -> list[str]:
+def arguments(values: list[str], *, theme: str | None = None) -> list[str]:
     # Custom integrations may read outside the copy using an unsandboxed host.
     # Re-enable integrations only after a separate boundary review.
     forbidden = {"--settings", "--setting-sources", "--mcp-config", "--plugin-dir",
                  "--plugin-url", "--chrome", "--ide", "--add-dir", "--worktree", "-w"}
     if any(v.split("=", 1)[0] in forbidden for v in values):
         raise Blocked("隔离项目暂不允许额外设置、目录、插件、MCP 或 IDE/Chrome 集成。")
-    settings = {"disableAllHooks": True, "remoteControlAtStartup": False}
+    settings = {"disableAllHooks": True, "remoteControlAtStartup": False,
+                "forceLoginMethod": "claudeai"}
+    if theme is not None:
+        from .isolated_preferences import THEMES
+        if theme not in THEMES:
+            raise Blocked("隔离终端主题不受支持。")
+        settings["theme"] = theme
     return ["--setting-sources", "", "--settings", json.dumps(settings),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", *values]
 
@@ -347,7 +405,8 @@ def _q(value: Path | str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path | None = None) -> str:
+def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path | None = None,
+            token_auth: bool = False) -> str:
     hook = browser_hook.resolve()
     if hook.parent.parent != Path("/private/tmp") or not hook.parent.name.startswith("surge-cc-oauth-"):
         raise Blocked("授权桥目录不符合隔离要求。")
@@ -364,6 +423,29 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
                 Path("/opt/homebrew"), Path("/System"), Path("/dev"), hook.parent}
     for path in (project.root, project.home, native.resolve(), hook, Path(sys.executable).resolve()):
         metadata.update(path.parents)
+    from . import isolated_auth
+    shared_auth = None if token_auth else isolated_auth.prepare(project)
+    auth_writes = ""
+    if token_auth:
+        # Preserve every existing credential file, but make none available to
+        # this child, even when its HOME contains a prior isolated OAuth login.
+        denied_auth = [project.home / ".token-auth-disabled",
+                       project.home / ".token-auth-disabled.lock",
+                       project.config / ".credentials.json",
+                       project.base / ".runtime/auth"]
+        auth_writes = "(deny file-read* file-write* " + " ".join(
+            "(subpath " + _q(path) + ")" for path in denied_auth) + ")\n"
+    if shared_auth is not None:
+        metadata.update(shared_auth.parents)
+        # Native secure storage uses atomic replacement and refresh/storage
+        # locks inside this directory, plus a legacy sibling lock directory.
+        # The enabling marker in the parent remains outside the child sandbox.
+        legacy_lock = shared_auth.with_name(shared_auth.name + ".lock")
+        auth_writes = "(allow file-read* file-write* (subpath " + _q(shared_auth) + ") (subpath " + _q(legacy_lock) + "))\n"
+        if project.workspace is not None:
+            # Old per-project fallback credentials are retained for rollback but
+            # never readable by a process bound to a workspace auth store.
+            auth_writes += "(deny file-read* file-write* (subpath " + _q(project.config / ".credentials.json") + "))\n"
     git_writes = ""
     if project.worktree:
         git_dirs, git_files, writable = _git_access(project.worktree)
@@ -399,7 +481,7 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
 (allow file-read-metadata
 {metas})
 (allow file-read* file-write* (subpath {_q(project.root)}) (subpath {_q(project.home)}))
-{git_writes}(allow file-write-data (literal "/dev/null"))
+{git_writes}{auth_writes}(allow file-write-data (literal "/dev/null"))
 (allow file-read* file-write-data file-ioctl {tty_rules})
 (allow network-outbound (remote tcp "localhost:62919"))
 (allow network-outbound (literal {_q(hook.parent / 's')}))
@@ -407,14 +489,16 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
 '''
 
 
-def command(project: Project, native: Path, values: list[str], browser_hook: Path) -> list[str]:
+def command(project: Project, native: Path, values: list[str], browser_hook: Path, *,
+            token_auth: bool = False) -> list[str]:
     if not SANDBOX.is_file():
         raise Blocked("本机缺少文件沙箱，已阻止隔离项目启动。")
-    args = arguments(values)
+    arguments(values)  # Validate before creating or changing runtime state.
     try:
-        if (project.worktree and project.home != _worktree_home(
-                project.base, project.name, project.root, project.worktree.git_dir)):
-            raise ValueError("incorrect worktree runtime scope")
+        original_home = (_worktree_home(project.base, project.name, project.root, project.worktree.git_dir)
+                         if project.worktree else project.base / ".runtime" / project.name / "home")
+        if project.home != _expected_home(project, original_home):
+            raise ValueError("incorrect project/workspace runtime scope")
         _validate_runtime(project.home, project.base, create=True)
         for folder in (project.config, project.home / "tmp", project.home / ".config", project.home / ".cache"):
             _validate_runtime(folder, project.base, create=True)
@@ -422,17 +506,24 @@ def command(project: Project, native: Path, values: list[str], browser_hook: Pat
         # policy. A worktree moved/relinked during route checks must fail closed.
         if project.worktree:
             current = _validate_worktree(project.root, project.name, project.worktree.main_root)
-            expected_home = _worktree_home(project.base, project.name, project.root, current.git_dir)
+            expected_home = _expected_home(project, _worktree_home(
+                project.base, project.name, project.root, current.git_dir))
             if current != project.worktree or expected_home != project.home:
                 raise ValueError("worktree linkage changed")
         else:
             clean_path(project.root)
     except (OSError, ValueError, TypeError):
         raise Blocked("隔离 HOME 或 Git worktree 关联已变更或权限不安全，已阻止启动。") from None
-    return [str(SANDBOX), "-p", profile(project, native, browser_hook), str(native), *args]
+    from . import isolated_preferences, isolated_trust
+    isolated_preferences.prepare(project)
+    # Trust is a separate, exact-project opt-in. Apply only after the repeated
+    # worktree linkage checks; it never changes the Seatbelt or proxy policy.
+    isolated_trust.prepare(project)
+    args = arguments(values, theme=isolated_preferences.theme(project))
+    return [str(SANDBOX), "-p", profile(project, native, browser_hook, token_auth=token_auth), str(native), *args]
 
 
-def diagnose(project: Project, native: Path, config: dict, config_path: Path) -> dict:
+def diagnose(project: Project, native: Path, config: dict, config_path: Path, *, token_auth: bool = False) -> dict:
     """Run local synthetic probes; no login, authorization URL, or model call."""
     from .oauth import OAuthSession
     from .core import run_checks
@@ -452,9 +543,16 @@ def diagnose(project: Project, native: Path, config: dict, config_path: Path) ->
     for runtime in (parent / ".runtime").iterdir():
         if runtime.is_dir():
             denied_paths.append(runtime / "home")
+            accounts = runtime / "accounts"
+            if accounts.is_dir():
+                denied_paths += [p / "home" for p in accounts.iterdir() if p.is_dir()]
             worktrees = runtime / "worktrees"
             if worktrees.is_dir():
                 denied_paths += [p / "home" for p in worktrees.iterdir() if p.is_dir()]
+                for worktree in worktrees.iterdir():
+                    accounts = worktree / "accounts"
+                    if accounts.is_dir():
+                        denied_paths += [p / "home" for p in accounts.iterdir() if p.is_dir()]
     # Only existing paths are tested; ENOENT must never count as access denial.
     denied = [{"path": str(p), "directory": p.is_dir()} for p in dict.fromkeys(denied_paths)
               if p != project.home and p.exists()]
@@ -467,8 +565,8 @@ def diagnose(project: Project, native: Path, config: dict, config_path: Path) ->
         os.set_inheritable(inherited_fd, True)
         try:
             with OAuthSession(config, config_path) as oauth:
-                command(project, native, [], oauth.browser_hook)  # prepare and validate homes
-                env = environment(project, config["proxy_url"])
+                command(project, native, [], oauth.browser_hook, token_auth=token_auth)  # prepare and validate homes
+                env = environment(project, config["proxy_url"], token_auth=token_auth)
                 spec = {
                     "project": project.name, "root": str(project.root), "native": str(native),
                     "native_help_args": arguments(["--help"]),
@@ -477,7 +575,7 @@ def diagnose(project: Project, native: Path, config: dict, config_path: Path) ->
                     spec["git"] = {"common_dir": str(project.worktree.common_dir),
                                    "git_dir": str(project.worktree.git_dir)}
                 env["SURGE_CC_ISOLATION_PROBE"] = json.dumps(spec)
-                tested = subprocess.run([str(SANDBOX), "-p", profile(project, native, oauth.browser_hook, probe=probe),
+                tested = subprocess.run([str(SANDBOX), "-p", profile(project, native, oauth.browser_hook, probe=probe, token_auth=token_auth),
                                          str(Path(sys.executable).resolve()), str(probe)],
                                         cwd=project.root, env=env, capture_output=True, text=True,
                                         timeout=60, close_fds=True)

@@ -1,7 +1,7 @@
 """App-owned working data and reversible snapshots; never reads personal credentials."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import fcntl
 import hashlib
 import json
@@ -13,7 +13,73 @@ import stat
 import tempfile
 import uuid
 
-from .core import Blocked, BrowserProfileBusy, now, save_config
+from .core import Blocked, BrowserProfileBusy, load_config, now, save_config, validate_config
+
+
+# The active config remains the runtime view. Each workspace owns a separate
+# copy of these fields; machine paths and installation metadata stay shared.
+SETTINGS_FIELDS = (
+    "group", "policy", "expected_ip", "proxy_url", "hosts", "expected_timezone",
+    "expected_locale", "expected_country", "expected_asn", "browser_language",
+    "privacy_strict", "guard_interval",
+)
+
+
+@contextmanager
+def account_lock(config_path: Path, exclusive: bool = False):
+    """Serialize account changes against launch preparation, not live sessions.
+
+    A launcher releases its shared gate only after the supervisor owns the
+    workspace session lock. A switch can then take the exclusive gate, stop
+    owned sessions, and commit without another launcher entering halfway.
+    """
+    parent = config_path.parent
+    if parent.is_symlink() or any(p.is_symlink() for p in parent.parents if p.exists()):
+        raise Blocked("账号切换锁的位置不能使用符号链接。")
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(parent / ".account.lock", os.O_RDWR | os.O_CREAT |
+                 getattr(os, "O_NOFOLLOW", 0), 0o600)
+    released = False
+
+    def release():
+        nonlocal released
+        if not released:
+            released = True
+            os.close(fd)
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise Blocked("账号切换锁文件的类型或所有者异常。")
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Blocked("正在切换工作区或准备启动，请稍后重试。") from None
+        yield release
+    finally:
+        release()
+
+
+def assert_current(config_path: Path, config: dict) -> dict:
+    """Reject a stale GUI request or launcher rather than mix two accounts."""
+    current = load_config(config_path)
+    if current != validate_config(config):
+        raise Blocked("当前工作区或设置已变更，请刷新后重试；未使用旧账号配置启动。")
+    return current
+
+
+@contextmanager
+def account_session(config_path: Path, config: dict):
+    with account_lock(config_path) as release:
+        assert_current(config_path, config)
+        yield release
+
+
+@contextmanager
+def account_switch(config_path: Path):
+    with account_lock(config_path, exclusive=True):
+        yield
 
 
 def name_ok(name: str) -> str:
@@ -108,6 +174,8 @@ def paths(config_path: Path, name: str) -> dict[str, Path]:
 def exclusive(config_path: Path, name: str):
     path = location(config_path, name)
     with _lock(path, exclusive=True):
+        from .sessions import assert_no_stop_failures
+        assert_no_stop_failures(path)
         _initialize(path, name)
         loc = {"root": path, "data": path / "data", "browser": path / "data/Browser",
                "claude": path / "data/Claude", "lock": path / ".session.lock"}
@@ -200,6 +268,89 @@ def restore(config_path: Path, name: str, identifier: str) -> dict:
                 shutil.rmtree(stage)
 
 
+def _route(config: dict) -> dict:
+    normalized = validate_config(config)
+    # Copy nested hosts too: later changes to one workspace must not mutate the
+    # initial same-route snapshot of another workspace in memory.
+    return json.loads(json.dumps({key: normalized[key] for key in SETTINGS_FIELDS}))
+
+
+def _settings_path(config_path: Path, name: str) -> Path:
+    return location(config_path, name) / "settings.json"
+
+
+def _read_settings(config_path: Path, name: str, base: dict) -> dict | None:
+    file = _settings_path(config_path, name)
+    if file.is_symlink():
+        raise Blocked("工作区线路设置不能使用符号链接。")
+    if not file.exists():
+        return None
+    try:
+        info = file.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("invalid settings owner")
+        value = json.loads(file.read_text(encoding="utf-8"))
+        if (not isinstance(value, dict) or set(value) != {"schema", "workspace", "settings"}
+                or value["schema"] != 1 or value["workspace"] != name
+                or not isinstance(value["settings"], dict)
+                or set(value["settings"]) != set(SETTINGS_FIELDS)):
+            raise ValueError("invalid settings metadata")
+        return _route(dict(base, **value["settings"], workspace=name))
+    except (OSError, ValueError, TypeError):
+        raise Blocked("工作区线路设置无法完整读取；未切换账号，也未覆盖原设置。") from None
+
+
+def _settings_value(name: str, route: dict) -> dict:
+    return {"schema": 1, "workspace": name, "settings": route}
+
+
+def _remember_file(path: Path) -> dict | None:
+    if path.is_symlink():
+        raise Blocked("工作区线路设置不能使用符号链接。")
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise Blocked("工作区线路设置无法完整读取，未覆盖。") from None
+
+
+def _rollback_settings(originals: dict[Path, dict | None]) -> None:
+    for path, original in originals.items():
+        if original is None:
+            if path.is_symlink():
+                raise Blocked("工作区设置回滚时发现符号链接；已停止。")
+            path.unlink(missing_ok=True)
+        else:
+            write_json(path, original)
+
+
+def save_settings(config_path: Path, candidate: dict) -> dict:
+    """Save the active account's route and shared machine settings atomically.
+
+    A caller wanting to change accounts must use use(); configure cannot change
+    workspace accidentally through an old GUI form. Active sessions must stop
+    first, so a launch never observes a half-updated account/route pairing.
+    """
+    candidate = validate_config(candidate)
+    with account_switch(config_path):
+        current = load_config(config_path) if config_path.exists() else None
+        if current and current["workspace"] != candidate["workspace"]:
+            raise Blocked("当前工作区已变更，请刷新设置后保存；未覆盖其他账号的线路。")
+        name = candidate["workspace"]
+        with exclusive(config_path, name):
+            file = _settings_path(config_path, name)
+            # Validate before allowing a malformed saved route to be replaced.
+            _read_settings(config_path, name, candidate)
+            previous = {file: _remember_file(file)}
+            try:
+                write_json(file, _settings_value(name, _route(candidate)))
+                return save_config(config_path, candidate)
+            except Exception:
+                _rollback_settings(previous)
+                raise
+
+
 def listing(config_path: Path, config: dict) -> dict:
     root = safe_root(config_path)
     names = {"A", "B", config.get("workspace", "A")}
@@ -224,14 +375,97 @@ def listing(config_path: Path, config: dict) -> dict:
                     snapshots.append({k: value[k] for k in ("id", "label", "created_at")})
                 except (OSError, ValueError, KeyError, TypeError):
                     continue
-        items.append({"name": name, "label": label, "snapshots": sorted(snapshots, key=lambda s: s["created_at"], reverse=True)})
+        # Legacy active data already belongs to the selected account, even
+        # before the first per-workspace settings file has been written.
+        route = (_route(config) if name == config.get("workspace", "A")
+                 else _read_settings(config_path, name, config))
+        items.append({"name": name, "label": label, "route": route,
+                      "route_configured": route is not None,
+                      "snapshots": sorted(snapshots, key=lambda s: s["created_at"], reverse=True)})
     return {"current_workspace": config.get("workspace", "A"), "workspaces": items}
 
 
-def use(config_path: Path, config: dict, name: str) -> dict:
-    create(config_path, name)
-    updated = dict(config, workspace=name)
-    return save_config(config_path, updated)
+def use(config_path: Path, config: dict, name: str, *, stop_sessions=None, apply_route=None) -> dict:
+    """Commit browser, CLI account selection and route as one active config.
+
+    stop_sessions(path, name) may gracefully close app-owned supervisors while
+    the global launch gate is closed. apply_route(old, new) may activate only
+    the app-owned route and return an undo callable for a later commit failure.
+    It must roll back its own partial effects if it raises. Unknown sessions
+    and Chrome locks remain fail-closed; no personal browser data is touched.
+    """
+    name = name_ok(name)
+    with account_switch(config_path):
+        current = assert_current(config_path, config)
+        old_name = current["workspace"]
+        names = list(dict.fromkeys((old_name, name)))
+        if stop_sessions is not None:
+            for workspace in names:
+                stop_sessions(config_path, workspace)
+        with ExitStack() as stack:
+            for workspace in sorted(names):
+                stack.enter_context(exclusive(config_path, workspace))
+            old_file = _settings_path(config_path, old_name)
+            new_file = _settings_path(config_path, name)
+            _read_settings(config_path, old_name, current)
+            target = _read_settings(config_path, name, current)
+            # First use creates independent route settings only. Login data,
+            # cookies, CLI credentials and keychain references are never copied.
+            target = _route(current) if target is None or name == old_name else target
+            updated = validate_config(dict(current, **target, workspace=name))
+            originals = {file: _remember_file(file) for file in (old_file, new_file)}
+            undo = None
+            try:
+                write_json(old_file, _settings_value(old_name, _route(current)))
+                write_json(new_file, _settings_value(name, target))
+                if apply_route is not None:
+                    undo = apply_route(current, updated)
+                    if undo is not None and not callable(undo):
+                        raise Blocked("线路切换没有返回有效回滚操作，未提交账号切换。")
+                return save_config(config_path, updated)
+            except Exception:
+                try:
+                    if callable(undo):
+                        undo()
+                finally:
+                    _rollback_settings(originals)
+                raise
+
+
+@contextmanager
+def browser_session(path: Path, config: dict):
+    """Lease the canonical Browser/Default from preparation through process exit.
+
+    Web and OAuth share this profile and therefore this exclusive lease. The
+    shared workspace lock still permits CLI work but excludes snapshots/restore.
+    Chrome's own lock is checked after leasing, before any preference write.
+    """
+    path = Path(path)
+    if (not path.is_absolute() or path.is_symlink() or
+            any(p.is_symlink() for p in path.parents if p.exists())):
+        raise Blocked("专用浏览器工作区位置异常。")
+    with _lock(path, exclusive=False):
+        _initialize(path, config["workspace"])
+        fd = os.open(path / ".browser.lock", os.O_RDWR | os.O_CREAT |
+                     getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise Blocked("专用浏览器锁文件的类型或所有者异常。")
+            os.fchmod(fd, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise BrowserProfileBusy(
+                    "专用网页或授权窗口正在使用同一份登录资料。请关闭专用窗口后重试；不会改用空白资料或个人 Chrome。") from None
+            profile = path / "data/Browser"
+            if os.path.lexists(profile / "SingletonLock"):
+                raise BrowserProfileBusy(
+                    "专用网页或授权窗口仍在运行，或退出后留有锁。请关闭专用窗口后重试，或点击检查并修复浏览器锁。")
+            _prepare_browser_preferences(profile, config)
+            yield profile
+        finally:
+            os.close(fd)
 
 
 def prepare_browser_language(config_path: Path, config: dict) -> None:
@@ -241,26 +475,17 @@ def prepare_browser_language(config_path: Path, config: dict) -> None:
     always applied; language is changed only when explicitly configured. These
     stored preferences alone do not prove effective runtime containment.
     """
-    with exclusive(config_path, config["workspace"]) as loc:
-        _prepare_browser_preferences(loc["browser"], config)
+    with browser_session(location(config_path, config["workspace"]), config):
+        pass
 
 
 def prepare_oauth_browser(config_path: Path, config: dict) -> Path:
-    """Prepare only the stopped OAuth profile while a CLI may hold a shared lock.
+    """Compatibility preparation helper; OAuth runtime holds browser_session.
 
-    The caller owns .oauth.lock for this profile's full browser lifetime.
-    The ordinary webpage profile and personal Chrome are never touched.
+    The legacy OAuthBrowser directory is left untouched. Login data is neither
+    copied nor merged: both entry points use the existing Browser/Default.
     """
-    path = location(config_path, config["workspace"])
-    with _lock(path, exclusive=False):
-        _initialize(path, config["workspace"])
-        profile = path / "data/OAuthBrowser"
-        if profile.is_symlink():
-            raise Blocked("专用授权资料目录异常，未启动浏览器。")
-        if os.path.lexists(profile / "SingletonLock"):
-            raise BrowserProfileBusy("专用授权窗口仍在运行，或退出后留有锁。请在 Surge CC 中检查并修复浏览器锁。")
-        profile.mkdir(mode=0o700, exist_ok=True)
-        _prepare_browser_preferences(profile, config)
+    with browser_session(location(config_path, config["workspace"]), config) as profile:
         return profile
 
 

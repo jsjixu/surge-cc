@@ -290,6 +290,8 @@ class CLIIntegrationTests(IsolationFixture):
     def setUp(self):
         super().setUp()
         self.write_registry()
+        from surge_cc import keychain_auth
+        keychain_auth.migrate_legacy(self.config_path, "A")
         self.native = self.temp_root / "native-claude"
         self.native.write_text("not executed")
         self.native.chmod(0o700)
@@ -334,14 +336,19 @@ class CLIIntegrationTests(IsolationFixture):
         self.assertEqual(call.kwargs["env"]["HOME"], str(self.home))
         self.assertEqual(call.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.project.config))
         self.assertEqual(call.kwargs["env"]["BROWSER"], str(self.oauth.browser_hook))
-        self.assertIs(call.kwargs["on_started"], self.oauth.set_child)
+        child = Mock()
+        call.kwargs["on_started"](child)
+        self.oauth.set_child.assert_called_once_with(child)
         self.runtime_factory.assert_called_once_with(self.config, process=str(self.native))
         self.assertIs(call.kwargs["checker"], self.runtime_factory.return_value)
         self.spawn.assert_not_called()
 
     def test_ordinary_project_keeps_previous_native_launch_path(self):
+        from surge_cc import isolated_trust
         self.cwd_patch.return_value = self.temp_root
-        report = self.launch(["--help"])
+        with patch.object(isolated_trust, "prepare") as trust:
+            report = self.launch(["--help"])
+            trust.assert_not_called()
         self.assertTrue(report["ok"])
         self.assertNotIn("file_isolation", report)
         self.settings_check.assert_called_once()

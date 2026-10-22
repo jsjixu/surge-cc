@@ -16,8 +16,9 @@ import uuid
 from .core import (
     APP_SUPPORT, CHROME, DEFAULT_CONFIG, Blocked, BrowserProfileBusy, Surge, chrome_args, default_claude,
     load_config, now, provider_environment_ok, proxy_env, result, row, run_checks, save_config, browser_executable,
+    global_mode_allowed,
 )
-from . import workspaces, repair, isolation
+from . import workspaces, repair, isolation, keychain_auth
 from .guard import run_guarded
 from .oauth import OAuthSession
 
@@ -25,6 +26,10 @@ from .oauth import OAuthSession
 def full_checks(config: dict, browser: bool = True, external_dns: bool = True) -> dict:
     basic = run_checks(config)
     if not basic["ok"]:
+        if basic.get("paused") is True:
+            # Global proxy mode suspends route enforcement; direct/unknown
+            # modes still block. Preserve the exact metadata for each caller.
+            return basic
         basic["checks"].append({"id": "privacy_pending", "title": "扩展隐私检测", "status": "unknown",
                                 "required": True, "detail": "先修复基础线路；未启动浏览器探针。"})
         return result(basic["checks"], config)
@@ -34,7 +39,18 @@ def full_checks(config: dict, browser: bool = True, external_dns: bool = True) -
     except Exception:
         extras = [{"id": "audit_error", "title": "扩展检测", "status": "unknown", "required": True,
                    "detail": "扩展检测未完成，不能视为通过。"}]
-    return result(basic["checks"] + extras, config)
+    report = result(basic["checks"] + extras, config)
+    if not report["ok"]:
+        try:
+            # The optional browser/DNS phase can overlap a deliberate switch
+            # to global mode. Only that explicit exception may replace failure.
+            if Surge().status().get("mode") == "proxy":
+                fresh = run_checks(config)
+                if global_mode_allowed(fresh):
+                    return fresh
+        except (Blocked, AttributeError, TypeError):
+            pass
+    return report
 
 
 def oauth_checks(config: dict) -> dict:
@@ -46,14 +62,41 @@ def oauth_checks(config: dict) -> dict:
     report = full_checks(config, external_dns=False)
     if report.get("ok") is not True:
         return report
-    verify_proxy_exit(config)
-    RuntimeChecker(config, process=str(browser_executable(config))).check(include_exit=False)
+    try:
+        verify_proxy_exit(config)
+        runtime = RuntimeChecker(config, process=str(browser_executable(config)))
+        runtime.check(include_exit=False)
+        if runtime.suspended is True:
+            return run_checks(config)
+    except Blocked:
+        # A mode change during the asynchronous probes is intentional only
+        # when a fresh, complete global-mode report explicitly allows it.
+        fresh = run_checks(config)
+        if global_mode_allowed(fresh):
+            return fresh
+        raise
     return report
 
 
 def command_result(summary: str, config: dict, **fields) -> dict:
     return {"schema": 1, "ok": True, "summary": summary, "checked_at": now(),
             "checks": [], "settings": config, **fields}
+
+
+def apply_launch_suspension(report: dict, receipt: dict, target: str) -> bool:
+    """A last-moment mode change must not be shown as protected startup."""
+    suspended = global_mode_allowed(report)
+    if (isinstance(receipt, dict) and receipt.get("schema") == 1 and
+            receipt.get("target") == target and receipt.get("state") == "running" and
+            receipt.get("ok") is True and receipt.get("suspended") is True and
+            receipt.get("protection_active") is False):
+        report.update(paused=True, pause_reason="surge-global-mode", surge_mode="proxy",
+                      launch_allowed=True, protection_active=False)
+        report["checks"] = [item for item in report.get("checks", []) if item.get("id") != "mode"]
+        report["checks"].append(row("mode", "规则模式", False,
+                                   "启动时已切换到全局代理模式；线路保护挂起，允许启动。"))
+        suspended = True
+    return suspended
 
 
 def print_result(report: dict, as_json: bool) -> None:
@@ -66,7 +109,19 @@ def print_result(report: dict, as_json: bool) -> None:
         print(f'{marker} {item["title"]}：{item["detail"]}')
 
 
-def code_settings_ok(config: dict, cwd: Path, env: dict) -> bool:
+def credential_override(name: str) -> bool:
+    name = name.upper()
+    return (name.startswith("ANTHROPIC_") or name.startswith("CLAUDE_CODE_OAUTH_")
+            or name.startswith("CLAUDE_CODE_USE_") or name.startswith("CLAUDE_CODE_API_KEY")
+            or name == "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+
+
+def token_base_environment(values: dict) -> dict:
+    """Drop inherited credentials before injecting the explicitly selected one."""
+    return {key: value for key, value in values.items() if not credential_override(key)}
+
+
+def code_settings_ok(config: dict, cwd: Path, env: dict, *, token_auth: bool = False) -> bool:
     if not provider_environment_ok(env):
         return False
     custom = env.get("CLAUDE_CONFIG_DIR")
@@ -89,16 +144,18 @@ def code_settings_ok(config: dict, cwd: Path, env: dict) -> bool:
                 if managed_root in path.parents and settings.get("remoteControlAtStartup") is True:
                     return False
                 settings = {**settings, "remoteControlAtStartup": False}
-            if not launch_settings_safe(config, settings):
+            if not launch_settings_safe(config, settings, token_auth=token_auth):
                 return False
         except (OSError, ValueError, AttributeError, TypeError):
             return False
     return True
 
 
-def launch_settings_safe(config: dict, settings: object) -> bool:
+def launch_settings_safe(config: dict, settings: object, *, token_auth: bool = False) -> bool:
     """Inspect settings without executing hooks; keep protected env immutable."""
     if not isinstance(settings, dict) or settings.get("remoteControlAtStartup") is True:
+        return False
+    if token_auth and any(key in settings for key in ("apiKeyHelper", "forceLoginMethod", "forceLoginOrgUUID")):
         return False
     values = settings.get("env", {})
     if (not isinstance(values, dict) or
@@ -106,6 +163,8 @@ def launch_settings_safe(config: dict, settings: object) -> bool:
             not provider_environment_ok(values)):
         return False
     for name, value in values.items():
+        if token_auth and credential_override(name):
+            return False
         if name.upper() in {"BROWSER", "CLAUDE_CONFIG_DIR"}:
             return False
         if name.upper() in {"DISABLE_UPDATES", "DISABLE_AUTOUPDATER"} and value != "1":
@@ -117,7 +176,7 @@ def launch_settings_safe(config: dict, settings: object) -> bool:
     return True
 
 
-def validate_launch_arguments(config: dict, arguments: list[str]) -> None:
+def validate_launch_arguments(config: dict, arguments: list[str], *, token_auth: bool = False) -> None:
     """Orca's inline settings are allowed only after semantic validation.
 
     Files are deliberately not accepted here: checking one then handing its path
@@ -133,7 +192,7 @@ def validate_launch_arguments(config: dict, arguments: list[str]) -> None:
             value = arguments[index + 1]
         if flag == "--settings":
             try:
-                safe = launch_settings_safe(config, json.loads(value))
+                safe = launch_settings_safe(config, json.loads(value), token_auth=token_auth)
             except (ValueError, TypeError):
                 safe = False
             if not safe:
@@ -178,6 +237,9 @@ def protected_code_arguments(arguments: list[str]) -> list[str]:
         settings.update(incoming)
         index += 1
     settings["remoteControlAtStartup"] = False
+    # Console browser SSO may live outside CLAUDE_CONFIG_DIR. This account
+    # manager deliberately supports claude.ai subscription OAuth/setup-token.
+    settings["forceLoginMethod"] = "claudeai"
     return ["--settings", json.dumps(settings, ensure_ascii=False, separators=(",", ":")), *remaining]
 
 
@@ -276,13 +338,17 @@ def start_web_guard(config: dict, config_path: Path, command: list[str], loc: di
 
 def launch(config: dict, config_path: Path, target: str, terminal: bool, args: list[str],
            checker=full_checks, popen=subprocess.Popen, terminal_open=terminal_launcher,
-           guarded=run_guarded, web_guard=start_web_guard) -> dict:
+           guarded=run_guarded, web_guard=start_web_guard, startup_release=lambda: None) -> dict:
     arguments = args[1:] if args[:1] == ["--"] else args
     isolated = isolation.for_cwd(config_path, Path.cwd()) if target == "code" else None
+    if isolated:
+        isolated = isolation.bind_workspace(isolated, config_path, config["workspace"])
+    token_config = keychain_auth.load(config_path, config["workspace"]) if target == "code" else None
+    token_auth = token_config is not None
     if target == "code" and arguments == ["--surge-cc-isolation-check"]:
         if not isolated:
             raise Blocked("当前目录不是已登记的隔离项目。")
-        report = isolation.diagnose(isolated, default_claude(), config, config_path)
+        report = isolation.diagnose(isolated, default_claude(), config, config_path, token_auth=token_auth)
         # The terminal shim uses passthrough; keep this explicitly requested
         # diagnostic report on stdout, without triggering native Claude login.
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -294,7 +360,16 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
         claude = default_claude()
         if not claude.is_file() or not os.access(claude, os.X_OK):
             raise Blocked("没有找到 Claude Code 可执行文件，请先完成官方安装。")
-        validate_launch_arguments(config, arguments)
+        # A project/env credential must never silently override the selected
+        # workspace, including when that workspace uses native OAuth.
+        validate_launch_arguments(config, arguments, token_auth=True)
+        if token_auth:
+            for index, arg in enumerate(arguments):
+                if index > 0 and arguments[index - 1] in {"-p", "--print"}:
+                    continue
+                if (arg == "setup-token" or arg.split("=", 1)[0] == "--bare"
+                        or (arg == "auth" and arguments[index + 1:index + 2] in (["login"], ["logout"]))):
+                    raise Blocked("当前使用钥匙串长效 Token；此命令需要先显式切回 OAuth 模式，不会自动打开网页登录。")
         # A maintenance word used as the immediate print prompt is harmless;
         # a later --print flag must not pardon an earlier update subcommand.
         maintenance = any(a in {"update", "upgrade", "install"} and not (
@@ -315,12 +390,9 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
             # propagate original home/ancestor project settings into this child.
             isolation.arguments(arguments)
         else:
-            code_env = dict(os.environ)
+            code_env = token_base_environment(os.environ)
             code_env["CLAUDE_CONFIG_DIR"] = str(workspaces.location(config_path, config["workspace"]) / "data/Claude")
-            external_home = os.environ.get("CLAUDE_CONFIG_DIR")
-            if external_home and Path(external_home).expanduser().resolve() != Path(code_env["CLAUDE_CONFIG_DIR"]).resolve():
-                raise Blocked("调用方指定了另一份 Claude 账号目录；请将 Orca 的 CLAUDE_CONFIG_DIR 与当前 Surge CC 工作区对齐后重试。")
-            if not code_settings_ok(config, Path.cwd(), code_env):
+            if not code_settings_ok(config, Path.cwd(), code_env, token_auth=True):
                 raise Blocked("Claude 的环境或项目配置包含冲突的代理、浏览器或其他模型服务设置，请先检查。")
     else:
         if arguments:
@@ -332,8 +404,12 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
     report = (full_checks(config, external_dns=False)
               if os.environ.get("SURGE_CC_TERMINAL_ENTRY") == "1" and checker is full_checks
               else checker(config))
-    if not report.get("ok"):
+    suspended = global_mode_allowed(report)
+    if not report.get("ok") and not suspended:
         return report
+    if suspended and os.environ.get("SURGE_CC_TERMINAL_ENTRY") == "1":
+        print("[Surge CC] 全局代理模式：线路保护已挂起，允许启动；出口由 Surge 全局策略决定。",
+              file=sys.stderr)
     loc = workspaces.paths(config_path, config["workspace"])
     if target == "web":
         profile = loc["browser"]
@@ -342,30 +418,53 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
             raise Blocked("专用网页资料目录异常，未启动浏览器。")
         if os.path.lexists(profile / "SingletonLock"):
             raise BrowserProfileBusy("专用网页窗口仍在运行，或退出后留有锁。可点击检查并修复；不会操作个人 Chrome。")
-        workspaces.prepare_browser_language(config_path, config)
-        profile.mkdir(parents=True, mode=0o700, exist_ok=True)
-        web_guard(config, config_path, chrome_args(config, profile), loc, popen=popen)
-        report.update(launched=True, target="web", summary="已打开独立网页窗口并启动运行期线路监控")
+        # The worker acquires the shared web/OAuth browser lease before writing
+        # preferences and retains it through process exit. Preparing here would
+        # leave a race between the preference write and detached-worker start.
+        receipt = web_guard(config, config_path, chrome_args(config, profile), loc, popen=popen)
+        startup_release()
+        suspended = apply_launch_suspension(report, receipt, "web")
+        report.update(ok=True, launched=True, target="web", summary=(
+            "已打开专用网页窗口；全局代理模式下线路保护已挂起，使用 Surge 全局策略"
+            if suspended else "已打开独立网页窗口并启动运行期线路监控"))
     elif terminal:
         terminal_open(config_path, arguments, Path.cwd())
-        report.update(launched=True, target="code-terminal", summary="已打开终端；终端将再次检查后启动 Claude Code")
+        report.update(ok=True, launched=True, target="code-terminal", summary=(
+            "已打开终端；终端将再次确认 Surge 模式，全局模式允许启动且挂起线路保护"
+            if suspended else "已打开终端；终端将再次检查后启动 Claude Code"))
     else:
-        env = (isolation.environment(isolated, config["proxy_url"]) if isolated
-               else proxy_env(config["proxy_url"]))
+        env = (isolation.environment(isolated, config["proxy_url"], token_auth=token_auth) if isolated
+               else proxy_env(config["proxy_url"], base=token_base_environment(os.environ)))
         env["CLAUDE_CONFIG_DIR"] = str(isolated.config if isolated else loc["claude"])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Native updates replace ~/.local/bin/claude, which is our guarded shim.
         # Scope this to the child; never change the user's global environment.
         env["DISABLE_AUTOUPDATER"] = "1"
         env["DISABLE_UPDATES"] = "1"
+        if not isolated and not token_auth:
+            env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(keychain_auth.auth_directory(config_path, config["workspace"]))
+        if token_auth:
+            # Read only after successful route checks. Never place this value in
+            # argv, settings, receipts, the child HOME, or a returned report.
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = keychain_auth.read_token(token_config)
+            if not isolated:
+                disabled_storage = loc["claude"] / ".token-auth-disabled"
+                if os.path.lexists(disabled_storage):
+                    raise Blocked("Token 模式的禁用凭据路径已被占用，未启动；不会回退其他登录。")
+                env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(disabled_storage)
+            print("[Surge CC] 使用钥匙串长效 Token；不会自动切换登录或打开授权网页。", file=sys.stderr)
         identifier = config["workspace"] + "-" + uuid.uuid4().hex
         folder = (config_path.parent / "sessions").absolute()
         status_path = folder / (identifier + ".status.json")
         receipt_path = folder / (identifier + ".receipt.json")
-        with OAuthSession(config, config_path, checker=oauth_checks) as oauth:
+        oauth_options = {"allow_authorization": False} if token_auth else {}
+        with OAuthSession(config, config_path, checker=oauth_checks, **oauth_options) as oauth:
+            def started(child):
+                oauth.set_child(child)
+                startup_release()
             env["BROWSER"] = str(oauth.browser_hook)
             native = default_claude()
-            command = (isolation.command(isolated, native, arguments, oauth.browser_hook) if isolated
+            command = (isolation.command(isolated, native, arguments, oauth.browser_hook, token_auth=token_auth) if isolated
                        else [str(native), *protected_code_arguments(arguments)])
             guard_options = {}
             if isolated:
@@ -374,11 +473,22 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                 detail = ("当前 Orca 工作树和独立 HOME 可读写，共享 Git 数据只读；提交和推送请在 Orca 完成。"
                           if isolated.worktree else "用户文件仅开放当前副本和独立 HOME，系统工具只读。")
                 print(f"[Surge CC] 文件隔离已启用：{isolated.name}；{detail}", file=sys.stderr)
+                if not token_auth and env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+                    print("[Surge CC] 登录存储共用；当前工作树的会话、记忆和日志仍独立。", file=sys.stderr)
             status = guarded(command, env=env, cwd=Path.cwd(),
                              config=config, target="code", status_path=status_path, popen=popen,
-                             receipt_path=receipt_path, on_started=oauth.set_child,
+                             receipt_path=receipt_path, on_started=started,
                              lock_path=loc["lock"].absolute(), interval=config["guard_interval"],
                              exit_interval=max(30, config["guard_interval"]), **guard_options)
+        if isolated:
+            from . import isolated_preferences
+            try:
+                isolated_preferences.record(isolated)
+            except Blocked:
+                # A completed session remains completed even if an optional UI
+                # preference could not be saved. Never retry with wider access.
+                report["preferences_warning"] = "未能保存共享界面偏好；当前会话和账号资料未被覆盖。"
+                print("[Surge CC] " + report["preferences_warning"], file=sys.stderr)
         try:
             receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() and not receipt_path.is_symlink() else {}
         except (OSError, ValueError):
@@ -386,14 +496,20 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
         launched = (isinstance(receipt, dict) and receipt.get("schema") == 1 and
                     receipt.get("target") == "code" and receipt.get("state") == "running" and
                     receipt.get("ok") is True)
+        suspended = apply_launch_suspension(report, receipt, "code")
         report.update(launched=launched, target="code", child_exit_code=status,
                       ok=launched and status == 0,
-                      summary=("Claude Code 受监控会话已结束" if status == 0 else "Claude Code 已停止；请查看保护状态")
+                      summary=(("Claude Code 会话已结束；启动时全局模式的线路保护处于挂起状态"
+                                if suspended else "Claude Code 受监控会话已结束") if status == 0
+                               else "Claude Code 已停止；请查看保护状态")
                       if launched else "启动前复核或运行监控未建立，未确认 Claude Code 启动")
+        if token_auth:
+            report["authentication"] = {"source": "keychain-setup-token", "automatic_browser_login": False}
         if isolated:
             report["file_isolation"] = {"project": isolated.name, "root": str(isolated.root),
                                         "home": str(isolated.home), "backend": "macOS Seatbelt",
-                                        "linked_worktree": isolated.worktree is not None}
+                                        "linked_worktree": isolated.worktree is not None,
+                                        "shared_login_storage": not token_auth and bool(env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"))}
         if not launched or status != 0:
             report["checks"].append(row("runtime", "运行监控", False,
                                         "未建立受监控会话。" if not launched else "受监控会话以非零状态结束。"))
@@ -414,8 +530,11 @@ def guard_status(config: dict, config_path: Path) -> dict:
                 continue
             updated = dt.datetime.fromisoformat(item["checked_at"])
             age = (current - updated).total_seconds()
-            item["running"] = item.get("state") == "running" and 0 <= age <= max(90, config["guard_interval"] * 3)
-            if item.get("state") == "running" and not item["running"]:
+            fresh = 0 <= age <= max(90, config["guard_interval"] * 3)
+            item["running"] = item.get("state") == "running" and fresh
+            item["suspended"] = item.get("state") == "suspended" and fresh
+            item["protection_active"] = item["running"]
+            if item.get("state") in {"running", "suspended"} and not fresh:
                 item["detail"] = "状态回执已过期，无法确认监控仍在运行。"
             item["workspace"] = file.name.rsplit("-", 1)[0]
             guards.append(item)
@@ -423,13 +542,36 @@ def guard_status(config: dict, config_path: Path) -> dict:
             continue
     guards.sort(key=lambda item: item["checked_at"], reverse=True)
     active = [item for item in guards if item["running"]]
+    suspended = [item for item in guards if item["suspended"]]
     latest = guards[0] if guards else {}
-    overview = {"running": bool(active), "interval": config["guard_interval"],
+    overview = {"running": bool(active), "protection_active": bool(active),
+                "state": "running" if active else "suspended" if suspended else "inactive",
+                "suspended": bool(suspended), "suspended_sessions": len(suspended),
+                "interval": config["guard_interval"],
                 "last_checked_at": latest.get("checked_at", ""),
                 "detail": f"最近 {max(90, config['guard_interval'] * 3)} 秒收到 {len(active)} 个会话的保护回执；"
-                          "只覆盖本工具启动的程序，进程当前状态仍可能变化。" if active
-                else latest.get("detail", "尚无有效保护回执。启动网页或 CLI 时建立监控。")}
+                          f"另有 {len(suspended)} 个会话挂起线路保护。只覆盖本工具启动的程序，进程当前状态仍可能变化。" if active
+                else (f"{len(suspended)} 个会话仍在运行，线路保护因全局代理模式挂起；出口由 Surge 全局策略决定。"
+                      if suspended else latest.get("detail", "尚无有效保护回执。启动网页或 CLI 时建立监控。"))}
     return command_result("运行期保护状态", config, guard=overview, guards=guards)
+
+
+def workspace_inventory(config_path: Path, config: dict) -> dict:
+    data = workspaces.listing(config_path, config)
+    for item in data["workspaces"]:
+        name = item["name"]
+        item["auth"] = keychain_auth.status(config_path, name)
+        profile = workspaces.location(config_path, name) / "data/Browser/Default"
+        item["browser"] = {"has_profile": profile.is_dir() and not profile.is_symlink()}
+    return data
+
+
+def migrate_accounts(config_path: Path, config: dict) -> None:
+    # Bind the pre-upgrade credential reference before any account switch.
+    # This never reads the token value or clones browser/CLI login databases.
+    with workspaces.account_switch(config_path):
+        workspaces.assert_current(config_path, config)
+        keychain_auth.migrate_legacy(config_path, config["workspace"])
 
 
 def parser() -> argparse.ArgumentParser:
@@ -448,6 +590,7 @@ def parser() -> argparse.ArgumentParser:
     configure.add_argument("--privacy-strict", choices=("true", "false"))
     configure.add_argument("--guard-interval", type=int)
     configure.add_argument("--json", action="store_true")
+    configure.add_argument("--expected-workspace")
     fix = commands.add_parser("repair")
     fix.add_argument("--plan-id", required=True)
     fix.add_argument("--json", action="store_true")
@@ -457,8 +600,14 @@ def parser() -> argparse.ArgumentParser:
     workspace.add_argument("--label", default="")
     workspace.add_argument("--snapshot")
     workspace.add_argument("--json", action="store_true")
+    workspace.add_argument("--close-sessions", action="store_true")
+    auth = commands.add_parser("workspace-auth")
+    auth.add_argument("action", choices=("status", "store", "oauth"))
+    auth.add_argument("--workspace", required=True)
+    auth.add_argument("--stdin", action="store_true")
+    auth.add_argument("--json", action="store_true")
     browser_locks = commands.add_parser("browser-locks")
-    browser_locks.add_argument("action", choices=("repair",))
+    browser_locks.add_argument("action", choices=("repair", "recover"))
     browser_locks.add_argument("--workspace", required=True)
     browser_locks.add_argument("--json", action="store_true")
     start = commands.add_parser("launch")
@@ -512,6 +661,9 @@ def main(argv: list[str] | None = None) -> int:
                 report.update(ok=False, summary=data.get("summary", "终端入口检查未通过"))
         elif options.command == "configure":
             existing = load_config(config_path) if config_path.exists() else {}
+            if (options.expected_workspace is not None and
+                    options.expected_workspace != existing.get("workspace", "A")):
+                raise Blocked("设置窗口对应的工作区已改变，请刷新后再保存。")
             candidate = {**existing,
                 "schema": 1, "group": options.group, "policy": options.policy,
                 "expected_ip": options.expected_ip, "proxy_url": options.proxy_url,
@@ -522,17 +674,19 @@ def main(argv: list[str] | None = None) -> int:
                     candidate[key] = getattr(options, key)
             if options.privacy_strict is not None:
                 candidate["privacy_strict"] = options.privacy_strict == "true"
-            config = save_config(config_path, candidate)
+            config = workspaces.save_settings(config_path, candidate)
             report = {"schema": 1, "ok": True, "summary": "配置已保存，尚未检查",
                       "checked_at": now(), "checks": [], "settings": config}
         else:
             config = load_config(config_path)
+            migrate_accounts(config_path, config)
             if options.command == "browser-locks":
                 # A stale GUI response must never target a newly selected workspace.
                 if options.workspace != config["workspace"]:
                     raise Blocked("当前工作区已变更，请刷新后检查当前工作区的浏览器锁。")
                 from . import browser_locks
-                recovery = browser_locks.repair(config_path, options.workspace)
+                recover = browser_locks.recover if options.action == "recover" else browser_locks.repair
+                recovery = recover(config_path, options.workspace)
                 report = command_result(recovery["message"], config, recovery=recovery)
             elif options.command == "workspace":
                 name = options.name or config["workspace"]
@@ -540,29 +694,63 @@ def main(argv: list[str] | None = None) -> int:
                 if options.action == "create":
                     workspaces.create(config_path, name, options.label)
                 elif options.action == "use":
-                    config = workspaces.use(config_path, config, name)
+                    from . import sessions, workspace_routes
+                    config = workspaces.use(
+                        config_path, config, name,
+                        stop_sessions=sessions.stop_workspace if options.close_sessions else None,
+                        apply_route=lambda old, target: workspace_routes.activate(config_path, old, target))
                 elif options.action == "snapshot":
                     extra["snapshot"] = workspaces.snapshot(config_path, name, options.label)
                 elif options.action == "restore":
                     if not options.snapshot:
                         raise Blocked("请选择快照编号后再恢复。")
                     extra.update(workspaces.restore(config_path, name, options.snapshot))
-                report = command_result("工作区操作完成", config, **workspaces.listing(config_path, config), **extra)
+                report = command_result("工作区操作完成；网页和 CLI 的下一次启动使用当前账号环境", config,
+                                        **workspace_inventory(config_path, config), **extra)
+            elif options.command == "workspace-auth":
+                name = workspaces.name_ok(options.workspace)
+                if options.action == "store" and not options.stdin:
+                    raise Blocked("Token 只能从安全输入读取，不能放入命令参数。")
+                with workspaces.account_switch(config_path):
+                    workspaces.assert_current(config_path, config)
+                    # Inactive accounts may be configured; live sessions must
+                    # finish before their credential reference can change.
+                    if options.action != "status":
+                        with workspaces.exclusive(config_path, name):
+                            if options.action == "store":
+                                raw = sys.stdin.buffer.read(keychain_auth.MAX_TOKEN + 3)
+                                try:
+                                    token = raw.decode("ascii").rstrip("\r\n")
+                                except UnicodeError:
+                                    raise Blocked("Token 格式不正确，未保存。") from None
+                                keychain_auth.store_token(config_path, name, token)
+                                del token, raw
+                            else:
+                                keychain_auth.configure_oauth(config_path, name)
+                report = command_result("工作区登录方式已更新；没有发起登录或授权" if options.action != "status"
+                                        else "工作区登录方式", config,
+                                        **workspace_inventory(config_path, config))
             elif options.command == "repair-plan":
                 planned = repair.public_plan(repair.plan(config))
                 summary = ("请核对修复计划后确认" if planned["actions"]
                            else "Claude 策略组、域名规则和出站模式无需修复；其他隐私项目请查看完整检查。")
                 report = command_result(summary, config, **planned)
             elif options.command == "repair":
-                applied = repair.apply(config, config_path, options.plan_id)
+                with workspaces.account_switch(config_path):
+                    workspaces.assert_current(config_path, config)
+                    applied = repair.apply(config, config_path, options.plan_id)
                 report = command_result(applied.pop("summary"), config, **applied)
             elif options.command == "guard-status":
                 report = guard_status(config, config_path)
             elif options.command == "pin":
-                Surge().pin(config)
-                report = full_checks(config)
+                with workspaces.account_switch(config_path):
+                    workspaces.assert_current(config_path, config)
+                    Surge().pin(config)
+                    report = full_checks(config)
             elif options.command == "launch":
-                report = launch(config, config_path, options.target, options.terminal, arguments)
+                with workspaces.account_session(config_path, config) as release:
+                    report = launch(config, config_path, options.target, options.terminal, arguments,
+                                    startup_release=release)
             else:
                 report = full_checks(config)
         if not (getattr(options, "passthrough", False) and report.get("launched") and report.get("ok")):
@@ -577,10 +765,11 @@ def main(argv: list[str] | None = None) -> int:
         error_workspace = (getattr(options, "name", None) or current_workspace
                            if options.command == "workspace" else current_workspace)
         if isinstance(exc, BrowserProfileBusy) and error_workspace == current_workspace:
-            report["recovery_action"] = "repair-browser-locks"
+            report["recovery_action"] = "recover-browser"
         elif (options.command == "browser-locks" and config and
               options.workspace == current_workspace):
-            report["recovery_action"] = "repair-browser-locks"
+            report["recovery_action"] = ("recover-browser" if options.action == "recover"
+                                         else "repair-browser-locks")
         emit(report)
         return 2
     except (OSError, ValueError, TypeError, KeyError):

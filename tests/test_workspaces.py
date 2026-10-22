@@ -118,10 +118,10 @@ class WorkspaceTests(unittest.TestCase):
         expected["webrtc"]["ip_handling_policy"] = "disable_non_proxied_udp"
         expected["webrtc"]["ip_handling_url"] = []
         for profile, prepare in ((loc["browser"], ws.prepare_browser_language),
-                                 (loc["data"] / "OAuthBrowser", ws.prepare_oauth_browser)):
+                                 (loc["browser"], ws.prepare_oauth_browser)):
             with self.subTest(profile=profile.name):
                 prefs = profile / "Default/Preferences"
-                prefs.parent.mkdir(parents=True)
+                prefs.parent.mkdir(parents=True, exist_ok=True)
                 prefs.write_text(json.dumps(original))
                 prepare(self.path, dict(config(), workspace="A", browser_language=""))
                 self.assertEqual(json.loads(prefs.read_text()), expected)
@@ -137,10 +137,10 @@ class WorkspaceTests(unittest.TestCase):
         expected["intl"].update(accept_languages="en-US", selected_languages="en-US")
         expected["webrtc"] = {"ip_handling_policy": "disable_non_proxied_udp", "ip_handling_url": []}
         for profile, prepare in ((loc["browser"], ws.prepare_browser_language),
-                                 (loc["data"] / "OAuthBrowser", ws.prepare_oauth_browser)):
+                                 (loc["browser"], ws.prepare_oauth_browser)):
             with self.subTest(profile=profile.name):
                 prefs = profile / "Default/Preferences"
-                prefs.parent.mkdir(parents=True)
+                prefs.parent.mkdir(parents=True, exist_ok=True)
                 prefs.write_text(json.dumps(original))
                 prepare(self.path, dict(config(), workspace="A", browser_language="en-US"))
                 self.assertEqual(json.loads(prefs.read_text()), expected)
@@ -156,10 +156,10 @@ class WorkspaceTests(unittest.TestCase):
                     ws.prepare_browser_language(self.path, dict(config(), workspace="A"))
                 self.assertEqual(prefs.read_text(), content)
 
-    def test_no_language_still_obeys_running_workspace_lock(self):
+    def test_no_language_still_obeys_exclusive_workspace_lock(self):
         loc = ws.paths(self.path, "A")
         with loc["lock"].open("a") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             with self.assertRaises(Blocked):
                 ws.prepare_browser_language(self.path, dict(config(), workspace="A", browser_language=""))
         self.assertFalse((loc["browser"] / "Default/Preferences").exists())
@@ -170,20 +170,67 @@ class WorkspaceTests(unittest.TestCase):
         with loc["lock"].open("a") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
             profile = ws.prepare_oauth_browser(self.path, dict(config(), workspace="A"))
-        self.assertEqual(profile, loc["data"] / "OAuthBrowser")
+        self.assertEqual(profile, loc["browser"])
+        self.assertFalse((loc["data"] / "OAuthBrowser").exists())
         self.assertEqual(json.loads((profile / "Default/Preferences").read_text())["webrtc"],
                          {"ip_handling_policy": "disable_non_proxied_udp", "ip_handling_url": []})
         self.assertEqual((loc["browser"] / "existing-web-data").read_text(), "preserved")
 
     def test_oauth_profile_never_reuses_unknown_running_instance(self):
         loc = ws.paths(self.path, "A")
-        oauth = loc["data"] / "OAuthBrowser"
-        oauth.mkdir()
+        oauth = loc["browser"]
         (oauth / "SingletonLock").symlink_to("unknown-123")
         with self.assertRaises(Blocked):
             ws.prepare_oauth_browser(self.path, dict(config(), workspace="A"))
         with self.assertRaises(Blocked):
             ws.snapshot(self.path, "A")
+
+    def test_both_entry_points_preserve_canonical_login_data_and_legacy_profile(self):
+        loc = ws.paths(self.path, "A")
+        default = loc["browser"] / "Default"
+        default.mkdir()
+        cookie = default / "Cookies"
+        cookie.write_bytes(b"opaque login data; never copied or interpreted")
+        prefs = default / "Preferences"
+        prefs.write_text(json.dumps({"profile": {"name": "signed-in profile"},
+                                     "account_info": [{"email": "fixture@example.test"}]}))
+        local_state = loc["browser"] / "Local State"
+        local_state.write_text('{"profile":{"last_used":"Profile 1"}}')
+        legacy = loc["data"] / "OAuthBrowser"
+        legacy.mkdir()
+        (legacy / "untouched").write_text("legacy data")
+        before_cookie, before_state = cookie.read_bytes(), local_state.read_bytes()
+        for prepare in (ws.prepare_browser_language, ws.prepare_oauth_browser):
+            prepare(self.path, dict(config(), workspace="A", browser_language="en-US"))
+            self.assertEqual(cookie.read_bytes(), before_cookie)
+            self.assertEqual(local_state.read_bytes(), before_state)
+            self.assertEqual(json.loads(prefs.read_text())["account_info"],
+                             [{"email": "fixture@example.test"}])
+            self.assertEqual((legacy / "untouched").read_text(), "legacy data")
+
+    def test_browser_lease_excludes_web_oauth_and_snapshot_until_release(self):
+        loc = ws.paths(self.path, "A")
+        settings = dict(config(), workspace="A")
+        with ws.browser_session(loc["root"], settings) as profile:
+            self.assertEqual(profile, loc["browser"])
+            self.assertEqual((loc["root"] / ".browser.lock").stat().st_mode & 0o777, 0o600)
+            for prepare in (ws.prepare_browser_language, ws.prepare_oauth_browser):
+                with self.assertRaisesRegex(Blocked, "关闭专用窗口"):
+                    prepare(self.path, settings)
+            with self.assertRaises(Blocked):
+                ws.snapshot(self.path, "A")
+        self.assertEqual(ws.prepare_oauth_browser(self.path, settings), loc["browser"])
+
+    def test_failed_preferences_release_browser_lease_without_overwriting_data(self):
+        loc = ws.paths(self.path, "A")
+        prefs = loc["browser"] / "Default/Preferences"
+        prefs.parent.mkdir()
+        prefs.write_text("not JSON")
+        with self.assertRaises(Blocked):
+            ws.prepare_oauth_browser(self.path, dict(config(), workspace="A"))
+        self.assertEqual(prefs.read_text(), "not JSON")
+        with (loc["root"] / ".browser.lock").open("r+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 if __name__ == "__main__":

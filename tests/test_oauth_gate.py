@@ -56,6 +56,29 @@ class OAuthGateTests(unittest.TestCase):
             self.assertFalse(cli.oauth_checks(self.settings())["ok"])
         proxy.assert_not_called()
 
+    def test_global_full_gate_skips_fixed_exit_probe(self):
+        from test_cli import suspended_report
+        report = suspended_report()
+        with patch.object(cli, "full_checks", return_value=report), \
+                patch.object(oauth_gate, "verify_proxy_exit") as proxy:
+            self.assertEqual(cli.oauth_checks(self.settings()), report)
+        proxy.assert_not_called()
+
+    def test_rule_to_global_during_probe_is_recognized_by_fresh_report(self):
+        from test_cli import suspended_report
+        report = suspended_report()
+        with patch.object(cli, "full_checks", return_value={"ok": True}), \
+                patch.object(oauth_gate, "verify_proxy_exit", side_effect=Blocked("route changed")), \
+                patch.object(cli, "run_checks", return_value=report):
+            self.assertEqual(cli.oauth_checks(self.settings()), report)
+
+    def test_failed_probe_without_explicit_global_report_still_blocks(self):
+        with patch.object(cli, "full_checks", return_value={"ok": True}), \
+                patch.object(oauth_gate, "verify_proxy_exit", side_effect=Blocked("route changed")), \
+                patch.object(cli, "run_checks", return_value={"ok": False, "paused": True}), \
+                self.assertRaises(Blocked):
+            cli.oauth_checks(self.settings())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -159,6 +159,9 @@ try:
             if b"\\n" in chunk:
                 break
         result = json.loads(data)
+        if isinstance(result, dict) and result.get("error") == "browser-busy":
+            sys.stderr.write("Surge CC 的专用网页或授权窗口正在使用同一份登录资料。请关闭专用窗口后重试；不会改用空白资料或个人 Chrome。\\n")
+            sys.exit(2)
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise ValueError()
 except Exception:
@@ -171,11 +174,13 @@ sys.exit(0)
 class OAuthSession:
     """One local CLI owns this broker and every browser process it launches."""
 
-    def __init__(self, config: dict, config_path: Path, *, checker=None, popen=subprocess.Popen):
+    def __init__(self, config: dict, config_path: Path, *, checker=None, popen=subprocess.Popen,
+                 allow_authorization: bool = True):
         self.config = dict(config)
         self.config_path = Path(config_path).absolute()
         self.checker = checker
         self.popen = popen
+        self.allow_authorization = allow_authorization
         self.child = None
         self.browser = None
         self.browser_hook = None
@@ -183,6 +188,7 @@ class OAuthSession:
         self._socket = None
         self._thread = None
         self._profile_lock = None
+        self._profile = None
         self._locks = None
         self._token = secrets.token_urlsafe(32)
         self._closing = threading.Event()
@@ -232,7 +238,8 @@ class OAuthSession:
         if not self._live():
             raise Blocked("授权会话已结束，未打开浏览器。")
         report = self.checker(self.config)
-        if (not isinstance(report, dict) or report.get("ok") is not True or not self._live()):
+        if (not isinstance(report, dict) or
+                (report.get("ok") is not True and not core.global_mode_allowed(report)) or not self._live()):
             raise Blocked("授权前线路检查未通过，未使用其他浏览器。")
 
     def _lock_profile(self):
@@ -252,8 +259,13 @@ class OAuthSession:
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
                 raise Blocked("授权浏览器锁文件异常。")
             os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise BrowserProfileBusy("专用授权窗口正在使用登录资料。请关闭专用窗口后重试。") from None
+            profile = locks.enter_context(workspaces.browser_session(root, self.config))
             self._profile_lock = fd
+            self._profile = profile
             self._locks = locks
         except BaseException:
             locks.close()
@@ -262,6 +274,7 @@ class OAuthSession:
     def _release_profile(self):
         locks, self._locks = self._locks, None
         self._profile_lock = None
+        self._profile = None
         if locks is not None:
             locks.close()
 
@@ -275,6 +288,8 @@ class OAuthSession:
             self._release_profile()
 
     def _open_authorization(self, value: str):
+        if self.allow_authorization is not True:
+            raise Blocked("当前使用钥匙串长效 Token；网页授权已停用，请先显式切回 OAuth 登录模式。")
         authorization = validate_authorization_url(value)
         started = None
         try:
@@ -286,7 +301,7 @@ class OAuthSession:
                     raise Blocked("授权会话已结束。")
                 self._stop_browser(release=False)
                 self._lock_profile()
-                profile = workspaces.prepare_oauth_browser(self.config_path, self.config)
+                profile = self._profile
                 if profile.is_symlink():
                     raise Blocked("专用授权资料目录异常，未启动浏览器。")
                 if os.path.lexists(profile / "SingletonLock"):
@@ -330,6 +345,7 @@ class OAuthSession:
                 break
             with connection:
                 ok = False
+                error = None
                 try:
                     connection.settimeout(5)
                     message = _read_message(connection)
@@ -341,11 +357,18 @@ class OAuthSession:
                         raise ValueError("Not ready")
                     self._open_authorization(message["url"])
                     ok = True
+                except BrowserProfileBusy:
+                    # A fixed error code is actionable without disclosing any
+                    # URL, account, token, process argument or raw exception.
+                    error = "browser-busy"
                 except Exception:
                     # Do not return exception text: it may contain the OAuth URL.
                     pass
                 try:
-                    connection.sendall(json.dumps({"ok": ok}).encode() + b"\n")
+                    response = {"ok": ok}
+                    if error is not None:
+                        response["error"] = error
+                    connection.sendall(json.dumps(response).encode() + b"\n")
                 except OSError:
                     pass
 
