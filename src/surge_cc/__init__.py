@@ -1,3 +1,3 @@
 """Surge CC: checked launches for Claude Code and the web."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

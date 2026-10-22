@@ -362,6 +362,15 @@ def environment(project: Project, proxy: str, inherited: dict | None = None, *, 
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_ATTR_NOSYSTEM": "1",
     })
+    from . import shared_history
+    if shared_history.enabled(project):
+        # The native, documented override keeps the picker on this project's
+        # account-scoped transcript bucket, independent of the Orca worktree.
+        base["CLAUDE_CODE_PROJECT_DIR_NAME"] = shared_history.bucket(project)
+    from . import messaging
+    peers = messaging.prepare_scope(project)
+    if peers is not None:
+        base["XDG_RUNTIME_DIR"] = str(peers.runtime)
     from . import isolated_auth
     shared_auth = None if token_auth else isolated_auth.prepare(project)
     if token_auth:
@@ -383,22 +392,49 @@ def environment(project: Project, proxy: str, inherited: dict | None = None, *, 
     return proxy_env(proxy, base=base)
 
 
-def arguments(values: list[str], *, theme: str | None = None) -> list[str]:
+def arguments(values: list[str], *, theme: str | None = None,
+              memory_directory: Path | None = None, local_messaging: bool = False,
+              default_model: str = "", default_effort: str = "") -> list[str]:
     # Custom integrations may read outside the copy using an unsandboxed host.
     # Re-enable integrations only after a separate boundary review.
     forbidden = {"--settings", "--setting-sources", "--mcp-config", "--plugin-dir",
                  "--plugin-url", "--chrome", "--ide", "--add-dir", "--worktree", "-w"}
     if any(v.split("=", 1)[0] in forbidden for v in values):
         raise Blocked("隔离项目暂不允许额外设置、目录、插件、MCP 或 IDE/Chrome 集成。")
+    # Native user/project settings remain disabled at this boundary. Supply
+    # the requested startup defaults here instead of inheriting a mutable
+    # settings file or a higher-priority effort environment variable. Native
+    # --model/--effort flags and in-session choices can still override them.
     settings = {"disableAllHooks": True, "remoteControlAtStartup": False,
                 "forceLoginMethod": "claudeai"}
+    if default_model:
+        settings["model"] = default_model
+    if default_effort:
+        settings["effortLevel"] = default_effort
     if theme is not None:
         from .isolated_preferences import THEMES
         if theme not in THEMES:
             raise Blocked("隔离终端主题不受支持。")
         settings["theme"] = theme
+    if memory_directory is not None:
+        settings["autoMemoryDirectory"] = str(memory_directory)
+    if local_messaging:
+        # This grant is for local Unix sockets only. Native cross-machine
+        # messaging must never silently inherit the local approval scope.
+        settings["isolatePeerMachines"] = True
+        settings["disableRemoteControl"] = True
+        settings["autoUploadSessions"] = False
     return ["--setting-sources", "", "--settings", json.dumps(settings),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", *values]
+
+
+def private_memory(project: Project) -> Path:
+    # Preserve the native repository-memory location within this HOME. Long
+    # path hashing is native-version-specific, so keep a private fallback there.
+    name = re.sub(r"[^A-Za-z0-9]", "-", str(project.registered_root))
+    if len(name) <= 200:
+        return project.config / "projects" / name / "memory"
+    return project.config / "isolated-memory"
 
 
 def _q(value: Path | str) -> str:
@@ -406,7 +442,7 @@ def _q(value: Path | str) -> str:
 
 
 def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path | None = None,
-            token_auth: bool = False) -> str:
+            token_auth: bool = False, terminal_device: Path | None = None) -> str:
     hook = browser_hook.resolve()
     if hook.parent.parent != Path("/private/tmp") or not hook.parent.name.startswith("surge-cc-oauth-"):
         raise Blocked("授权桥目录不符合隔离要求。")
@@ -455,15 +491,47 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
             metadata.update(path.parents)
         git_writes = "(allow file-read* file-write* " + " ".join(
             "(literal " + _q(path) + ")" for path in writable) + ")\n"
+    from . import shared_history
+    history = shared_history.history(project)
+    history_rules = ""
+    if history is not None:
+        metadata.update(history.parents)
+        history_rules = "(allow file-read* file-write* (subpath " + _q(history) + "))\n"
+        # Only conversations are shared. Native automatic memory stays in the
+        # current HOME even though the transcript bucket is common.
+        history_rules += "(deny file-read* file-write* (subpath " + _q(history / "memory") + "))\n"
+    from . import messaging
+    peers = messaging.scope(project)
+    peer_rules = ""
+    if peers is not None:
+        metadata.update(peers.sockets.parents)
+        peer_rules = (
+            f"(allow file-read* file-write* (subpath {_q(peers.sockets)}) (subpath {_q(peers.sessions)}))\n"
+            f"(allow network-bind network-inbound network-outbound (subpath {_q(peers.sockets)}))\n"
+        )
     reads = "\n".join("  (subpath " + _q(p) + ")" for p in read_dirs)
     reads += "\n" + "\n".join("  (literal " + _q(p) + ")" for p in read_files)
     metas = "\n".join("  (literal " + _q(p) + ")" for p in sorted(metadata))
     terminals = {"/dev/tty"}
-    for fd in (0, 1, 2):
+    if terminal_device is not None:
+        # With a trusted paste bridge, the child must not reopen the outer
+        # Orca terminal and inject input into (or bypass) that bridge.
+        terminal_device = Path(terminal_device)
         try:
-            terminals.add(os.ttyname(fd))
-        except OSError:
-            pass
+            info = terminal_device.lstat()
+            if (not re.fullmatch(r"/dev/ttys[0-9A-Za-z]{3,6}", str(terminal_device))
+                    or terminal_device.resolve() != terminal_device
+                    or not stat.S_ISCHR(info.st_mode) or info.st_uid != os.getuid()):
+                raise ValueError("invalid child terminal")
+        except (OSError, ValueError):
+            raise Blocked("截图导入终端无法验证，已阻止隔离程序启动。") from None
+        terminals.add(str(terminal_device))
+    else:
+        for fd in (0, 1, 2):
+            try:
+                terminals.add(os.ttyname(fd))
+            except OSError:
+                pass
     tty_rules = " ".join("(literal " + _q(p) + ")" for p in sorted(terminals))
     # Do NOT allow all /System: /System/Volumes/Data aliases user data on APFS.
     # No Mach services, AppleEvents, securityd, global Unix sockets, DNS or UDP.
@@ -481,7 +549,7 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
 (allow file-read-metadata
 {metas})
 (allow file-read* file-write* (subpath {_q(project.root)}) (subpath {_q(project.home)}))
-{git_writes}{auth_writes}(allow file-write-data (literal "/dev/null"))
+{git_writes}{auth_writes}{history_rules}{peer_rules}(allow file-write-data (literal "/dev/null"))
 (allow file-read* file-write-data file-ioctl {tty_rules})
 (allow network-outbound (remote tcp "localhost:62919"))
 (allow network-outbound (literal {_q(hook.parent / 's')}))
@@ -490,7 +558,8 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
 
 
 def command(project: Project, native: Path, values: list[str], browser_hook: Path, *,
-            token_auth: bool = False) -> list[str]:
+            token_auth: bool = False, terminal_device: Path | None = None,
+            default_model: str = "", default_effort: str = "") -> list[str]:
     if not SANDBOX.is_file():
         raise Blocked("本机缺少文件沙箱，已阻止隔离项目启动。")
     arguments(values)  # Validate before creating or changing runtime state.
@@ -514,13 +583,19 @@ def command(project: Project, native: Path, values: list[str], browser_hook: Pat
             clean_path(project.root)
     except (OSError, ValueError, TypeError):
         raise Blocked("隔离 HOME 或 Git worktree 关联已变更或权限不安全，已阻止启动。") from None
-    from . import isolated_preferences, isolated_trust
+    from . import isolated_preferences, isolated_trust, shared_history, messaging
     isolated_preferences.prepare(project)
     # Trust is a separate, exact-project opt-in. Apply only after the repeated
     # worktree linkage checks; it never changes the Seatbelt or proxy policy.
     isolated_trust.prepare(project)
-    args = arguments(values, theme=isolated_preferences.theme(project))
-    return [str(SANDBOX), "-p", profile(project, native, browser_hook, token_auth=token_auth), str(native), *args]
+    history = shared_history.prepare(project)
+    peers = messaging.prepare(project)
+    args = arguments(values, theme=isolated_preferences.theme(project),
+                     memory_directory=private_memory(project) if history is not None else None,
+                     local_messaging=peers is not None,
+                     default_model=default_model, default_effort=default_effort)
+    return [str(SANDBOX), "-p", profile(project, native, browser_hook, token_auth=token_auth,
+                                      terminal_device=terminal_device), str(native), *args]
 
 
 def diagnose(project: Project, native: Path, config: dict, config_path: Path, *, token_auth: bool = False) -> dict:

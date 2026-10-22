@@ -53,7 +53,7 @@ private struct Settings: Codable, Equatable, Sendable {
     var group = ""
     var policy = ""
     var expected_ip = ""
-    var proxy_url = "http://127.0.0.1:6152"
+    var proxy_url = "http://127.0.0.1:62919"
     var profile_path = ""
     var expected_timezone = ""
     var expected_locale = ""
@@ -61,12 +61,15 @@ private struct Settings: Codable, Equatable, Sendable {
     var expected_asn = ""
     var browser_language = ""
     var browser_path = ""
+    var default_model = ""
+    var default_effort = ""
+    var browser_start_page = "claude"
     var workspace = "A"
     var privacy_strict = true
     var guard_interval = 10
 
     init(group: String = "", policy: String = "", expected_ip: String = "",
-         proxy_url: String = "http://127.0.0.1:6152", profile_path: String = "") {
+         proxy_url: String = "http://127.0.0.1:62919", profile_path: String = "") {
         self.group = group
         self.policy = policy
         self.expected_ip = expected_ip
@@ -78,6 +81,7 @@ private struct Settings: Codable, Equatable, Sendable {
         case group, policy, expected_ip, proxy_url, profile_path
         case expected_timezone, expected_locale, expected_country, expected_asn
         case browser_language, browser_path, privacy_strict, guard_interval, workspace
+        case default_model, default_effort, browser_start_page
     }
 
     init(from decoder: Decoder) throws {
@@ -86,7 +90,7 @@ private struct Settings: Codable, Equatable, Sendable {
         group = try container.decodeIfPresent(String.self, forKey: .group) ?? ""
         policy = try container.decodeIfPresent(String.self, forKey: .policy) ?? ""
         expected_ip = try container.decodeIfPresent(String.self, forKey: .expected_ip) ?? ""
-        proxy_url = try container.decodeIfPresent(String.self, forKey: .proxy_url) ?? "http://127.0.0.1:6152"
+        proxy_url = try container.decodeIfPresent(String.self, forKey: .proxy_url) ?? "http://127.0.0.1:62919"
         profile_path = try container.decodeIfPresent(String.self, forKey: .profile_path) ?? ""
         expected_timezone = try container.decodeIfPresent(String.self, forKey: .expected_timezone) ?? ""
         expected_locale = try container.decodeIfPresent(String.self, forKey: .expected_locale) ?? ""
@@ -94,6 +98,9 @@ private struct Settings: Codable, Equatable, Sendable {
         expected_asn = try container.decodeIfPresent(String.self, forKey: .expected_asn) ?? ""
         browser_language = try container.decodeIfPresent(String.self, forKey: .browser_language) ?? ""
         browser_path = try container.decodeIfPresent(String.self, forKey: .browser_path) ?? ""
+        default_model = try container.decodeIfPresent(String.self, forKey: .default_model) ?? ""
+        default_effort = try container.decodeIfPresent(String.self, forKey: .default_effort) ?? ""
+        browser_start_page = try container.decodeIfPresent(String.self, forKey: .browser_start_page) ?? "claude"
         workspace = try container.decodeIfPresent(String.self, forKey: .workspace) ?? "A"
         privacy_strict = try container.decodeIfPresent(Bool.self, forKey: .privacy_strict) ?? true
         guard_interval = try container.decodeIfPresent(Int.self, forKey: .guard_interval) ?? 10
@@ -408,9 +415,25 @@ private enum Backend {
         guard let script = scriptURL() else {
             return CommandResult(response: nil, exitCode: 1, error: "找不到配套程序，请重新构建或安装 Surge CC。")
         }
-        let candidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
-        guard let python = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) else {
-            return CommandResult(response: nil, exitCode: 1, error: "未找到 Python 3，暂时无法执行检查。")
+        let candidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3",
+                          "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/Current/bin/python3",
+                          "/Library/Developer/CommandLineTools/usr/bin/python3"]
+        guard let python = candidates.first(where: { path in
+            guard FileManager.default.isExecutableFile(atPath: path) else { return false }
+            let probe = Process()
+            probe.executableURL = URL(fileURLWithPath: path)
+            probe.arguments = ["-I", "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"]
+            probe.standardInput = FileHandle.nullDevice
+            probe.standardOutput = FileHandle.nullDevice
+            probe.standardError = FileHandle.nullDevice
+            let timeout = DispatchWorkItem { if probe.isRunning { probe.terminate() } }
+            do { try probe.run() } catch { return false }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: timeout)
+            probe.waitUntilExit()
+            timeout.cancel()
+            return probe.terminationStatus == 0
+        }) else {
+            return CommandResult(response: nil, exitCode: 1, error: "需要 Python 3.9 或更新版本；请运行配置向导检查依赖。")
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
@@ -899,6 +922,9 @@ private final class ViewModel: ObservableObject {
                  "--expected-country", cleaned.expected_country.trimmingCharacters(in: .whitespacesAndNewlines),
                  "--expected-asn", cleaned.expected_asn.trimmingCharacters(in: .whitespacesAndNewlines),
                  "--browser-language", cleaned.browser_language.trimmingCharacters(in: .whitespacesAndNewlines),
+                 "--default-model", cleaned.default_model.trimmingCharacters(in: .whitespacesAndNewlines),
+                 "--default-effort", cleaned.default_effort,
+                 "--browser-start-page", cleaned.browser_start_page,
                  "--privacy-strict", cleaned.privacy_strict ? "true" : "false",
                  "--guard-interval", String(cleaned.guard_interval), "--json"]
         perform(args, message: "正在保存配置…", operation: .configure)
@@ -916,6 +942,30 @@ private final class ViewModel: ObservableObject {
 }
 
 private struct ContentView: View {
+    private func openSetupWizard() {
+        guard let backend = Backend.scriptURL() else { return }
+        let script = backend.deletingLastPathComponent().appendingPathComponent("first-run.sh")
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: script.path) else { return }
+        let folder = Backend.configURL.deletingLastPathComponent().appendingPathComponent("launchers")
+        let command = folder.appendingPathComponent("Setup-\(UUID().uuidString).command")
+        func quoted(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let content = "#!/bin/bash\n/bin/bash \(quoted(script.path)) --config \(quoted(Backend.configURL.path))\n"
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            try content.write(to: command, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: command.path)
+            NSWorkspace.shared.open([command],
+                withApplicationAt: URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"),
+                configuration: NSWorkspace.OpenConfiguration())
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "配置向导未启动"
+            alert.informativeText = "无法写入启动入口。可按 README 从终端运行 first-run.sh。"
+            alert.runModal()
+        }
+    }
     @StateObject private var vm = ViewModel()
 
     var body: some View {
@@ -932,6 +982,9 @@ private struct ContentView: View {
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("配置向导") { openSetupWizard() }
+                    .help("检查依赖、专用浏览器、终端、项目隔离与 Dock 入口")
+                    .disabled(vm.busy)
                 Button { vm.openSettings() } label: {
                     Image(systemName: "slider.horizontal.3")
                 }
@@ -1001,7 +1054,7 @@ private struct ContentView: View {
 
             HStack {
                 Button { vm.launchWeb() } label: {
-                    Label("打开 Claude 网页", systemImage: "globe")
+                    Label("打开专用浏览器", systemImage: "globe")
                         .frame(maxWidth: .infinity)
                 }
                 Button { vm.launchCode() } label: {
@@ -1335,7 +1388,7 @@ private struct SettingsView: View {
                         Button("选择…") { chooseProfile() }
                     }
                     Text(vm.draft.browser_path.isEmpty
-                         ? "本地代理地址通常类似 http://127.0.0.1:6152，请以 Surge 当前设置为准。"
+                         ? "首次安装请运行配置向导；文件隔离使用专用端口 62919。"
                          : "已使用独立浏览器与专用代理端口。请保留此入口；改为普通代理端口会使隔离检查失败。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -1360,8 +1413,25 @@ private struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(18).tabItem { Text("隐私与保护") }.tag(2)
+                Form {
+                    TextField("默认模型（如 opus 或精确模型 ID）", text: $vm.draft.default_model)
+                    Picker("默认 Effort", selection: $vm.draft.default_effort) {
+                        Text("使用 Claude 默认值").tag("")
+                        Text("Low").tag("low")
+                        Text("Medium").tag("medium")
+                        Text("High").tag("high")
+                        Text("Max").tag("max")
+                    }
+                    Picker("浏览器启动页", selection: $vm.draft.browser_start_page) {
+                        Text("Claude").tag("claude")
+                        Text("新标签页").tag("newtab")
+                    }
+                    Text("只影响新启动会话。模型留空时使用原生默认值；显式 --model / --effort 优先。模型可用性与费用由账号决定。OAuth 仍打开本次授权地址。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(18).tabItem { Text("启动偏好") }.tag(3)
             }
-            .frame(height: 280)
+            .frame(height: 320)
             .textFieldStyle(.roundedBorder)
             .disabled(vm.busy)
             if !vm.settingsError.isEmpty {

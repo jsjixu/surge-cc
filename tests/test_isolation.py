@@ -159,7 +159,9 @@ class EnvironmentAndArgumentsTests(IsolationFixture):
             "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "AWS_SECRET_ACCESS_KEY",
             "GOOGLE_APPLICATION_CREDENTIALS", "GH_TOKEN", "SSH_AUTH_SOCK", "NODE_OPTIONS", "PYTHONPATH",
             "DYLD_INSERT_LIBRARIES", "ORCA_SOCKET", "GIT_CONFIG_COUNT", "HOME", "CLAUDE_CONFIG_DIR",
-            "PATH", "BROWSER", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")}
+            "PATH", "BROWSER", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "CLAUDE_CODE_EFFORT_LEVEL")}
         inherited.update(TERM="xterm-256color", COLORTERM="truecolor", NO_COLOR="1")
         before = dict(inherited)
         env = isolation.environment(self.project, "http://127.0.0.1:62919", inherited)
@@ -167,7 +169,9 @@ class EnvironmentAndArgumentsTests(IsolationFixture):
         self.assertNotIn("SYNTHETIC-DO-NOT-INHERIT", env.values())
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "AWS_SECRET_ACCESS_KEY",
                     "GOOGLE_APPLICATION_CREDENTIALS", "GH_TOKEN", "SSH_AUTH_SOCK", "NODE_OPTIONS", "PYTHONPATH",
-                    "DYLD_INSERT_LIBRARIES", "ORCA_SOCKET", "GIT_CONFIG_COUNT", "BROWSER"):
+                    "DYLD_INSERT_LIBRARIES", "ORCA_SOCKET", "GIT_CONFIG_COUNT", "BROWSER",
+                    "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "CLAUDE_CODE_EFFORT_LEVEL"):
             self.assertNotIn(key, env)
         self.assertEqual(env["HOME"], str(self.home))
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / ".claude"))
@@ -211,6 +215,36 @@ class EnvironmentAndArgumentsTests(IsolationFixture):
         env = isolation.environment(self.project, "http://127.0.0.1:62919", {})
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.project.config))
 
+    def test_model_defaults_do_not_enable_native_settings_or_integrations(self):
+        result = isolation.arguments([], default_model="claude-opus-5-5", default_effort="high")
+        self.assertEqual(result[:2], ["--setting-sources", ""])
+        settings = json.loads(result[result.index("--settings") + 1])
+        self.assertEqual(settings, {
+            "disableAllHooks": True, "remoteControlAtStartup": False,
+            "forceLoginMethod": "claudeai", "model": "claude-opus-5-5",
+            "effortLevel": "high"})
+        # Defaults are settings, not competing CLI flags or environment
+        # overrides that could prevent the user's explicit session choice.
+        self.assertNotIn("--model", result)
+        self.assertNotIn("--effort", result)
+        self.assertIn("--strict-mcp-config", result)
+        self.assertIn("--no-chrome", result)
+
+    def test_explicit_model_and_effort_override_flags_survive_without_competitors(self):
+        for values in (["--model", "sonnet", "--effort", "medium"],
+                       ["--model=claude-sonnet-5-5", "--effort=low"],
+                       ["--continue", "--model", "opus", "--effort", "max"]):
+            with self.subTest(values=values):
+                result = isolation.arguments(values, default_model="claude-opus-5-5", default_effort="high")
+                self.assertEqual(result[-len(values):], values)
+                overrides = [value for value in result
+                             if value.split("=", 1)[0] in ("--model", "--effort")]
+                self.assertEqual(overrides, [value for value in values
+                                            if value.split("=", 1)[0] in ("--model", "--effort")])
+                settings = json.loads(result[result.index("--settings") + 1])
+                self.assertEqual(settings["model"], "claude-opus-5-5")
+                self.assertEqual(settings["effortLevel"], "high")
+
 
 class ProfileTests(IsolationFixture):
     def setUp(self):
@@ -245,6 +279,27 @@ class ProfileTests(IsolationFixture):
         self.assertNotIn('/dev/ttys[', policy)
         self.assertNotIn('(subpath "/dev")', policy)
         self.assertNotIn('(literal "/dev/ttys008")', policy)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS PTY policy")
+    def test_paste_terminal_grants_only_allocated_child_device(self):
+        master, slave = os.openpty()
+        try:
+            device = Path(os.ttyname(slave))
+            with patch.object(isolation.os, "ttyname", return_value="/dev/ttys999") as parent:
+                policy = isolation.profile(self.project, self.native, self.hook, terminal_device=device)
+            parent.assert_not_called()
+            self.assertIn('(literal ' + json.dumps(str(device)) + ')', policy)
+            self.assertNotIn('/dev/ttys999', policy)
+            self.assertNotIn('(subpath "/dev")', policy)
+            self.assertIn('(allow network-outbound (remote tcp "localhost:62919"))', policy)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_paste_terminal_rejects_arbitrary_file_or_missing_device(self):
+        for device in (self.native, Path('/dev/ttysnot-real')):
+            with self.subTest(device=device), self.assertRaises(core.Blocked):
+                isolation.profile(self.project, self.native, self.hook, terminal_device=device)
 
     def test_native_hook_and_probe_allowed_as_exact_files(self):
         probe = self.temp_root / "probe.py"
@@ -284,6 +339,183 @@ class ProfileTests(IsolationFixture):
         sandbox.write_text("not executed")
         with patch.object(isolation, "SANDBOX", sandbox), self.assertRaises(core.Blocked):
             isolation.command(self.project, self.native, [], self.hook)
+
+
+class SharedHistoryIsolationTests(IsolationFixture):
+    """Exercise real opt-in/binding across the isolation launch boundary."""
+
+    def setUp(self):
+        super().setUp()
+        from surge_cc import keychain_auth, shared_history
+        self.shared = shared_history
+        self.keychain = keychain_auth
+        self.write_registry()
+        self.home.parent.chmod(0o700)
+        self.select_account("A")
+        keychain_auth.migrate_legacy(self.config_path, "A")
+        self.bound = isolation.bind_workspace(self.project, self.config_path, "A")
+        self.native = self.temp_root / "native-claude"
+        self.native.write_text("never executed")
+        self.sandbox = self.temp_root / "sandbox-exec"
+        self.sandbox.write_text("never executed")
+        self.hook = Path("/private/tmp/surge-cc-oauth-shared-history/browser")
+        self.stack.enter_context(patch.object(isolation, "SANDBOX", self.sandbox))
+
+    def select_account(self, name):
+        self.config_path.write_text(json.dumps({"workspace": name}))
+        self.config_path.chmod(0o600)
+
+    def enable(self):
+        self.shared.initialize(self.bound)
+        marker = self.base / ".runtime" / self.shared.MARKER
+        marker.write_text(json.dumps({"schema": 1, "projects": [
+            {"id": "vv", "path": str(self.project_root)}]}))
+        marker.chmod(0o600)
+        return self.shared.history(self.bound)
+
+    def command(self, project=None, values=None):
+        return isolation.command(project or self.bound, self.native,
+                                 ["--resume"] if values is None else values,
+                                 self.hook, token_auth=True)
+
+    def linked(self, name):
+        """Create the exact local Git pointer metadata checked by admission."""
+        orca = self.temp_root / "orca" / "workspaces"
+        root = orca / "vv" / name
+        root.mkdir(parents=True)
+        self.stack.enter_context(patch.object(isolation, "ORCA_WORKSPACES", orca))
+        admin = self.project_root / ".git" / "worktrees" / name
+        admin.mkdir(parents=True)
+        (root / ".git").write_text("gitdir: " + str(admin) + "\n")
+        (admin / "commondir").write_text("../..\n")
+        (admin / "gitdir").write_text(str(root / ".git") + "\n")
+        (root / isolation.MARKER_NAME).write_text(json.dumps({
+            "schema": 1, "project": "vv", "requires_registered_launcher": True}))
+        discovered = isolation.for_cwd(self.config_path, root)
+        return isolation.bind_workspace(discovered, self.config_path, "A")
+
+    def test_opt_out_keeps_private_state_and_ignores_inherited_bucket_override(self):
+        env = isolation.environment(self.bound, "http://127.0.0.1:62919",
+                                    {"CLAUDE_CODE_PROJECT_DIR_NAME": "foreign"}, token_auth=True)
+        self.assertNotIn("CLAUDE_CODE_PROJECT_DIR_NAME", env)
+        self.assertEqual(env["HOME"], str(self.bound.home))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.bound.config))
+        command = self.command()
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertNotIn("autoMemoryDirectory", settings)
+        self.assertNotIn("conversation-history", command[2])
+        self.assertEqual(command[-1], "--resume")
+        self.assertFalse((self.bound.config / "projects" / self.shared.bucket(self.bound)).exists())
+
+    def test_enabled_bucket_does_not_replace_home_auth_or_proxy(self):
+        self.enable()
+        env = isolation.environment(self.bound, "http://127.0.0.1:62919",
+                                    {"CLAUDE_CODE_PROJECT_DIR_NAME": "foreign"}, token_auth=True)
+        self.assertEqual(env["CLAUDE_CODE_PROJECT_DIR_NAME"], self.shared.bucket(self.bound))
+        self.assertEqual(env["HOME"], str(self.bound.home))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.bound.config))
+        self.assertEqual(env["CLAUDE_CODE_TMPDIR"], str(self.bound.home / "tmp"))
+        self.assertEqual(env["CLAUDE_SECURESTORAGE_CONFIG_DIR"],
+                         str(self.bound.home / ".token-auth-disabled"))
+        self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:62919")
+        self.assertEqual(env["NO_PROXY"], "")
+
+    def test_command_links_conversations_but_keeps_existing_memory_private(self):
+        history = self.enable()
+        self.bound.config.mkdir(mode=0o700)
+        memory = isolation.private_memory(self.bound)
+        memory.mkdir(parents=True, mode=0o700)
+        existing = memory / "MEMORY.md"
+        existing.write_text("synthetic private project note\n")
+        command = self.command(values=["--resume", "synthetic-session", "--fork-session"])
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(settings["autoMemoryDirectory"], str(memory))
+        self.assertTrue(settings["disableAllHooks"])
+        self.assertFalse(settings["remoteControlAtStartup"])
+        self.assertEqual(existing.read_text(), "synthetic private project note\n")
+        link = self.bound.config / "projects" / self.shared.bucket(self.bound)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), history)
+        self.assertFalse(isolation.within(memory, history))
+        self.assertEqual(command[-3:], ["--resume", "synthetic-session", "--fork-session"])
+
+    def test_policy_grants_only_selected_history_data_not_management_or_other_scopes(self):
+        history = self.enable()
+        policy = self.command()[2]
+        self.assertIn('(allow file-read* file-write* (subpath ' + json.dumps(str(history)) + '))', policy)
+        self.assertIn('(deny file-read* file-write* (subpath ' + json.dumps(str(history / "memory")) + '))', policy)
+        other_account = history.parent.parent / "B" / "data"
+        other_project = self.base / ".runtime" / "inkclaw" / "conversation-history" / "A" / "data"
+        for path in (history.parent, history.parent.parent, self.base / ".runtime",
+                     other_account, other_project, Path.home() / ".claude"):
+            self.assertNotIn("(subpath " + json.dumps(str(path)) + ")", policy)
+        self.assertNotIn('(literal ' + json.dumps(str(history.parent / self.shared.RECEIPT)) + ')', policy)
+        self.assertIn('(allow network-outbound (remote tcp "localhost:62919"))', policy)
+        self.assertNotIn("(allow network-outbound)", policy)
+
+    def test_same_project_worktrees_share_bucket_but_not_home_memory_or_source_access(self):
+        history = self.enable()
+        first, second = self.linked("branch-one"), self.linked("branch-two")
+        first_command, second_command = self.command(first), self.command(second)
+        first_env = isolation.environment(first, "http://127.0.0.1:62919", {}, token_auth=True)
+        second_env = isolation.environment(second, "http://127.0.0.1:62919", {}, token_auth=True)
+        self.assertEqual(first_env["CLAUDE_CODE_PROJECT_DIR_NAME"], second_env["CLAUDE_CODE_PROJECT_DIR_NAME"])
+        self.assertNotEqual(first_env["HOME"], second_env["HOME"])
+        self.assertNotEqual(first_env["CLAUDE_CONFIG_DIR"], second_env["CLAUDE_CONFIG_DIR"])
+        self.assertNotEqual(isolation.private_memory(first), isolation.private_memory(second))
+        for project, other, command in ((first, second, first_command), (second, first, second_command)):
+            link = project.config / "projects" / self.shared.bucket(project)
+            self.assertEqual(link.resolve(), history)
+            settings = json.loads(command[command.index("--settings") + 1])
+            self.assertEqual(settings["autoMemoryDirectory"], str(isolation.private_memory(project)))
+            self.assertNotIn("(subpath " + json.dumps(str(other.root)) + ")", command[2])
+            self.assertNotIn("(subpath " + json.dumps(str(other.home)) + ")", command[2])
+
+    def test_account_switch_uses_a_separate_store_and_does_not_rebind_old_home(self):
+        history_a = self.enable()
+        self.command()
+        home_a = self.bound.home
+        self.select_account("B")
+        bound_b = isolation.bind_workspace(self.project, self.config_path, "B")
+        self.shared.initialize(bound_b)
+        history_b = self.shared.history(bound_b)
+        command_b = self.command(bound_b)
+        env_b = isolation.environment(bound_b, "http://127.0.0.1:62919", {}, token_auth=True)
+        self.assertNotEqual(history_a, history_b)
+        self.assertNotEqual(home_a, bound_b.home)
+        self.assertEqual(env_b["HOME"], str(bound_b.home))
+        self.assertEqual((bound_b.config / "projects" / self.shared.bucket(bound_b)).resolve(), history_b)
+        self.assertEqual((self.bound.config / "projects" / self.shared.bucket(self.bound)).resolve(), history_a)
+        self.assertNotIn("(subpath " + json.dumps(str(history_a)) + ")", command_b[2])
+        with self.assertRaises(core.Blocked):
+            self.command(self.bound)
+
+    def test_unlisted_registered_project_does_not_inherit_another_projects_history(self):
+        history = self.enable()
+        root = self.base / "projects" / "inkclaw"
+        home = self.base / ".runtime" / "inkclaw" / "home"
+        root.mkdir(mode=0o700)
+        home.mkdir(parents=True, mode=0o700)
+        home.parent.chmod(0o700)
+        self.data["projects"].append({"id": "inkclaw", "path": str(root), "home": str(home)})
+        self.write_registry()
+        other = isolation.bind_workspace(isolation.for_cwd(self.config_path, root), self.config_path, "A")
+        env = isolation.environment(other, "http://127.0.0.1:62919", {}, token_auth=True)
+        command = self.command(other)
+        self.assertNotIn("CLAUDE_CODE_PROJECT_DIR_NAME", env)
+        self.assertNotIn("autoMemoryDirectory", json.loads(command[command.index("--settings") + 1]))
+        self.assertNotIn("(subpath " + json.dumps(str(history)) + ")", command[2])
+        self.assertNotIn("conversation-history", command[2])
+
+    def test_uninitialized_enabled_store_blocks_instead_of_falling_back_to_private_history(self):
+        marker = self.base / ".runtime" / self.shared.MARKER
+        marker.write_text(json.dumps({"schema": 1, "projects": [
+            {"id": "vv", "path": str(self.project_root)}]}))
+        marker.chmod(0o600)
+        with self.assertRaises(core.Blocked):
+            self.command()
+        with self.assertRaises(core.Blocked):
+            isolation.profile(self.bound, self.native, self.hook, token_auth=True)
 
 
 class CLIIntegrationTests(IsolationFixture):
@@ -377,6 +609,80 @@ class CLIIntegrationTests(IsolationFixture):
         result = self.launch(["--help"])
         self.assertFalse(result["ok"])
         self.oauth_factory.assert_not_called()
+        self.guarded.assert_not_called()
+
+    def test_interactive_detection_excludes_pipes_print_and_subcommands(self):
+        with patch.object(cli.os, 'isatty', return_value=True):
+            self.assertTrue(cli.interactive_paste_enabled(['--permission-mode', 'auto']))
+            self.assertTrue(cli.interactive_paste_enabled(['--resume', 'session-id']))
+            for args in (['-p', 'hello'], ['--print'], ['-phello'], ['--output-format=json'],
+                         ['--input-format', 'stream-json'], ['auth', 'login'], ['setup-token'],
+                         ['--help'], ['--version']):
+                with self.subTest(args=args):
+                    self.assertFalse(cli.interactive_paste_enabled(args))
+        with patch.object(cli.os, 'isatty', side_effect=[True, False]):
+            self.assertFalse(cli.interactive_paste_enabled([]))
+
+    def test_isolated_interactive_bridge_preserves_native_guard_and_oauth_owner(self):
+        from surge_cc import paste_terminal, pasted_images
+        relay = Mock()
+        relay.tty_path = '/dev/ttys123'
+        child = Mock()
+        command = ['/synthetic/sandbox', 'native']
+
+        def completed(command, **kwargs):
+            kwargs['on_started'](child)
+            return self.completed(command, **kwargs)
+
+        self.guarded.side_effect = completed
+        with patch.object(cli, 'interactive_paste_enabled', return_value=True), \
+                patch.object(pasted_images, 'ImageImporter') as importer, \
+                patch.object(paste_terminal, 'PasteTerminal') as bridge, \
+                patch.object(cli.isolation, 'command', return_value=command) as sandbox:
+            bridge.return_value.__enter__.return_value = relay
+            report = self.launch(['--permission-mode', 'auto'])
+        self.assertTrue(report['ok'])
+        importer.assert_called_once_with(self.home)
+        bridge.assert_called_once_with(importer.return_value, popen_factory=self.spawn)
+        bound = isolation.bind_workspace(self.project, self.config_path, 'A')
+        sandbox.assert_called_once_with(bound, self.native, ['--permission-mode', 'auto'],
+                                        self.oauth.browser_hook, token_auth=False,
+                                    default_model='', default_effort='',
+                                        terminal_device=Path('/dev/ttys123'))
+        call = self.guarded.call_args
+        self.assertEqual(call.args[0], command)
+        self.assertIs(call.kwargs['popen'], relay.popen)
+        self.assertIs(call.kwargs['monitor'], relay.monitor)
+        self.assertIs(call.kwargs['checker'], self.runtime_factory.return_value)
+        relay.start.assert_called_once_with(child)
+        self.oauth.set_child.assert_called_once_with(child)
+        bridge.return_value.__exit__.assert_called_once()
+
+    def test_noninteractive_and_ordinary_launches_do_not_construct_bridge(self):
+        from surge_cc import paste_terminal
+        with patch.object(paste_terminal, 'PasteTerminal') as bridge:
+            self.assertTrue(self.launch(['--help'])['ok'])
+            self.cwd_patch.return_value = self.temp_root
+            with patch.object(cli, 'interactive_paste_enabled', return_value=True):
+                self.assertTrue(self.launch([])['ok'])
+        bridge.assert_not_called()
+
+    def test_preflight_failure_never_constructs_bridge(self):
+        from surge_cc import paste_terminal
+        self.checker.return_value = {'ok': False, 'checks': [], 'summary': 'blocked'}
+        with patch.object(cli, 'interactive_paste_enabled', return_value=True), \
+                patch.object(paste_terminal, 'PasteTerminal') as bridge:
+            self.assertFalse(self.launch([])['ok'])
+        bridge.assert_not_called()
+        self.guarded.assert_not_called()
+
+    def test_bridge_setup_failure_never_falls_back_to_unfiltered_launch(self):
+        from surge_cc import paste_terminal, pasted_images
+        with patch.object(cli, 'interactive_paste_enabled', return_value=True), \
+                patch.object(pasted_images, 'ImageImporter'), \
+                patch.object(paste_terminal, 'PasteTerminal', side_effect=core.Blocked('bridge refused')):
+            with self.assertRaises(core.Blocked):
+                self.launch([])
         self.guarded.assert_not_called()
 
 

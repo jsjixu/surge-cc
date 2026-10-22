@@ -1,6 +1,6 @@
-# Surge CC 0.3.0 接口合约
+# Surge CC 0.4.0 接口合约
 
-本文对应 **v0.3.0 / Build 13**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
+本文对应 **v0.4.0 / Build 14**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 终端入口
 
@@ -286,6 +286,52 @@ v0.2.5 的 `isolation` 模块是可选的高级功能。只有 `launch code` 的
 
 工作树 HOME 位于 `root/.runtime/<id>/worktrees/<路径摘要>/home`，由启动器在核验后创建；它不会复制主项目 HOME、旧会话或凭据。每次启动在路径发现和生成沙箱策略前分别复核关联。主项目工作文件和其他工作树 HOME 不因此开放。
 
+### 共享项目会话
+
+此功能为已登记文件隔离项目的独立选择，默认关闭。管理程序先排空旧 Claude 写入进程，在 `workspaces.account_switch` 和受影响工作区独占会话锁内，为各项目与账号调用 `shared_history.initialize(bound_project)`。该方法仅复制现有隔离 HOME 的 UUID 会话 JSONL、对应 `subagents` 和 `tool-results`，包括已移除工作树留下的 HOME；不读取旧全局 `~/.claude`。原文件不改动，相同目标的内容冲突、链接、权限异常或迁移期间源变化均阻止发布。
+
+全部目标初始化成功后，管理程序原子写入隔离根的私有 `.runtime/shared-history.json`：
+
+```json
+{"schema":1,"projects":[{"id":"vv","path":"/absolute/isolated/projects/vv"}]}
+```
+
+每个条目必须精确匹配登记文件，不能使用通配符或路径别名。会话库为 `.runtime/<id>/conversation-history/<workspace>/data`，初始化收据保存在 `data` 外；子进程只获得当前项目与账号 `data` 的读写权限。启用但缺少初始化收据时阻止启动。未来新增账号也必须先显式初始化，启动器不自动导入或回退。
+
+每工作树仍有独立 `HOME` 和 `CLAUDE_CONFIG_DIR`。启动器将原生 `CLAUDE_CODE_PROJECT_DIR_NAME` 固定为 `surge-cc-<id>`，并只为 `.claude/projects/<该名称>` 建立指向上述库的精确链接；自动记忆通过内联 `autoMemoryDirectory` 保留在当前 HOME 的原主项目记忆目录。共享目录中的 `memory` 明确禁止访问。外部继承的 bucket 变量不能覆盖此选择。
+
+共享会话包含已在对话中出现的内容，不代表能新读取其他工作树源码、HOME、凭据、日志或图片路径。`file-history`、计划和独立 HOME 内的图片不会随会话共享。原生 `/resume` 默认从固定 bucket 读取；`--fork-session` 可用于启动时分支，但不改变交互式 `/resume` 的行为。同一 ID 同时恢复可能交错写入，不保证并发同会话安全。
+
+原 bucket 文件保留作为迁移时的副本，之后新增内容以共享库为准。撤销 opt-in 会回到各 HOME 原有历史视图，不会自动把共享库的新内容拆回去；需要先退出相关会话并备份共享库。此功能仍不包含在 A/B 的 `data` 快照内，需备份隔离根 `.runtime`。已安装的终端后端和 GUI 内置后端应分别核对版本；更新终端后端不会自动重新签名 GUI 安装包。
+
+### 本机跨会话通信
+
+`messaging` 是已登记文件隔离项目的独立 opt-in，默认关闭，与共享历史、默认目录信任分别配置。明确授权后，维护者在隔离根创建私有 `.runtime/messaging.json`：
+
+```json
+{"schema":1,"projects":[{"id":"vv","path":"/absolute/isolated/projects/vv"}]}
+```
+
+文件须为当前用户拥有、权限 `600` 的普通单链接文件。条目精确匹配 `isolation.json` 中的项目 ID 与规范主项目路径，不接受通配符、重复条目或路径别名。标记缺失或项目未列出时不准备通信空间；标记损坏、权限异常、项目关联或当前账号绑定无法验证时阻止启动。
+
+`prepare_scope(bound_project)` 在 `/private/tmp/surge-cc-ipc-<uid>/<scope-hash>/` 准备私有短目录，其中 `scope-hash` 由登记主项目路径、启动器配置路径和当前工作区身份共同派生。同项目、同账号的主目录与关联 Orca 工作树使用同一空间；不同项目、账号或配置目录使用不同空间。父目录及子目录要求当前用户所有、权限 `700`，私有 `binding.json` 验证精确归属。启动器检查 Unix socket 路径长度，不能安全使用短路径时拒绝启动，不回退到其他共享临时目录。
+
+子进程的 `XDG_RUNTIME_DIR` 固定为该短目录，原生 socket 位于其 `cc-socks/` 下。`prepare(bound_project)` 在完成当前独立 HOME 的准备后，仅把 `.claude/sessions` 精确链接到此空间的 `sessions/`，共享本地会话发现及握手元数据。它不共享整个 HOME、源码访问、账号登录凭据、设置、自动记忆或调试日志；历史对话是否共享仍由 `shared-history.json` 决定。继承环境中的其他 runtime、socket 或消息令牌不能选择通信空间。
+
+首次切换前应正常退出相关旧 Claude 进程。若当前 HOME 已有原生 `sessions/` 目录，启动器检查其中 PID；任何活动进程、无法确认的进程状态、不认识的文件或不安全链接均阻止替换。确认失效的目录保留为同 HOME 下私有的 `sessions-before-messaging-<随机值>` 备份，不把旧发现记录或握手密钥导入新空间。更新不会热修改已运行进程；通信双方需要正常退出后通过新版受控入口重新启动。撤销项目条目只停止后续启动的通信授权，已有进程仍须正常退出。
+
+Seatbelt 仅新增当前空间 `sessions/` 与 `cc-socks/` 的文件读写，以及 `cc-socks/` 路径下的 Unix socket 绑定、接收和发送。通信根目录、绑定文件、其他项目或账号空间不获得内容访问权限；其他工作树源码与 HOME 不因此开放。原有 `127.0.0.1:62919` 专用 TCP 出口、OAuth socket 及本机回调限制保持不变，不扩大 DNS、UDP、其他 TCP 出站或跨沙箱信号权限。它不是整机通用网络隔离，也不改变 Surge 的节点选择、轮询保护或全局模式边界。
+
+本地通信启动设置包含 `isolatePeerMachines:true`、`disableRemoteControl:true`、`remoteControlAtStartup:false` 和 `autoUploadSessions:false`，不因本机消息授权而启用远端控制、跨机器会话发现或自动上传。Claude 原生消息权限确认及等待审批（permission hold）仍保留；Surge CC 不伪造授权或自动批准原生消息。消息中主动发送的内容会被接收方会话看到，但这不赋予接收方额外文件访问权限。此功能针对已接管的原生终端进程，不声明 Orca Native Chat 或未更新的 GUI 内置后端已支持。
+
+### Orca 终端图片粘贴
+
+已登记隔离项目的交互终端使用 PTY 粘贴通道。只有完整 `ESC[200~` / `ESC[201~`（bracketed paste）片段中、内容恰好为当前用户系统临时目录下 `orca-paste-<时间戳>-<UUID>.png` 路径时，才触发图片导入。通道不直接读取剪贴板，不扫描临时目录，也不处理子进程输出。普通键盘输入、其他粘贴内容、管道、`--print` / JSON 协议及认证和维护命令保留原处理方式。
+
+可信启动器检查源文件身份、链接及 PNG 结构，单图最多 **20 MiB**，然后复制到当前隔离 HOME 内本次启动的私有目录，将粘贴片段中的路径替换为副本路径。导入失败时以固定错误文字替换该片段，保留之后的输入；终端转发异常交由现有守护停止受控进程。原 `/var/folders/…/T` 目录及其中其他文件仍不可读，文件沙箱和 SixtyNet 等现有线路保护不因导入而放宽，个人 Chrome 和其他代理服务不受影响。
+
+副本随该项目或工作树的隔离 HOME 保留，以便恢复会话时继续读取；关闭终端不会删除已导入图片。更新后需退出并重新启动已有 Claude 会话才能使用该通道。此支持针对已接管的隔离终端入口，不表示 Orca Native Chat、直接剪贴板读取或 GUI 安装包均已部署、验收。
+
 ### 默认目录信任
 
 默认不为新隔离 HOME 继承其他目录的信任。明确授权后，可在隔离根目录的 `.runtime/trust.json` 创建私有配置：
@@ -310,10 +356,23 @@ v0.2.5 的 `isolation` 模块是可选的高级功能。只有 `launch code` 的
 
 原生 Claude 及其子进程通过 `/usr/bin/sandbox-exec` 进入 macOS Seatbelt，可信启动器、线路监控及 OAuth 代理留在沙箱外。沙箱允许当前项目和独立 HOME 读写，以及指定系统工具和必要资源读取；拒绝文件硬链接。关联工作树仅允许共享 Git 对象、引用及少量元数据读取，允许本工作树 `index` / `index.lock` 写入。代码编辑、`git status`、`git diff`、查看历史在支持范围内；提交、推送及修改共享配置须在 Orca 或普通终端中完成，后者不受该沙箱约束。已允许读取的共享 Git 对象可能包含整个仓库历史，不是内容脱敏。
 
-当前沙箱固定允许 TCP 专用入口 `127.0.0.1:62919` 及本次 OAuth 打开器的 Unix socket；配置中的 `proxy_url` 必须精确为 `http://127.0.0.1:62919`。不提供任意端口或额外网络授权设置。CLI 可建立本机回调监听，OAuth 代理仍独立核对精确回环端口和进程归属；这不是允许所有 localhost 出站连接。
+当前沙箱固定允许 TCP 专用入口 `127.0.0.1:62919` 及本次 OAuth 打开器的 Unix socket；配置中的 `proxy_url` 必须精确为 `http://127.0.0.1:62919`。启用本机跨会话通信时，仅额外开放上文指定项目与账号的 Unix socket 目录，不提供任意端口或通用网络授权设置。CLI 可建立本机回调监听，OAuth 代理仍独立核对精确回环端口和进程归属；这不是允许所有 localhost 出站连接。
 
 隔离分支使用最小环境变量集和独立 `HOME`、临时目录及 `CLAUDE_CONFIG_DIR`，不继承原终端的认证令牌、SSH agent 或 IDE 句柄。CLI 配置来源置空、hooks 禁用、MCP 置空，并拒绝额外 settings、目录、插件和 IDE/Chrome 集成参数。系统服务、构建工具、登录与授权可能因此受限；本次只验证了明确列出的命令及边界，不承诺所有工程或交互式登录流程兼容。
 
 在已登记目录可执行 `claude --surge-cc-isolation-check`（需已安装终端接管），或从该目录调用后端 `launch code --passthrough -- --surge-cc-isolation-check`。它先做基础线路检查，再用临时文件、Git 只读命令、原生 CLI `--help` 和网络边界探针返回诊断 JSON；不登录或向模型发送提示词。路径、项目名称及出口等回执信息分享前需脱敏。
 
 常规报告模式的隔离 CLI 会话可带 `file_isolation:{project,root,home,backend,linked_worktree}`；这些字段描述启动方式，不是持续文件审计。文件隔离目录不在 A/B `data` 快照中，需另外备份。绑定迁移时原账号的项目 HOME 原位保留；其他账号使用该项目/工作树的独立 HOME，源码保留。账号的 OAuth 存储经 `auth_directory` 选择本账号 `data/Auth` 或迁移保留的 `data/Claude`，不再跨账号共用旧项目全局认证。普通 CLI 的原生钥匙串与隔离 CLI 的文件回退可能需要分别授权；工作区 Token 模式统一注入。浏览器仍按所选工作区管理，不随项目 HOME 复制。
+
+
+## 0.4.0 通用配置入口
+
+- `setup doctor --json`：只读依赖与已有节点/策略组名称，依赖缺失返回 `ok:false` 和退出码 2；不声明线路已通过。
+- `setup plan` / `setup apply --plan-id`：审核后准备完整专用 Chrome 与当前工作区设置。应用前重复核对摘要；不在此命令隐式修改 Surge。`first-run.sh` 顺序编排后续 repair、终端和项目步骤。
+- `project status`、`project plan --source --name`、`project apply --plan-id`：只读盘点、预览和建立隔离副本，原目录不写入；状态变化使计划失效。`--trust` 仅信任明确项目。
+- `project enable-plan --name`：读取当前账号已登记隔离 HOME 的候选历史数量；`project enable --name` 在账号及会话排他锁内初始化历史并启用开关。其他项目/账号不混入，旧原始记录保留。`--no-shared-history` 与 `--no-messaging` 表示本次不新增对应功能，不撤销已经启用的功能。
+- `shortcut install --name --workspace --start-page --app`：复制发布包的预编译模板并签名，保存安装路径引用，不复制后端。已存在目标拒绝覆盖。`shortcut open --launcher-config --json` 返回原始 `action=focus|needs_switch|blocked`，失败不回退普通浏览器。
+
+配置新增 `default_model`（空字符串为原生默认）、`default_effort`（空或 low/medium/high/max）、`browser_start_page`（claude/newtab），按工作区保存。旧工作区缺字段时使用各自兼容默认，不继承其他账号的值。模型/effort通过JSON设置传给原生CLI，显式CLI参数保留；配置effort时仅在受控子进程移除冲突的继承环境变量。启动页由主启动器和守护共同核对，OAuth单独使用本次授权地址。
+
+`configure --cli-process-path PATH` 可重复提供进程范围，不必手工编辑配置JSON；首次向导从已验证的原生安装生成范围。变更范围后须重新应用并验证Surge规则，保存字段本身不代表保护已生效。

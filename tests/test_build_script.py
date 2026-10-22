@@ -25,6 +25,8 @@ class BuildOutputTests(unittest.TestCase):
         self.script = self.project / "scripts/build-app.sh"
         shutil.copy2(source, self.script)
         (self.project / "scripts/surge-cc").write_text("# fixture; never executed\n")
+        (self.project / "scripts/first-run.sh").write_text("# fixture; never executed\n")
+        (self.project / "app/shortcut.swift").write_text("// fixture; never compiled\n")
         (self.project / "src/surge_cc/__init__.py").write_text("")
         (self.project / "app/main.swift").write_text("// fixture; never compiled\n")
         (self.project / "app/assets/SurgeCCIcon.icns").write_bytes(b"fixture icon")
@@ -190,13 +192,12 @@ if tool == "codesign" and "--verify" in sys.argv:
         self.assertEqual(list(existing.iterdir()), [existing / "keep.txt"])
         output = self.dist / "Surge CC 0.2.2.app"
         info = plistlib.loads((output / "Contents/Info.plist").read_bytes())
-        self.assertEqual(info["CFBundleShortVersionString"], "0.3.0")
         self.assertEqual(info["CFBundleShortVersionString"], __version__)
-        self.assertEqual(info["CFBundleVersion"], "13")
+        self.assertEqual(info["CFBundleVersion"], "14")
         self.assertTrue((output / "Contents/MacOS/SurgeCC").is_file())
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual([call[0] for call in calls],
-                         ["swiftc", "plutil", "codesign", "codesign"])
+                         ["swiftc", "swiftc", "plutil", "codesign", "codesign"])
         for flag in ("-file-prefix-map", "-debug-prefix-map"):
             self.assertEqual(calls[0][calls[0].index(flag) + 1], str(self.project) + "=/SurgeCC")
         self.assertIn("app/main.swift", calls[0])
@@ -273,7 +274,7 @@ if tool == "codesign" and "--verify" in sys.argv:
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
-        compiles = [call for call in calls if call[0] == "swiftc"]
+        compiles = [call for call in calls if call[0] == "swiftc" and "app/main.swift" in call]
         stages = [Path(call[call.index("-o") + 1]).parents[3] for call in compiles]
         self.assertNotEqual(stages[0], stages[1])
         self.assertTrue(all(stage.parent == self.dist for stage in stages))

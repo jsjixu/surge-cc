@@ -129,7 +129,7 @@ def validate_config(config: dict) -> dict:
     allowed = {"schema", "group", "policy", "expected_ip", "proxy_url", "profile_path", "hosts",
                "expected_timezone", "expected_locale", "expected_country", "expected_asn",
                "browser_language", "privacy_strict", "guard_interval", "workspace", "browser_path",
-               "cli_process_paths"}
+               "cli_process_paths", "default_model", "default_effort", "browser_start_page"}
     if set(config) - allowed:
         raise Blocked("配置包含不支持的字段。")
     for key in ("group", "policy"):
@@ -169,6 +169,16 @@ def validate_config(config: dict) -> dict:
     config["browser_path"] = browser
     from .containment import validate_cli_process_paths
     config["cli_process_paths"] = validate_cli_process_paths(config.get("cli_process_paths", []))
+    model = config.get("default_model", "")
+    if not isinstance(model, str) or (model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,127}", model)):
+        raise Blocked("默认模型必须是模型别名或 ID；留空可使用 Claude 默认值。")
+    effort = config.get("default_effort", "")
+    if effort not in ("", "low", "medium", "high", "max"):
+        raise Blocked("默认 Effort 不受支持。")
+    page = config.get("browser_start_page", "claude")
+    if page not in ("claude", "newtab"):
+        raise Blocked("浏览器启动页只能选择 Claude 或新标签页。")
+    config.update(default_model=model, default_effort=effort, browser_start_page=page)
     for key in ("expected_timezone", "expected_locale", "expected_country", "expected_asn", "browser_language"):
         val = config.get(key, "")
         if not isinstance(val, str) or len(val) > 100 or any(ord(c) < 32 for c in val):
@@ -562,7 +572,7 @@ def chrome_args(config: dict, profile_dir: Path) -> list[str]:
         "--profile-directory=Default",
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-quic", "--no-first-run", "--no-default-browser-check", "--new-window",
-        "https://claude.ai/",
+        "chrome://newtab/" if config.get("browser_start_page") == "newtab" else "https://claude.ai/",
     ]
     if config.get("browser_language"):
         args.insert(-1, "--lang=" + config["browser_language"])

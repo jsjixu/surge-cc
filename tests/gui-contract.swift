@@ -168,6 +168,14 @@ private enum GUIContractTests {
         precondition(settings.expected_country.isEmpty && settings.expected_timezone.isEmpty)
         precondition(settings.browser_language.isEmpty && settings.workspace == "A")
         let empty = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+        precondition(empty.default_model.isEmpty && empty.default_effort.isEmpty)
+        precondition(empty.browser_start_page == "claude")
+        let preferences = try JSONDecoder().decode(Settings.self, from: Data(
+            #"{"default_model":"opus","default_effort":"high","browser_start_page":"newtab"}"#.utf8))
+        precondition(preferences.default_model == "opus" && preferences.default_effort == "high")
+        precondition(preferences.browser_start_page == "newtab")
+        let roundtrip = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(preferences))
+        precondition(roundtrip == preferences)
         precondition(!empty.isComplete)
 
         let extras = #"{"schema":1,"ok":true,"summary":"工作区","checks":[],"current_workspace":"B","workspaces":[{"name":"B","label":"B","snapshots":[{"id":"snap-1","label":"before","created_at":"2026-01-01"}]}],"guard":{"running":false,"interval":10,"last_checked_at":"","detail":"未运行"},"actions":[{"id":"route","title":"补充规则","detail":"精确修复"}],"plan_id":"plan-1"}"#

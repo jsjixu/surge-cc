@@ -21,8 +21,9 @@ from .core import Blocked, BrowserProfileBusy, load_config, now, save_config, va
 SETTINGS_FIELDS = (
     "group", "policy", "expected_ip", "proxy_url", "hosts", "expected_timezone",
     "expected_locale", "expected_country", "expected_asn", "browser_language",
-    "privacy_strict", "guard_interval",
+    "privacy_strict", "guard_interval", "default_model", "default_effort", "browser_start_page",
 )
+OPTIONAL_SETTINGS = {"default_model": "", "default_effort": "", "browser_start_page": "claude"}
 
 
 @contextmanager
@@ -293,9 +294,11 @@ def _read_settings(config_path: Path, name: str, base: dict) -> dict | None:
         if (not isinstance(value, dict) or set(value) != {"schema", "workspace", "settings"}
                 or value["schema"] != 1 or value["workspace"] != name
                 or not isinstance(value["settings"], dict)
-                or set(value["settings"]) != set(SETTINGS_FIELDS)):
+                or set(value["settings"]) - set(SETTINGS_FIELDS)
+                or (set(SETTINGS_FIELDS) - set(OPTIONAL_SETTINGS)) - set(value["settings"])):
             raise ValueError("invalid settings metadata")
-        return _route(dict(base, **value["settings"], workspace=name))
+        # Older account snapshots do not inherit another account's new defaults.
+        return _route({**base, **OPTIONAL_SETTINGS, **value["settings"], "workspace": name})
     except (OSError, ValueError, TypeError):
         raise Blocked("工作区线路设置无法完整读取；未切换账号，也未覆盖原设置。") from None
 

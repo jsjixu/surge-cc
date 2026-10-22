@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, ExitStack
 import datetime as dt
 import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -203,13 +204,16 @@ def validate_launch_arguments(config: dict, arguments: list[str], *, token_auth:
                 raise Blocked("无法确认 Claude 设置来源；只接受 user、project、local。")
 
 
-def protected_code_arguments(arguments: list[str]) -> list[str]:
+def protected_code_arguments(arguments: list[str], config: dict | None = None) -> list[str]:
     """Merge validated inline settings, then force local-only startup in the child.
 
     The caller must validate each settings object before this transformation.
     Never edit home/project settings; preserve unrelated Orca settings and env.
     """
     settings: dict = {}
+    for source, target in (("default_model", "model"), ("default_effort", "effortLevel")):
+        if (config or {}).get(source):
+            settings[target] = config[source]
     remaining = []
     index = 0
     while index < len(arguments):
@@ -336,6 +340,18 @@ def start_web_guard(config: dict, config_path: Path, command: list[str], loc: di
         raise
 
 
+def interactive_paste_enabled(arguments: list[str]) -> bool:
+    """Do not alter pipes, print/JSON protocols or maintenance/auth commands."""
+    noninteractive = {"-p", "--print", "--input-format", "--output-format", "--version", "-v",
+                      "--help", "-h"}
+    commands = {"auth", "setup-token", "mcp", "plugin", "plugins", "doctor", "install",
+                "update", "upgrade", "agents", "config", "completion"}
+    if any(value.split("=", 1)[0] in noninteractive or value in commands
+           or (value.startswith("-p") and not value.startswith("--")) for value in arguments):
+        return False
+    return os.isatty(0) and os.isatty(1)
+
+
 def launch(config: dict, config_path: Path, target: str, terminal: bool, args: list[str],
            checker=full_checks, popen=subprocess.Popen, terminal_open=terminal_launcher,
            guarded=run_guarded, web_guard=start_web_guard, startup_release=lambda: None) -> dict:
@@ -435,6 +451,8 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
     else:
         env = (isolation.environment(isolated, config["proxy_url"], token_auth=token_auth) if isolated
                else proxy_env(config["proxy_url"], base=token_base_environment(os.environ)))
+        if config.get("default_effort"):
+            env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
         env["CLAUDE_CONFIG_DIR"] = str(isolated.config if isolated else loc["claude"])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Native updates replace ~/.local/bin/claude, which is our guarded shim.
@@ -458,15 +476,31 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
         status_path = folder / (identifier + ".status.json")
         receipt_path = folder / (identifier + ".receipt.json")
         oauth_options = {"allow_authorization": False} if token_auth else {}
-        with OAuthSession(config, config_path, checker=oauth_checks, **oauth_options) as oauth:
+        with OAuthSession(config, config_path, checker=oauth_checks, **oauth_options) as oauth, ExitStack() as io_stack:
+            paste = None
+            if isolated and interactive_paste_enabled(arguments):
+                from .pasted_images import ImageImporter
+                from .paste_terminal import PasteTerminal
+                importer = ImageImporter(isolated.home)
+                io_stack.callback(importer.close)
+                paste = io_stack.enter_context(PasteTerminal(importer, popen_factory=popen))
             def started(child):
                 oauth.set_child(child)
+                if paste is not None:
+                    paste.start(child)
                 startup_release()
             env["BROWSER"] = str(oauth.browser_hook)
             native = default_claude()
-            command = (isolation.command(isolated, native, arguments, oauth.browser_hook, token_auth=token_auth) if isolated
-                       else [str(native), *protected_code_arguments(arguments)])
+            terminal_options = {"terminal_device": Path(paste.tty_path)} if paste is not None else {}
+            command = (isolation.command(isolated, native, arguments, oauth.browser_hook,
+                                         token_auth=token_auth,
+                                         default_model=config.get("default_model", ""),
+                                         default_effort=config.get("default_effort", ""),
+                                         **terminal_options) if isolated
+                       else [str(native), *protected_code_arguments(arguments, config)])
             guard_options = {}
+            if paste is not None:
+                guard_options["monitor"] = paste.monitor
             if isolated:
                 from .guard import RuntimeChecker
                 guard_options["checker"] = RuntimeChecker(config, process=str(native))
@@ -474,9 +508,13 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                           if isolated.worktree else "用户文件仅开放当前副本和独立 HOME，系统工具只读。")
                 print(f"[Surge CC] 文件隔离已启用：{isolated.name}；{detail}", file=sys.stderr)
                 if not token_auth and env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
-                    print("[Surge CC] 登录存储共用；当前工作树的会话、记忆和日志仍独立。", file=sys.stderr)
+                    from . import shared_history
+                    detail = ("同项目同账号共享对话；工作树记忆和其他日志仍独立。"
+                              if shared_history.enabled(isolated) else "当前工作树的会话、记忆和日志仍独立。")
+                    print("[Surge CC] 登录存储共用；" + detail, file=sys.stderr)
             status = guarded(command, env=env, cwd=Path.cwd(),
-                             config=config, target="code", status_path=status_path, popen=popen,
+                             config=config, target="code", status_path=status_path,
+                             popen=paste.popen if paste is not None else popen,
                              receipt_path=receipt_path, on_started=started,
                              lock_path=loc["lock"].absolute(), interval=config["guard_interval"],
                              exit_interval=max(30, config["guard_interval"]), **guard_options)
@@ -589,6 +627,10 @@ def parser() -> argparse.ArgumentParser:
         configure.add_argument("--" + flag)
     configure.add_argument("--privacy-strict", choices=("true", "false"))
     configure.add_argument("--guard-interval", type=int)
+    configure.add_argument("--default-model")
+    configure.add_argument("--default-effort", choices=("", "low", "medium", "high", "max"))
+    configure.add_argument("--browser-start-page", choices=("claude", "newtab"))
+    configure.add_argument("--cli-process-path", dest="cli_process_paths", action="append")
     configure.add_argument("--json", action="store_true")
     configure.add_argument("--expected-workspace")
     fix = commands.add_parser("repair")
@@ -619,6 +661,35 @@ def parser() -> argparse.ArgumentParser:
     terminal = commands.add_parser("terminal")
     terminal.add_argument("action", choices=("install", "uninstall", "status", "version"))
     terminal.add_argument("--json", action="store_true")
+    project = commands.add_parser("project", help="预览并建立隔离工程，或管理同范围共享")
+    project.add_argument("action", choices=("status", "plan", "apply", "enable", "enable-plan"))
+    project.add_argument("--source", type=Path)
+    project.add_argument("--name", action="append")
+    project.add_argument("--root", type=Path)
+    project.add_argument("--plan-id")
+    project.add_argument("--trust", action="store_true")
+    project.add_argument("--no-shared-history", action="store_true")
+    project.add_argument("--no-messaging", action="store_true")
+    project.add_argument("--json", action="store_true")
+    setup = commands.add_parser("setup", help="首次配置依赖与本机准备")
+    setup.add_argument("action", choices=("doctor", "plan", "apply"))
+    for flag in ("group", "policy", "expected-ip", "profile", "browser-path", "plan-id"):
+        setup.add_argument("--" + flag)
+    setup.add_argument("--default-model")
+    setup.add_argument("--default-effort", choices=("", "low", "medium", "high", "max"))
+    setup.add_argument("--browser-language")
+    setup.add_argument("--browser-start-page", choices=("claude", "newtab"))
+    setup.add_argument("--json", action="store_true")
+    shortcut = commands.add_parser("shortcut", help="安装或打开专用 Dock 入口")
+    shortcut.add_argument("action", choices=("install", "open"))
+    shortcut.add_argument("--name")
+    shortcut.add_argument("--workspace")
+    shortcut.add_argument("--start-page", choices=("claude", "newtab"))
+    shortcut.add_argument("--app", type=Path)
+    shortcut.add_argument("--applications-dir", type=Path)
+    shortcut.add_argument("--launcher-config", type=Path)
+    shortcut.add_argument("--confirm-switch-from")
+    shortcut.add_argument("--json", action="store_true")
     # parse_known_args below accepts extra arguments only after an explicit "--".
     return value
 
@@ -638,7 +709,77 @@ def main(argv: list[str] | None = None) -> int:
         config_path = options.config.expanduser().absolute()
         if arguments and options.command != "launch":
             raise Blocked("只有启动命令接受额外参数。")
-        if options.command == "terminal":
+        if options.command == "shortcut":
+            from . import shortcuts
+            if options.action == "open":
+                previous = signal.getsignal(signal.SIGTERM)
+                def interrupted(*_):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    raise shortcuts.LauncherStopped("启动已取消。")
+                signal.signal(signal.SIGTERM, interrupted)
+                try:
+                    if not options.launcher_config:
+                        raise Blocked("请指定快捷入口资料。")
+                    data = shortcuts.open_launcher(options.launcher_config, options.confirm_switch_from,
+                                                   expected_config=config_path)
+                except Blocked as exc:
+                    data = {"schema": 1, "action": "blocked", "message": str(exc)}
+                except Exception:
+                    data = {"schema": 1, "action": "blocked", "message": "快捷入口资料无法验证，未启动。请重新检查安装。"}
+                finally:
+                    signal.signal(signal.SIGTERM, previous)
+                print(json.dumps(data, ensure_ascii=False))
+                return 0 if data.get("action") in {"focus", "needs_switch"} else 2
+            if not all((options.name, options.workspace, options.start_page, options.app)):
+                raise Blocked("安装快捷入口需要名称、工作区、启动页和主应用路径。")
+            data = shortcuts.install(config_path, options.workspace, options.name, options.start_page,
+                                     options.app, applications_dir=options.applications_dir)
+            report = command_result("专用快捷入口已创建", {}, shortcut=data)
+        elif options.command == "setup":
+            from . import onboarding
+            if options.action == "doctor":
+                data = onboarding.doctor(config_path)
+            else:
+                if not all((options.group, options.policy, options.expected_ip)):
+                    raise Blocked("配置计划需要策略组、节点和预期出口 IP。")
+                kwargs = dict(profile_path=options.profile, model=options.default_model,
+                              effort=options.default_effort, browser_language=options.browser_language,
+                              browser_start_page=options.browser_start_page, browser_path=options.browser_path)
+                if options.action == "plan":
+                    data = onboarding.public_plan(onboarding.plan(config_path, options.group, options.policy,
+                                                                  options.expected_ip, **kwargs))
+                else:
+                    if not options.plan_id:
+                        raise Blocked("请先预览，并传入本次配置计划编号。")
+                    data = onboarding.apply(config_path, options.plan_id, options.group, options.policy,
+                                            options.expected_ip, **kwargs)
+            report = command_result("首次配置检查完成" if options.action == "doctor" else "本机准备计划操作完成", {}, setup=data)
+            if options.action == "doctor" and data.get("ok") is not True:
+                report.update(ok=False, summary="首次配置依赖尚未齐备，请查看检查结果。")
+        elif options.command == "project":
+            from . import projects
+            names = options.name or []
+            flags = dict(trust=options.trust, share_history=not options.no_shared_history,
+                         local_messaging=not options.no_messaging)
+            if options.action == "status":
+                data = projects.status(config_path)
+            elif options.action in ("enable", "enable-plan"):
+                if not names:
+                    raise Blocked("请明确选择要启用功能的项目名称。")
+                data = (projects.enable(config_path, names, **flags) if options.action == "enable"
+                        else projects.preview_enable(config_path, names))
+            else:
+                if len(names) != 1 or not options.source:
+                    raise Blocked("请指定一个源项目目录和一个项目名称。")
+                if options.action == "plan":
+                    data = projects.plan(config_path, options.source, names[0], root=options.root)
+                else:
+                    if not options.plan_id:
+                        raise Blocked("请先预览，并传入项目计划的 digest。")
+                    data = projects.apply(config_path, options.source, names[0], root=options.root,
+                                          expected_digest=options.plan_id, **flags)
+            report = command_result("项目隔离操作完成", {}, project=data)
+        elif options.command == "terminal":
             from . import terminal
             if options.action == "version":
                 print(terminal.metadata_version())
@@ -669,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
                 "expected_ip": options.expected_ip, "proxy_url": options.proxy_url,
                 "profile_path": options.profile,
             }
-            for key in ("expected_timezone", "expected_locale", "expected_country", "expected_asn", "browser_language", "browser_path", "guard_interval"):
+            for key in ("expected_timezone", "expected_locale", "expected_country", "expected_asn", "browser_language", "browser_path", "guard_interval", "default_model", "default_effort", "browser_start_page", "cli_process_paths"):
                 if getattr(options, key) is not None:
                     candidate[key] = getattr(options, key)
             if options.privacy_strict is not None:

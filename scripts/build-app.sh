@@ -104,16 +104,36 @@ swiftc -O -parse-as-library \
     -o "$STAGE_DIR/Contents/MacOS/SurgeCC" \
     -framework SwiftUI -framework AppKit
 
+swiftc -O \
+    -file-prefix-map "$PROJECT_ROOT=/SurgeCC" \
+    -debug-prefix-map "$PROJECT_ROOT=/SurgeCC" \
+    -file-compilation-dir /SurgeCC \
+    -module-cache-path "$CACHE_DIR" \
+    -target "$(uname -m)-apple-macos13.0" \
+    app/shortcut.swift \
+    -o "$STAGE_DIR/Contents/Resources/SurgeCCShortcut" \
+    -framework AppKit
+cp "$PROJECT_ROOT/scripts/first-run.sh" "$STAGE_DIR/Contents/Resources/scripts/first-run.sh"
 cp "$PROJECT_ROOT/scripts/surge-cc" "$STAGE_DIR/Contents/Resources/scripts/surge-cc"
 cp -R "$PROJECT_ROOT/src/surge_cc" "$STAGE_DIR/Contents/Resources/src/"
 cp "$ICON_FILE" "$STAGE_DIR/Contents/Resources/SurgeCCIcon.icns"
 chmod 755 "$STAGE_DIR/Contents/MacOS/SurgeCC" \
+    "$STAGE_DIR/Contents/Resources/scripts/first-run.sh" \
+    "$STAGE_DIR/Contents/Resources/SurgeCCShortcut" \
     "$STAGE_DIR/Contents/Resources/scripts/surge-cc"
 find "$STAGE_DIR/Contents/Resources/src" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$STAGE_DIR/Contents/Resources/src" -name '*.pyc' -type f -delete
 if [ -f "$PROJECT_ROOT/LICENSE" ]; then
     cp "$PROJECT_ROOT/LICENSE" "$STAGE_DIR/Contents/Resources/LICENSE"
 fi
+if [ -d "$PROJECT_ROOT/docs" ]; then
+    cp -R "$PROJECT_ROOT/docs" "$STAGE_DIR/Contents/Resources/docs"
+fi
+for document in README.md CHANGELOG.md VALIDATION.md INTERFACE.md SIGNING.md TOKEN-AUTH.md; do
+    if [ -f "$PROJECT_ROOT/$document" ]; then
+        cp "$PROJECT_ROOT/$document" "$STAGE_DIR/Contents/Resources/$document"
+    fi
+done
 
 cat > "$STAGE_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -125,8 +145,8 @@ cat > "$STAGE_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Surge CC</string>
   <key>CFBundleIconFile</key><string>SurgeCCIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.3.0</string>
-  <key>CFBundleVersion</key><string>13</string>
+  <key>CFBundleShortVersionString</key><string>0.4.0</string>
+  <key>CFBundleVersion</key><string>14</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
