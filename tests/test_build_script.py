@@ -193,7 +193,7 @@ if tool == "codesign" and "--verify" in sys.argv:
         output = self.dist / "Surge CC 0.2.2.app"
         info = plistlib.loads((output / "Contents/Info.plist").read_bytes())
         self.assertEqual(info["CFBundleShortVersionString"], __version__)
-        self.assertEqual(info["CFBundleVersion"], "16")
+        self.assertEqual(info["CFBundleVersion"], "17")
         self.assertTrue((output / "Contents/MacOS/SurgeCC").is_file())
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual([call[0] for call in calls],

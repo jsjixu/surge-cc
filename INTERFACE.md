@@ -1,6 +1,6 @@
-# Surge CC 0.5.0 接口合约
+# Surge CC 0.5.1 接口合约
 
-本文对应 **v0.5.0 / Build 16**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
+本文对应 **v0.5.1 / Build 17**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 终端入口
 
@@ -180,7 +180,7 @@ GUI 每行默认显示短摘要，长说明和可选证据折叠在「查看完�
 
 `core.result` 的检查通过条件：检查非空、ID 不重复、包含全部基础检查 ID（`surge`、`mode`、`group`、`definition`、`route`、`proxy`、`exit`、`stable`），且所有必需行均为 `pass`。非必需的 `unknown`/`warn`/`fail` 会使摘要提示仍有待确认项目。保存、工作区、修复及读取保护状态属于操作回执，可返回 `ok:true` 与空 `checks`；这只表示该操作完成，不是线路检查通过。GUI 不应将这类操作回执转为绿色启动状态。
 
-v0.3.0 在已确认 `Surge.mode=proxy`（全局代理）时返回挂起报告：`ok:false`、必需 `mode` 行 `status:"fail"`，并包含 `paused:true`、`pause_reason:"surge-global-mode"`、`surge_mode:"proxy"`、`launch_allowed:true`、`protection_active:false`。`check` 仍退出 `2`，不执行后续浏览器/DNS 探针；但 `launch` 可按明确的全局代理分支启动。成功的 GUI 网页/Terminal 启动回执保持这些挂起字段，改为 `ok:true`、`launched:true`、`target:"web"` 或 `"code-terminal"`，退出 `0`。同步 CLI 非零结束不得当作启动成功或检查通过。全局模式流量依 Surge 全局策略，固定出口与断线阻断暂停，工作区与已登记文件隔离保留。
+v0.3.0 在已确认 `Surge.mode=proxy`（全局代理）时返回挂起报告：`ok:false`、必需 `mode` 行 `status:"fail"`，并包含 `paused:true`、`pause_reason:"surge-global-mode"`、`surge_mode:"proxy"`、`launch_allowed:true`、`protection_active:false`。`check` 仍退出 `2`，不执行后续浏览器/DNS 探针；但 `launch` 可按明确的全局代理分支启动。成功的 GUI 网页/Terminal 启动回执保持这些挂起字段，改为 `ok:true`、`launched:true`、`target:"web"` 或 `"code-terminal"`，退出 `0`。同步 CLI 非零结束不得当作启动成功或检查通过。上述挂起分支仅用于专用网页和未启用项目文件沙箱的 CLI。v0.5.1 的已登记隔离开发项目要求规则模式；全局模式阻止该项目启动，不进入挂起分支。其他入口在全局模式下依 Surge 全局策略联网，固定出口与断线阻断暂停，工作区分离保留。
 
 GUI 只有在全部全局挂起字段类型和值一致、检查行非空且 ID 唯一、状态有效、必需 `surge:pass` 和 `mode:fail` 存在且其他必需项全部通过时识别「保护已挂起」。检查回执须为 `ok:false` / 退出 `2` / 未启动；成功启动须为 `ok:true` / 退出 `0` / `launched:true` / 已知 GUI 目标。缺字段、未知原因、直连冒用全局标记、矛盾退出码或其他必需失败均按阻止处理，不能变为绿色检查通过。
 
@@ -244,7 +244,7 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 默认巡检目标间隔为 `guard_interval=10` 秒；出口复查为 `max(30, guard_interval)` 秒。每次检查完成后再计算下一轮，检测耗时会增加实际间隔。检查错误或未知异常触发清理；停止先 TERM，必要时核对仍属于自身后 KILL。清理失败使用 `stop_failed`，不会报告已确认停止。
 
-运行期间，监控在轮询识别到全局代理模式后挂起固定出口与断线阻断，允许已持有会话继续运行，并记录 `suspended` 状态。切回规则模式后，监控在轮询识别到变化后重新核验保护前提，通过后恢复运行保护，失败则停止对应受控程序；直连和未知模式仍触发停止。模式切换与监控响应之间存在轮询延迟，不是切换瞬间的原子防火墙操作。挂起不修改 Surge 模式、策略或个人 Chrome，也不移除已登记文件隔离。
+专用网页与未启用项目文件沙箱的 CLI 在运行期间，由监控在轮询识别到全局代理模式后挂起固定出口与断线阻断，允许已持有会话继续运行，并记录 `suspended` 状态。切回规则模式后，监控在轮询识别到变化后重新核验保护前提，通过后恢复运行保护，失败则停止对应受控程序；直连和未知模式仍触发停止。模式切换与监控响应之间存在轮询延迟，不是切换瞬间的原子防火墙操作。挂起不修改 Surge 模式、策略或个人 Chrome。已登记隔离开发会话使用 `dev_proxy.StrictRuntimeChecker`，不支持挂起；发现全局、直连、未知模式或保护失败时，开发代理关闭连接并锁定本次启动，守护停止对应受控进程。成功的连接前检查最多在同次启动内复用一秒；保护仍有检查和轮询延迟，不构成瞬时防火墙。
 
 私有状态/回执字段：`schema`、`target`、`state`、`ok`、`checked_at`、`detail`，不存 PID、CLI 参数或配置明文。可能状态为 `starting`、`running`、`suspended`、`exited`、`blocked`、`stopped`、`stop_failed`。首次有效 `running` 或 `suspended` 回执确认对应模式下的启动；`suspended` 不能作为保护已生效的证据。后续状态文件记录监控进展。`guard-status` 仅在 `state=running` 且时间差处于 `0..max(90, guard_interval*3)` 秒时视为近期回执，负时间差或过期不计入。
 
@@ -258,7 +258,7 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 切换持有账号独占启动锁。新启动持有账号共享锁直到 CLI 监控已接管子进程（先 `oauth.set_child` 后释放启动锁）或网页监控已返回有效回执，防止在账号选择与实际启动之间切换。`--close-sessions` 写入私有停止代次，监控轮询时仅结束自己创建的程序；切换器不从回执 PID 批量杀进程。等旧及目标工作区 session 锁均可独占、确认浏览器锁无活动持有者后，才准备目标线路与账号提交。旧监控不响应、归属不明或锁未释放时拒绝切换。停止不保存网页草稿或恢复 CLI 任务，GUI 会先确认；失败时已退出的程序不自动重启。
 
-线路变化经 `workspace_routes.activate` 处理本地配置的专用入口、对应组与 Claude 域名规则，保留其他节点及无关配置。先备份与语法校验，再重载、选中目标节点并核验；失败尝试撤回可确认的本次改动。观察到外部并发更改时不强行覆盖。全局模式维持 `proxy` 状态，固定出口保护仍挂起；直连/未知状态不切换。Surge 配置路径或模式在过程中变化会阻止提交。相同线路不用重载；重载可能使其他既有连接短暂重连。
+线路变化经 `workspace_routes.activate` 处理本地配置的专用入口、对应组与 Claude 域名规则，保留其他节点及无关配置。先备份与语法校验，再重载、选中目标节点并核验；失败尝试撤回可确认的本次改动。观察到外部并发更改时不强行覆盖。全局模式维持 `proxy` 状态；专用网页与普通 CLI 的固定出口保护仍挂起，已登记隔离开发项目则须切回规则模式才能启动。直连/未知状态不切换。Surge 配置路径或模式在过程中变化会阻止提交。相同线路不用重载；重载可能使其他既有连接短暂重连。
 
 快照只复制工作区 `data` 并校验清单，不包括根目录认证引用、线路设置、系统钥匙串 Token 或工作区外项目。原生 OAuth 在所选认证目录的明文回退文件（`data/Auth/.credentials.json` 或迁移保留的 `data/Claude/.credentials.json`）和浏览器登录资料可能包含在快照中，须私下保存。恢复不覆盖钥匙串引用，也不会切换另一账号；OAuth 在钥匙串中的原生值不会随文件快照恢复。快照和恢复要求工作区独占锁，恢复前自动备份并保留 `previous-*`。这些是本地账号数据分离，不是独立系统用户、设备身份或服务端不关联保证。
 
@@ -276,9 +276,9 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 ## 已登记项目文件沙箱
 
-v0.2.5 的 `isolation` 模块是可选的高级功能。只有 `launch code` 的当前目录被登记或识别为登记项目的关联工作树时才启用。GUI 选择目录、终端入口接管及 A/B 工作区本身不完成登记；目前没有公开登记命令、迁移工具或设置界面。
+`isolation` 模块是可选的项目文件沙箱。只有 `launch code` 的当前目录被登记或识别为登记项目的关联工作树时才启用。GUI 仅选择目录、终端入口接管及 A/B 工作区本身不完成登记；可通过配置向导或 `project plan/apply` 创建并登记隔离副本，见 [项目管理](docs/PROJECTS.md)。
 
-维护者需在 `config.json` 同目录准备私有 `isolation.json`，并事先建立项目副本和主项目运行目录。下面仅展示格式；所有路径须替换为本机绝对路径，不展开 `~` 或环境变量：
+项目管理入口在 `config.json` 同目录生成私有 `isolation.json`，并建立项目副本与主项目运行目录。下面展示登记格式；手动维护时所有路径须替换为本机绝对路径，不展开 `~` 或环境变量：
 
 ```json
 {
@@ -344,7 +344,7 @@ v0.2.5 的 `isolation` 模块是可选的高级功能。只有 `launch code` 的
 
 首次切换前应正常退出相关旧 Claude 进程。若当前 HOME 已有原生 `sessions/` 目录，启动器检查其中 PID；任何活动进程、无法确认的进程状态、不认识的文件或不安全链接均阻止替换。确认失效的目录保留为同 HOME 下私有的 `sessions-before-messaging-<随机值>` 备份，不把旧发现记录或握手密钥导入新空间。更新不会热修改已运行进程；通信双方需要正常退出后通过新版受控入口重新启动。撤销项目条目只停止后续启动的通信授权，已有进程仍须正常退出。
 
-Seatbelt 仅新增当前空间 `sessions/` 与 `cc-socks/` 的文件读写，以及 `cc-socks/` 路径下的 Unix socket 绑定、接收和发送。通信根目录、绑定文件、其他项目或账号空间不获得内容访问权限；其他工作树源码与 HOME 不因此开放。原有 `127.0.0.1:62919` 专用 TCP 出口、OAuth socket 及本机回调限制保持不变，不扩大 DNS、UDP、其他 TCP 出站或跨沙箱信号权限。它不是整机通用网络隔离，也不改变 Surge 的节点选择、轮询保护或全局模式边界。
+Seatbelt 仅新增当前空间 `sessions/` 与 `cc-socks/` 的文件读写，以及 `cc-socks/` 路径下的 Unix socket 绑定、接收和发送。通信根目录、绑定文件、其他项目或账号空间不获得内容访问权限；其他工作树源码与 HOME 不因此开放。通信功能本身不扩大 DNS、UDP、任意 TCP 出站或跨沙箱信号权限。v0.5.1 隔离开发启动的 TCP 出站仅开放该次开发代理端口，由代理使用 `127.0.0.1:62919` 固定上游；OAuth socket 与本机回调仍单独核验。项目通信不改变节点选择，也不使隔离开发入口在全局模式下获得启动资格。
 
 本地通信启动设置包含 `isolatePeerMachines:true`、`disableRemoteControl:true`、`remoteControlAtStartup:false` 和 `autoUploadSessions:false`，不因本机消息授权而启用远端控制、跨机器会话发现或自动上传。Claude 原生消息权限确认及等待审批（permission hold）仍保留；Surge CC 不伪造授权或自动批准原生消息。消息中主动发送的内容会被接收方会话看到，但这不赋予接收方额外文件访问权限。此功能针对已接管的原生终端进程，不声明 Orca Native Chat 或未更新的 GUI 内置后端已支持。
 
@@ -376,15 +376,35 @@ Seatbelt 仅新增当前空间 `sessions/` 与 `cc-socks/` 的文件读写，以
 
 将配置设为关闭或移除项目条目，会停止之后的自动信任；已经写入当前 HOME 的信任标记会保留。若要撤销已经建立的信任，应在退出对应 Claude 会话后，将该 HOME 中对应项目的 `hasTrustDialogAccepted` 设为 `false`，启动器不会覆盖该明确选择。
 
-### 实际限制与诊断
+### 开发能力与隔离边界
 
-原生 Claude 及其子进程通过 `/usr/bin/sandbox-exec` 进入 macOS Seatbelt，可信启动器、线路监控及 OAuth 代理留在沙箱外。沙箱允许当前项目和独立 HOME 读写，以及指定系统工具和必要资源读取；拒绝文件硬链接。关联工作树仅允许共享 Git 对象、引用及少量元数据读取，允许本工作树 `index` / `index.lock` 写入。代码编辑、`git status`、`git diff`、查看历史在支持范围内；提交、推送及修改共享配置须在 Orca 或普通终端中完成，后者不受该沙箱约束。已允许读取的共享 Git 对象可能包含整个仓库历史，不是内容脱敏。
+原生 Claude 及其子进程通过 `/usr/bin/sandbox-exec` 进入 macOS Seatbelt，可信启动器、线路监控、开发代理及 OAuth 代理留在沙箱外。当前工作树与独立 HOME 可读写，系统工具、TLS 配置和证书开放必要的只读路径。硬链接仅允许源与目标均在当前工作树或当前 HOME 的授权范围内，不能借共享 Git 或系统文件的硬链接扩大写权限。
 
-当前沙箱固定允许 TCP 专用入口 `127.0.0.1:62919` 及本次 OAuth 打开器的 Unix socket；配置中的 `proxy_url` 必须精确为 `http://127.0.0.1:62919`。启用本机跨会话通信时，仅额外开放上文指定项目与账号的 Unix socket 目录，不提供任意端口或通用网络授权设置。CLI 可建立本机回调监听，OAuth 代理仍独立核对精确回环端口和进程归属；这不是允许所有 localhost 出站连接。
+Git 可读同仓库历史，可写 objects、refs、reflogs 及当前工作树状态，支持 add、commit、fetch、push；其他工作树工作文件不开放。共享 Git 配置、hooks、关联元数据及 alternates 仍受写保护，修改远端等控制配置需在宿主进行。已允许的共享 Git 对象可能包含整个仓库历史，这不是内容脱敏。SSH agent、宿主 GitHub/SSH 凭据和系统钥匙串不继承，私有远端需要隔离环境自身的授权。
 
-隔离分支使用最小环境变量集和独立 `HOME`、临时目录及 `CLAUDE_CONFIG_DIR`，不继承原终端的认证令牌、SSH agent 或 IDE 句柄。CLI 配置来源置空、hooks 禁用、MCP 置空，并拒绝额外 settings、目录、插件和 IDE/Chrome 集成参数。系统服务、构建工具、登录与授权可能因此受限；本次只验证了明确列出的命令及边界，不承诺所有工程或交互式登录流程兼容。
+配置中的 `proxy_url` 仍须为 `http://127.0.0.1:62919`。真实隔离开发启动为每个会话创建短期 HTTP/CONNECT 代理，子进程只能连接该代理的动态回环端口，不能直接连接 Surge 普通端口或公网。公网连接由代理转交唯一固定的专用上游，不在代理中解析公网 DNS 或直接连接公网。规则模式、线路和进程边界检查失败后，关闭连接并锁定本次代理，不换上游，也不进入全局模式挂起。
 
-在已登记目录可执行 `claude --surge-cc-isolation-check`（需已安装终端接管），或从该目录调用后端 `launch code --passthrough -- --surge-cc-isolation-check`。它先做基础线路检查，再用临时文件、Git 只读命令、原生 CLI `--help` 和网络边界探针返回诊断 JSON；不登录或向模型发送提示词。路径、项目名称及出口等回执信息分享前需脱敏。
+本地预览经该代理访问 `localhost`、`127.0.0.1` 或 `::1` 时，必须确认监听者属于此次 Claude 的活跃子进程树；其他项目、会话或宿主服务的端口不开放。支持 HTTP、CONNECT 和本地 WebSocket。CLI 可建立本机回调监听；OAuth 代理另行核验精确端口及进程归属。OAuth、可选项目通信及下述标题桥只开放各自特定 Unix socket，不是通用宿主访问。需要代理的开发工具应遵循环境变量或显式配置代理；未配置的直接连接仍会被拒绝。
+
+隔离分支使用独立 `HOME`、临时目录、`CLAUDE_CONFIG_DIR` 和开发缓存。PATH 包含隔离 HOME 的 `.local/bin`、当前项目的 `node_modules/.bin` 及已允许的系统工具。原终端的认证令牌、SSH agent、IDE/Orca 通用句柄不继承；当前账号认证由可信启动器单独提供。当前隔离 HOME、项目及 local 设置按 `user,project,local` 加载，普通 plugins、skills、commands、hooks 可用，安装脚本继续继承同一沙箱。受保护的账号、代理、浏览器、更新及目录设置不能被覆盖。显式额外 settings、目录、插件路径和 IDE/Chrome 集成参数仍拒绝，MCP 由严格空配置关闭，远程控制与自动会话上传保持禁用。
+
+隔离 HOME 中的 `claude` helper 仅提供插件管理及帮助/版本查询，验证自己处于沙箱后才调用固定原生程序；不能用它启动新模型会话、切换登录或更新 CLI 本体。新会话须从 Orca/Ghostty 的受控入口启动。其他系统服务或宿主集成仍可能受限；支持范围与使用方法见 [隔离开发](docs/ISOLATED-DEVELOPMENT.md)。
+
+### Orca 最小标题桥
+
+`orca_titles` 在可信启动器中核验本机 Orca 终端、当前项目、标签页和 pane 绑定，再创建每次启动独立的短期 Unix socket。隔离子进程仅获得这个专用 hook，不获得 Orca 通用令牌、CLI 或宿主 `~/.claude/settings.json`。桥接只转发 `SessionStart`、`UserPromptSubmit`、`Stop`、`SessionEnd` 及提交 prompt 的前 512 个字符，目标由宿主固定；不转发完整会话、工具载荷或宿主响应。标题生成由 Orca 处理，Surge CC 不选择其模型。
+
+标题 hook 与当前隔离环境的原生 hooks 合并，不替换插件 hooks。绑定不可核实时仅提示标题通知不可用，继续保留文件沙箱与线路保护，不回退宿主 hooks 或无隔离启动。
+
+### 旧版 Orca 拒绝规则迁移
+
+`legacy_permissions.repair` 只在已登记项目及 HOME、工作树 Git 双向关联验证后检查当前根的 `.claude/settings.json`。必须包含完整匹配当前宿主 HOME 的旧版 12 条 Read/Edit 模板才迁移；只移除其中针对整个 `~/orca/**` 的 Read 与 Edit 两条，避免它们误伤当前工作树的 `CLAUDE.md` 和正常编辑。其余模板规则、自定义规则及其他设置保留；部分模板、独立的自定义 deny、`settings.local.json` 都不改动。
+
+修改前把原始字节备份到当前隔离 HOME 的 `.surge-cc-settings-backups/`，目录 `700`、文件 `600`。路径别名、符号链接、硬链接、归属异常及并发变化拒绝迁移；同目录暂存后原子替换，失败保留已有备份。迁移幂等，既有工作树或之后从旧分支生成的新工作树都在各自下次启动时执行，不批量扫描其他目录。该迁移不修改 Seatbelt、代理规则、其他项目/账号访问权限或原始工程。
+
+### 诊断与会话数据
+
+在已登记目录可执行 `claude --surge-cc-isolation-check`（需已安装终端接管），或从该目录调用后端 `launch code --passthrough -- --surge-cc-isolation-check`。它先做基础线路检查，再用临时文件、Git 操作、原生 CLI `--help` 及文件与网络边界探针返回诊断 JSON；不登录或向模型发送提示词。路径、项目名称及出口等回执信息分享前需脱敏。
 
 常规报告模式的隔离 CLI 会话可带 `file_isolation:{project,root,home,backend,linked_worktree}`；这些字段描述启动方式，不是持续文件审计。文件隔离目录不在 A/B `data` 快照中，需另外备份。绑定迁移时原账号的项目 HOME 原位保留；其他账号使用该项目/工作树的独立 HOME，源码保留。账号的 OAuth 存储经 `auth_directory` 选择本账号 `data/Auth` 或迁移保留的 `data/Claude`，不再跨账号共用旧项目全局认证。普通 CLI 的原生钥匙串与隔离 CLI 的文件回退可能需要分别授权；工作区 Token 模式统一注入。浏览器仍按所选工作区管理，不随项目 HOME 复制。
 

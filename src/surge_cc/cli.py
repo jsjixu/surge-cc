@@ -386,11 +386,10 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                 if (arg == "setup-token" or arg.split("=", 1)[0] == "--bare"
                         or (arg == "auth" and arguments[index + 1:index + 2] in (["login"], ["logout"]))):
                     raise Blocked("当前使用钥匙串长效 Token；此命令需要先显式切回 OAuth 模式，不会自动打开网页登录。")
-        # A maintenance word used as the immediate print prompt is harmless;
-        # a later --print flag must not pardon an earlier update subcommand.
-        maintenance = any(a in {"update", "upgrade", "install"} and not (
-            i > 0 and arguments[i - 1] in {"-p", "--print"}) for i, a in enumerate(arguments))
-        if maintenance:
+        # Only native executable maintenance is blocked. Plugin install/update
+        # manage the current isolated plugin directory, not the guarded entry.
+        from .development import maintenance_command
+        if maintenance_command(arguments):
             raise Blocked("终端接管期间不能由 Claude 更新或覆盖命令入口；请先卸载接管，更新后重新安装。")
         if config.get("cli_process_paths"):
             from .containment import cli_scope_covers
@@ -421,6 +420,8 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
               if os.environ.get("SURGE_CC_TERMINAL_ENTRY") == "1" and checker is full_checks
               else checker(config))
     suspended = global_mode_allowed(report)
+    if isolated and suspended:
+        raise Blocked("隔离开发会话需要 Surge 规则模式；不会跟随全局代理更换出口。")
     if not report.get("ok") and not suspended:
         return report
     if suspended and os.environ.get("SURGE_CC_TERMINAL_ENTRY") == "1":
@@ -477,6 +478,29 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
         receipt_path = folder / (identifier + ".receipt.json")
         oauth_options = {"allow_authorization": False} if token_auth else {}
         with OAuthSession(config, config_path, checker=oauth_checks, **oauth_options) as oauth, ExitStack() as io_stack:
+            development_proxy = None
+            if isolated:
+                from .dev_proxy import Session as DevelopmentProxy, StrictRuntimeChecker
+                native_path = str(default_claude())
+                development_proxy = io_stack.enter_context(DevelopmentProxy(
+                    config, checker=StrictRuntimeChecker(config, process=native_path)))
+                # All development tools use the per-launch gate. Internet still
+                # has only one upstream; local previews require child ownership.
+                env = proxy_env(development_proxy.proxy_url, base=env)
+                env["npm_config_proxy"] = env["npm_config_https_proxy"] = development_proxy.proxy_url
+                env["npm_config_noproxy"] = ""
+                env["NODE_USE_ENV_PROXY"] = "1"
+            titles = None
+            if isolated:
+                from . import orca_titles
+                try:
+                    binding = orca_titles.bind(isolated)
+                    if binding is not None:
+                        titles = io_stack.enter_context(orca_titles.Session(binding, isolated))
+                except (Blocked, OSError, ValueError):
+                    # Optional UI integration must never fall back to the host
+                    # hooks, broad credentials or an unisolated Claude launch.
+                    print("[Surge CC] Orca 标题通知未连接；文件隔离和线路保护保持启用。", file=sys.stderr)
             paste = None
             if isolated and interactive_paste_enabled(arguments):
                 from .pasted_images import ImageImporter
@@ -486,12 +510,26 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                 paste = io_stack.enter_context(PasteTerminal(importer, popen_factory=popen))
             def started(child):
                 oauth.set_child(child)
+                if development_proxy is not None:
+                    development_proxy.set_child(child)
+                if titles is not None:
+                    titles.set_child(child)
                 if paste is not None:
                     paste.start(child)
                 startup_release()
             env["BROWSER"] = str(oauth.browser_hook)
             native = default_claude()
             terminal_options = {"terminal_device": Path(paste.tty_path)} if paste is not None else {}
+            if development_proxy is not None:
+                terminal_options["development_port"] = development_proxy.port
+                terminal_options["protected_env"] = {
+                    key: value for key, value in env.items()
+                    if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                                       "npm_config_proxy", "npm_config_https_proxy", "npm_config_noproxy"}
+                    or key in {"BROWSER", "NODE_USE_ENV_PROXY"}}
+            if titles is not None:
+                terminal_options["title_hook"] = titles.hook
+                print("[Surge CC] Orca 自动标题已接通，仅通知当前标签页。", file=sys.stderr)
             command = (isolation.command(isolated, native, arguments, oauth.browser_hook,
                                          token_auth=token_auth,
                                          default_model=config.get("default_model", ""),
@@ -502,9 +540,9 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
             if paste is not None:
                 guard_options["monitor"] = paste.monitor
             if isolated:
-                from .guard import RuntimeChecker
-                guard_options["checker"] = RuntimeChecker(config, process=str(native))
-                detail = ("当前 Orca 工作树和独立 HOME 可读写，共享 Git 数据只读；提交和推送请在 Orca 完成。"
+                from .dev_proxy import StrictRuntimeChecker
+                guard_options["checker"] = StrictRuntimeChecker(config, process=str(native))
+                detail = ("当前工作树、同项目 Git 数据和独立 HOME 可用；其他项目与账号保持隔离。"
                           if isolated.worktree else "用户文件仅开放当前副本和独立 HOME，系统工具只读。")
                 print(f"[Surge CC] 文件隔离已启用：{isolated.name}；{detail}", file=sys.stderr)
                 if not token_auth and env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):

@@ -387,6 +387,7 @@ class MessagingTests(unittest.TestCase):
 
     def test_profile_adds_only_own_ipc_scope_without_broadening_tcp_dns_or_signal(self):
         native = self.write(self.top / "native-claude", b"not executed")
+        native.chmod(0o700)
         hook = Path("/private/tmp/surge-cc-oauth-messaging/browser")
         before = isolation.profile(self.project, native, hook, token_auth=True)
         self.enable()
@@ -414,6 +415,7 @@ class MessagingTests(unittest.TestCase):
         project = self.linked("fresh")
         self.assertFalse(project.home.exists())
         native = self.write(self.top / "native-claude", b"not executed")
+        native.chmod(0o700)
         sandbox = self.write(self.top / "sandbox-exec", b"not executed")
         hook = Path("/private/tmp/surge-cc-oauth-messaging/browser")
         with patch.object(isolation, "SANDBOX", sandbox):
@@ -425,7 +427,7 @@ class MessagingTests(unittest.TestCase):
         self.assertIn('(allow network-outbound (remote tcp "localhost:62919"))', command[2])
         self.assertEqual(command[-2:], ["--model", "opus"])
         settings = json.loads(command[command.index("--settings") + 1])
-        self.assertTrue(settings["disableAllHooks"])
+        self.assertFalse(settings["disableAllHooks"])
         self.assertFalse(settings["remoteControlAtStartup"])
 
 

@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from surge_cc import cli, core, guard, isolated_auth, isolation, keychain_auth, oauth
+from surge_cc import cli, core, dev_proxy, guard, isolated_auth, isolation, keychain_auth, oauth, orca_titles
 
 
 TOKEN = "sk-ant-oat01-" + "synthetic-keychain-token-for-tests-only-123456789"
@@ -57,6 +57,11 @@ class KeychainLaunchTests(unittest.TestCase):
         self.oauth_factory = self.stack.enter_context(patch.object(cli, "OAuthSession"))
         self.session = self.oauth_factory.return_value.__enter__.return_value
         self.session.browser_hook = self.root / "private-browser-hook"
+        self.development_factory = self.stack.enter_context(patch.object(dev_proxy, "Session"))
+        self.development = self.development_factory.return_value.__enter__.return_value
+        self.development.port = 49152
+        self.development.proxy_url = "http://127.0.0.1:49152"
+        self.strict_factory = self.stack.enter_context(patch.object(dev_proxy, "StrictRuntimeChecker"))
         self.guarded = Mock(side_effect=completed)
         self.output, self.errors = io.StringIO(), io.StringIO()
         self.stack.enter_context(redirect_stdout(self.output))
@@ -225,12 +230,128 @@ class KeychainLaunchTests(unittest.TestCase):
         self.assertEqual(invocation.kwargs["env"]["CLAUDE_SECURESTORAGE_CONFIG_DIR"],
                          str(home / ".token-auth-disabled"))
         self.assertEqual(invocation.kwargs["cwd"], project_root)
-        runtime.assert_called_once_with(config(), process=str(self.native))
-        self.assertIs(invocation.kwargs["checker"], runtime.return_value)
+        runtime.assert_not_called()
+        self.assertEqual(self.strict_factory.call_count, 2)
+        self.strict_factory.assert_called_with(config(), process=str(self.native))
+        self.assertIs(invocation.kwargs["checker"], self.strict_factory.return_value)
+        self.assertEqual(invocation.kwargs["env"]["HTTPS_PROXY"], self.development.proxy_url)
         self.assertTrue(result["ok"])
         self.assertFalse(result["file_isolation"]["shared_login_storage"])
         self.assertNotIn(TOKEN, json.dumps(result))
         self.assertNotIn(TOKEN, repr(args))
+
+    def title_project(self):
+        base = self.root / "isolated"
+        project_root = base / "projects/example"
+        home = base / ".runtime/example/home"
+        project_root.mkdir(parents=True, mode=0o700)
+        home.mkdir(parents=True, mode=0o700)
+        home.chmod(0o700)
+        project = isolation.Project("example", project_root, home)
+        self.session.browser_hook = Path("/private/tmp/surge-cc-oauth-keychain-title-test/browser")
+        self.stack.enter_context(patch.object(cli.isolation, "for_cwd", return_value=project))
+        self.stack.enter_context(patch.object(cli.isolation, "bind_workspace", return_value=project))
+        self.stack.enter_context(patch.object(cli.Path, "cwd", return_value=project_root))
+        self.stack.enter_context(patch.object(isolation, "SANDBOX", self.native))
+        self.stack.enter_context(patch.dict(os.environ, {
+            "ORCA_PANE_KEY": "synthetic-pane", "ORCA_TAB_ID": "synthetic-tab",
+            "ORCA_WORKTREE_ID": "synthetic-worktree", "ORCA_AGENT_HOOK_TOKEN": OUTSIDE,
+            "ORCA_AGENT_HOOK_PORT": "54321", "ORCA_AGENT_LAUNCH_TOKEN": OUTSIDE,
+        }))
+        return project
+
+    def test_verified_orca_title_bridge_preserves_child_isolation_and_runtime_guard(self):
+        project = self.title_project()
+        temp = tempfile.TemporaryDirectory(prefix="surge-cc-title-launch-test-", dir="/private/tmp")
+        self.addCleanup(temp.cleanup)
+        hook = Path(temp.name) / "hook"
+        hook.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+        hook.chmod(0o500)
+        child = Mock(name="single-native-child")
+        binding = object()
+
+        def started_and_completed(*args, **kwargs):
+            kwargs["on_started"](child)
+            return completed(*args, **kwargs)
+
+        self.guarded.side_effect = started_and_completed
+        with patch.object(orca_titles, "bind", return_value=binding) as bind, \
+                patch.object(orca_titles, "Session") as title_factory, \
+                patch.object(isolation, "command", wraps=isolation.command) as command, \
+                patch.object(guard, "RuntimeChecker") as runtime:
+            title_session = title_factory.return_value.__enter__.return_value
+            title_session.hook = hook
+            result = self.launch(["--help"])
+
+        bind.assert_called_once_with(project)
+        title_factory.assert_called_once_with(binding, project)
+        title_session.set_child.assert_called_once_with(child)
+        self.session.set_child.assert_called_once_with(child)
+        title_factory.return_value.__exit__.assert_called_once()
+        self.assertEqual(command.call_args.kwargs["title_hook"], hook)
+        invocation = self.guarded.call_args
+        args, env = invocation.args[0], invocation.kwargs["env"]
+        self.assertFalse(any(key.startswith("ORCA_") for key in env))
+        self.assertNotIn(OUTSIDE, env.values())
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], TOKEN)
+        self.assertEqual(args[:2], [str(self.native), "-p"])
+        self.assertIn('(deny default)', args[2])
+        self.assertIn('(allow network-outbound (literal ' + json.dumps(str(hook.parent / "s")) + '))', args[2])
+        self.assertNotIn('localhost:54321', args[2])
+        settings = json.loads(args[args.index("--settings") + 1])
+        self.assertFalse(settings["disableAllHooks"])
+        self.assertEqual(set(settings["hooks"]), {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"})
+        self.assertEqual(args[args.index("--setting-sources") + 1], "user,project,local")
+        self.assertIn("--strict-mcp-config", args)
+        self.assertIn("--no-chrome", args)
+        runtime.assert_not_called()
+        self.assertEqual(self.strict_factory.call_count, 2)
+        self.strict_factory.assert_called_with(config(), process=str(self.native))
+        self.assertIs(invocation.kwargs["checker"], self.strict_factory.return_value)
+        self.development.set_child.assert_called_once_with(child)
+        self.assertTrue(result["ok"])
+        for exposed in (repr(args), json.dumps(result), self.output.getvalue(), self.errors.getvalue()):
+            self.assertNotIn(TOKEN, exposed)
+            self.assertNotIn(OUTSIDE, exposed)
+
+    def test_unverified_orca_title_bridge_warns_without_host_hook_or_network_fallback(self):
+        self.title_project()
+        child = Mock(name="still-isolated-native-child")
+
+        def started_and_completed(*args, **kwargs):
+            kwargs["on_started"](child)
+            return completed(*args, **kwargs)
+
+        self.guarded.side_effect = started_and_completed
+        with patch.object(orca_titles, "bind", side_effect=core.Blocked(OUTSIDE)), \
+                patch.object(orca_titles, "Session") as title_factory, \
+                patch.object(isolation, "command", wraps=isolation.command) as command, \
+                patch.object(guard, "RuntimeChecker") as runtime:
+            result = self.launch(["--help"])
+
+        title_factory.assert_not_called()
+        self.assertNotIn("title_hook", command.call_args.kwargs)
+        self.session.set_child.assert_called_once_with(child)
+        invocation = self.guarded.call_args
+        args, env = invocation.args[0], invocation.kwargs["env"]
+        self.assertEqual(args[:2], [str(self.native), "-p"])
+        self.assertIn('(deny default)', args[2])
+        self.assertNotIn("surge-cc-title-", args[2])
+        self.assertNotIn('localhost:54321', args[2])
+        self.assertFalse(any(key.startswith("ORCA_") for key in env))
+        self.assertNotIn(OUTSIDE, env.values())
+        settings = json.loads(args[args.index("--settings") + 1])
+        self.assertFalse(settings["disableAllHooks"])
+        self.assertNotIn("hooks", settings)
+        self.assertEqual(args[args.index("--setting-sources") + 1], "user,project,local")
+        runtime.assert_not_called()
+        self.assertEqual(self.strict_factory.call_count, 2)
+        self.strict_factory.assert_called_with(config(), process=str(self.native))
+        self.assertIs(invocation.kwargs["checker"], self.strict_factory.return_value)
+        self.assertTrue(result["ok"])
+        self.assertIn("Orca 标题通知未连接", self.errors.getvalue())
+        self.assertNotIn(OUTSIDE, self.errors.getvalue())
+        self.assertNotIn(TOKEN, self.errors.getvalue())
 
 
 class TokenOAuthBrokerTests(unittest.TestCase):

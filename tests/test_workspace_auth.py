@@ -248,6 +248,7 @@ class WorkspaceIsolatedAuthTests(unittest.TestCase):
         self.a = isolation.bind_workspace(self.project, self.config, 'A')
         self.b = isolation.bind_workspace(self.project, self.config, 'B')
         self.native = self.root / 'native'; self.native.write_text('synthetic')
+        self.native.chmod(0o700)
         self.hook = Path('/private/tmp/surge-cc-oauth-account-test/browser')
 
     # Separate from inherited auth tests; these cases exercise project binding.

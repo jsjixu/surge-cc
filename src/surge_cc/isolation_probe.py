@@ -13,6 +13,60 @@ import sys
 import uuid
 
 
+def git_boundary_checks(root, common, admin, record):
+    """Probe current development grants using unique files and nontruncating opens.
+
+    Shared objects/refs are intentionally writable. Repository configuration,
+    hooks and worktree linkage must remain protected. Never alter an existing
+    file's bytes or execute a repository hook.
+    """
+    def new_file(path, *, writable):
+        created = False
+        passed = False
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            created = True
+            os.close(fd)
+            passed = writable
+        except OSError as error:
+            passed = not writable and error.errno in (errno.EPERM, errno.EACCES)
+        finally:
+            if created:
+                try:
+                    path.unlink()
+                except OSError:
+                    passed = False
+        return passed
+
+    shared_link = root / (".surge-cc-shared-link-" + uuid.uuid4().hex)
+    linked = False
+    try:
+        os.link(common / "config", shared_link)
+        linked = True
+        record("shared_git_hardlink_escape_denied", False)
+    except OSError as error:
+        record("shared_git_hardlink_escape_denied", error.errno in (errno.EPERM, errno.EACCES))
+    finally:
+        if linked:
+            shared_link.unlink()
+
+    for label, path in (("shared_git_config_write_denied", common / "config"),
+                        ("worktree_commondir_write_denied", admin / "commondir"),
+                        ("worktree_gitdir_write_denied", admin / "gitdir")):
+        # O_WRONLY without O_TRUNC checks permission without changing data.
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+            os.close(fd)
+            record(label, False)
+        except OSError as error:
+            record(label, error.errno in (errno.EPERM, errno.EACCES))
+    for directory in ("objects", "refs"):
+        candidate = common / directory / ("surge-cc-probe-" + uuid.uuid4().hex)
+        record("shared_git_" + directory + "_write_allowed", new_file(candidate, writable=True))
+    hook = common / "hooks" / ("surge-cc-probe-" + uuid.uuid4().hex)
+    record("shared_git_hooks_write_denied", new_file(hook, writable=False))
+
+
 def main():
     spec = json.loads(os.environ.pop("SURGE_CC_ISOLATION_PROBE"))
     root, home = Path(spec["root"]), Path(os.environ["HOME"])
@@ -109,30 +163,8 @@ sys.exit(43)
                 result = subprocess.run(prefix + args, cwd=root, env=git_env,
                                         capture_output=True, timeout=20, close_fds=True)
                 record(label, result.returncode == 0)
-            common = Path(spec["git"]["common_dir"])
-            shared_link = root / (".surge-cc-shared-link-" + uuid.uuid4().hex)
-            try:
-                os.link(common / "config", shared_link)
-                shared_link.unlink()
-                record("shared_git_hardlink_escape_denied", False)
-            except OSError as error:
-                record("shared_git_hardlink_escape_denied", error.errno in (errno.EPERM, errno.EACCES))
-            # O_WRONLY without O_TRUNC checks permission without changing data.
-            try:
-                fd = os.open(common / "config", os.O_WRONLY | os.O_NOFOLLOW)
-                os.close(fd)
-                record("shared_git_config_write_denied", False)
-            except OSError as error:
-                record("shared_git_config_write_denied", error.errno in (errno.EPERM, errno.EACCES))
-            for directory in ("objects", "refs"):
-                candidate = common / directory / ("surge-cc-probe-" + uuid.uuid4().hex)
-                try:
-                    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    os.close(fd)
-                    candidate.unlink()
-                    record("shared_git_" + directory + "_write_denied", False)
-                except OSError as error:
-                    record("shared_git_" + directory + "_write_denied", error.errno in (errno.EPERM, errno.EACCES))
+            git_boundary_checks(root, Path(spec["git"]["common_dir"]),
+                                Path(spec["git"]["git_dir"]), record)
         help_run = subprocess.run([spec["native"], *spec["native_help_args"]], capture_output=True, text=True,
                                   timeout=30, close_fds=True)
         record("native_claude_help", help_run.returncode == 0 and "Usage: claude" in help_run.stdout)

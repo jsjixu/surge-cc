@@ -4,10 +4,11 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from surge_cc import cli, core, guard, isolation
@@ -184,6 +185,21 @@ class EnvironmentAndArgumentsTests(IsolationFixture):
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
         self.assertEqual(env["TERM"], "xterm-256color")
         self.assertEqual(env["DISABLE_AUTOUPDATER"], "1")
+        self.assertEqual(env["PATH"].split(":" )[:2], [str(self.home / ".local/bin"),
+                                                        str(self.project_root / "node_modules/.bin")])
+        self.assertEqual(env["NPM_CONFIG_CACHE"], str(self.home / ".cache/npm"))
+        self.assertEqual(env["NPM_CONFIG_PREFIX"], str(self.home / ".local"))
+        self.assertNotIn(str(Path.home() / ".local/bin"), env["PATH"].split(":"))
+
+    def test_development_proxy_is_exact_local_and_cannot_replace_route_anchor(self):
+        env = isolation.environment(self.project, "http://127.0.0.1:62919", {},
+                                    development_proxy="http://127.0.0.1:49152")
+        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:49152")
+        for proxy in ("http://localhost:49152", "http://127.0.0.1:62919", "http://127.0.0.1:6152",
+                      "http://127.0.0.1:6153", "http://127.0.0.1:80", "http://127.0.0.1:65536",
+                      "http://127.0.0.1:49152/", "http://user@127.0.0.1:49152", "socks5://127.0.0.1:49152"):
+            with self.subTest(proxy=proxy), self.assertRaises(core.Blocked):
+                isolation.environment(self.project, "http://127.0.0.1:62919", {}, development_proxy=proxy)
 
     def test_unmatched_proxy_is_refused_instead_of_silently_unreachable(self):
         for proxy in ("http://127.0.0.1:6152", "http://localhost:62919", "socks5://127.0.0.1:62919"):
@@ -192,6 +208,7 @@ class EnvironmentAndArgumentsTests(IsolationFixture):
 
     def test_args_reject_external_integrations_and_override_forms(self):
         flags = ("--settings", "--setting-sources", "--mcp-config", "--plugin-dir", "--plugin-url",
+                 "--plugin-dir-no-mcp", "--managed-settings",
                  "--chrome", "--ide", "--add-dir", "--worktree", "-w")
         for flag in flags:
             for values in ([flag, "synthetic"], [flag + "=synthetic"]):
@@ -251,6 +268,7 @@ class ProfileTests(IsolationFixture):
         super().setUp()
         self.native = self.temp_root / "native-claude"
         self.native.write_text("not executed")
+        self.native.chmod(0o700)
         self.hook = Path("/private/tmp/surge-cc-oauth-synthetic/browser")
 
     def test_deny_default_and_only_current_project_home_are_writable(self):
@@ -271,6 +289,67 @@ class ProfileTests(IsolationFixture):
         for unsafe in ("(allow network*)", "(allow network-outbound)", "(allow mach-lookup", "(allow appleevent-send",
                        "securityd", 'remote tcp "localhost:*"', '(subpath "/private/tmp/surge-cc-oauth-synthetic")'):
             self.assertNotIn(unsafe, policy)
+
+    def test_public_tls_runtime_files_are_readonly_and_not_general_etc_access(self):
+        policy = isolation.profile(self.project, self.native, self.hook)
+        for path in ("/private/etc/ssl/openssl.cnf", "/private/etc/ssl/cert.pem",
+                     "/etc/ssl/openssl.cnf", "/etc/ssl/cert.pem", "/private/var/select/sh",
+                     "/opt/homebrew/etc/openssl@3/openssl.cnf",
+                     "/opt/homebrew/etc/ca-certificates/cert.pem"):
+            self.assertIn('(literal ' + json.dumps(path) + ')', policy)
+            self.assertFalse(any(path in line for line in policy.splitlines()
+                                 if line.startswith('(allow file-write')))
+        for path in ("/private/etc", "/etc", "/private/var", "/opt/homebrew/etc"):
+            self.assertNotIn('(subpath ' + json.dumps(path) + ')', policy)
+
+    def test_development_proxy_policy_replaces_upstream_with_exact_broker_port(self):
+        policy = isolation.profile(self.project, self.native, self.hook, development_port=49152)
+        self.assertIn('(allow network-outbound (remote tcp "localhost:49152"))', policy)
+        self.assertNotIn('remote tcp "localhost:62919"', policy)
+        self.assertNotIn('remote tcp "localhost:*"', policy)
+        for port in (True, 80, 6152, 6153, 62919, 65536, "49152x"):
+            with self.subTest(port=port), self.assertRaises(core.Blocked):
+                isolation.profile(self.project, self.native, self.hook, development_port=port)
+
+    def test_main_git_controls_cannot_be_hardlinked_or_replaced_from_writable_root(self):
+        policy = isolation.profile(self.project, self.native, self.hook)
+        deny = next(line for line in policy.splitlines() if line.startswith('(deny file-write* file-link '))
+        for name in ("config", "config.lock", "hooks", "worktrees", "objects/info/alternates"):
+            self.assertIn('(subpath ' + json.dumps(str(self.project_root / '.git' / name)) + ')', deny)
+        self.assertIn('(literal ' + json.dumps(str(self.project_root / '.git')) + ')',
+                      next(line for line in policy.splitlines() if line.startswith('(deny file-write-unlink ')))
+
+    @unittest.skipUnless(sys.platform == "darwin" and isolation.SANDBOX.is_file(), "macOS Seatbelt unavailable")
+    def test_real_main_git_controls_and_linked_readonly_inodes_remain_protected(self):
+        git = self.project_root / ".git"
+        git.mkdir()
+        control = git / "config"
+        control.write_text("synthetic control\n")
+        (git / "hooks").mkdir()
+        policy = isolation.profile(self.project, self.native, self.hook)
+
+        def sandbox(*args):
+            return subprocess.run([str(isolation.SANDBOX), "-p", policy, *map(str, args)],
+                                  capture_output=True, text=True, timeout=10)
+
+        initial = sandbox("/bin/sh", "-c", "true")
+        if initial.returncode == 71 and "sandbox_apply: Operation not permitted" in initial.stderr:
+            self.skipTest("run outside the enclosing sandbox for real Seatbelt verification")
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        for args in (("/bin/ln", control, self.project_root / "config-alias"),
+                     ("/bin/mv", git, self.project_root / "renamed-git"),
+                     ("/bin/sh", "-c", 'printf changed >> "$1"', "sh", control),
+                     ("/bin/sh", "-c", 'printf hook > "$1"', "sh", git / "hooks/pre-commit")):
+            result = sandbox(*args)
+            self.assertNotEqual(result.returncode, 0, str(args))
+        self.assertEqual(control.read_text(), "synthetic control\n")
+        self.assertFalse((self.project_root / "config-alias").exists())
+        source = self.project_root / "source.txt"
+        source.write_text("synthetic source\n")
+        destination = self.home / "internal-link"
+        result = sandbox("/bin/ln", source, destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(source.stat().st_ino, destination.stat().st_ino)
 
     def test_only_current_terminal_devices_are_granted(self):
         with patch.object(isolation.os, "ttyname", side_effect=["/dev/ttys007", OSError(), OSError()]):
@@ -341,6 +420,59 @@ class ProfileTests(IsolationFixture):
             isolation.command(self.project, self.native, [], self.hook)
 
 
+class TitleBridgePolicyTests(IsolationFixture):
+    def setUp(self):
+        super().setUp()
+        self.native = self.temp_root / "native-claude"
+        self.native.write_text("not executed")
+        self.native.chmod(0o700)
+        self.hook = Path("/private/tmp/surge-cc-oauth-synthetic/browser")
+        self.title_dir = tempfile.TemporaryDirectory(prefix="surge-cc-title-test-", dir="/private/tmp")
+        self.addCleanup(self.title_dir.cleanup)
+        self.title_hook = Path(self.title_dir.name) / "hook"
+        self.title_hook.write_text("#!/bin/sh\nprintf '{}'\n")
+        self.title_hook.chmod(0o500)
+
+    def test_only_internal_title_events_enabled_with_no_host_settings(self):
+        values = isolation.arguments([], title_hook=self.title_hook)
+        settings = json.loads(values[values.index("--settings") + 1])
+        self.assertFalse(settings["disableAllHooks"])
+        self.assertEqual(values[:2], ["--setting-sources", ""])
+        self.assertEqual(set(settings["hooks"]), {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"})
+        for hooks in settings["hooks"].values():
+            self.assertEqual(hooks, [{"hooks": [{"type": "command", "command": str(self.title_hook), "timeout": 4}]}])
+        self.assertIn("--strict-mcp-config", values)
+        self.assertIn("--no-chrome", values)
+
+    def test_title_capability_has_no_host_files_or_general_localhost_grant(self):
+        profile = isolation.profile(self.project, self.native, self.hook, title_hook=self.title_hook)
+        self.assertIn('(literal ' + json.dumps(str(self.title_hook)) + ')', profile)
+        self.assertIn('(allow network-outbound (literal ' + json.dumps(str(self.title_hook.parent / 's')) + '))', profile)
+        self.assertNotIn('(subpath ' + json.dumps(str(self.title_hook.parent)) + ')', profile)
+        self.assertNotIn('remote tcp "localhost:*"', profile)
+        self.assertNotIn('Library/Application Support/orca', profile)
+        self.assertNotIn(str(Path.home() / '.orca'), profile)
+        self.assertNotIn(str(Path.home() / '.claude'), profile)
+        self.assertIn('(allow network-outbound (remote tcp "localhost:62919"))', profile)
+
+    def test_invalid_title_file_alias_permissions_and_location_are_rejected(self):
+        with self.assertRaises(core.Blocked):
+            isolation.arguments([], title_hook=self.native)
+        self.title_hook.chmod(0o755)
+        with self.assertRaises(core.Blocked):
+            isolation.arguments([], title_hook=self.title_hook)
+        self.title_hook.chmod(0o500)
+        alias = self.title_hook.parent / "other"
+        os.link(self.title_hook, alias)
+        with self.assertRaises(core.Blocked):
+            isolation.profile(self.project, self.native, self.hook, title_hook=self.title_hook)
+        alias.unlink()
+        self.title_hook.unlink()
+        self.title_hook.symlink_to(self.native)
+        with self.assertRaises(core.Blocked):
+            isolation.arguments([], title_hook=self.title_hook)
+
+
 class SharedHistoryIsolationTests(IsolationFixture):
     """Exercise real opt-in/binding across the isolation launch boundary."""
 
@@ -356,6 +488,7 @@ class SharedHistoryIsolationTests(IsolationFixture):
         self.bound = isolation.bind_workspace(self.project, self.config_path, "A")
         self.native = self.temp_root / "native-claude"
         self.native.write_text("never executed")
+        self.native.chmod(0o700)
         self.sandbox = self.temp_root / "sandbox-exec"
         self.sandbox.write_text("never executed")
         self.hook = Path("/private/tmp/surge-cc-oauth-shared-history/browser")
@@ -430,7 +563,7 @@ class SharedHistoryIsolationTests(IsolationFixture):
         command = self.command(values=["--resume", "synthetic-session", "--fork-session"])
         settings = json.loads(command[command.index("--settings") + 1])
         self.assertEqual(settings["autoMemoryDirectory"], str(memory))
-        self.assertTrue(settings["disableAllHooks"])
+        self.assertFalse(settings["disableAllHooks"])
         self.assertFalse(settings["remoteControlAtStartup"])
         self.assertEqual(existing.read_text(), "synthetic private project note\n")
         link = self.bound.config / "projects" / self.shared.bucket(self.bound)
@@ -522,7 +655,7 @@ class CLIIntegrationTests(IsolationFixture):
     def setUp(self):
         super().setUp()
         self.write_registry()
-        from surge_cc import keychain_auth
+        from surge_cc import keychain_auth, dev_proxy
         keychain_auth.migrate_legacy(self.config_path, "A")
         self.native = self.temp_root / "native-claude"
         self.native.write_text("not executed")
@@ -535,6 +668,11 @@ class CLIIntegrationTests(IsolationFixture):
         self.oauth_factory = self.stack.enter_context(patch.object(cli, "OAuthSession"))
         self.oauth = self.oauth_factory.return_value.__enter__.return_value
         self.oauth.browser_hook = Path("/private/tmp/surge-cc-oauth-synthetic/browser")
+        self.development_factory = self.stack.enter_context(patch.object(dev_proxy, "Session"))
+        self.development = self.development_factory.return_value.__enter__.return_value
+        self.development.port = 49152
+        self.development.proxy_url = "http://127.0.0.1:49152"
+        self.strict_factory = self.stack.enter_context(patch.object(dev_proxy, "StrictRuntimeChecker"))
         self.runtime_factory = self.stack.enter_context(patch.object(guard, "RuntimeChecker"))
         self.stack.enter_context(patch.dict(os.environ, {"ANTHROPIC_API_KEY": "SYNTHETIC-KEY", "NO_PROXY": "*"}, clear=True))
         self.checker = Mock(return_value={"ok": True, "checks": [], "summary": "synthetic"})
@@ -568,11 +706,18 @@ class CLIIntegrationTests(IsolationFixture):
         self.assertEqual(call.kwargs["env"]["HOME"], str(self.home))
         self.assertEqual(call.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.project.config))
         self.assertEqual(call.kwargs["env"]["BROWSER"], str(self.oauth.browser_hook))
+        self.assertEqual(call.kwargs["env"]["HTTPS_PROXY"], self.development.proxy_url)
+        self.assertEqual(call.kwargs["env"]["npm_config_https_proxy"], self.development.proxy_url)
+        self.assertIn('remote tcp "localhost:49152"', call.args[0][2])
+        self.assertNotIn('remote tcp "localhost:62919"', call.args[0][2])
         child = Mock()
         call.kwargs["on_started"](child)
         self.oauth.set_child.assert_called_once_with(child)
-        self.runtime_factory.assert_called_once_with(self.config, process=str(self.native))
-        self.assertIs(call.kwargs["checker"], self.runtime_factory.return_value)
+        self.development.set_child.assert_called_once_with(child)
+        self.assertEqual(self.strict_factory.call_count, 2)
+        self.strict_factory.assert_called_with(self.config, process=str(self.native))
+        self.runtime_factory.assert_not_called()
+        self.assertIs(call.kwargs["checker"], self.strict_factory.return_value)
         self.spawn.assert_not_called()
 
     def test_ordinary_project_keeps_previous_native_launch_path(self):
@@ -648,12 +793,14 @@ class CLIIntegrationTests(IsolationFixture):
         sandbox.assert_called_once_with(bound, self.native, ['--permission-mode', 'auto'],
                                         self.oauth.browser_hook, token_auth=False,
                                     default_model='', default_effort='',
-                                        terminal_device=Path('/dev/ttys123'))
+                                        terminal_device=Path('/dev/ttys123'), development_port=49152,
+                                        protected_env=ANY)
+        self.assertEqual(sandbox.call_args.kwargs['protected_env']['HTTPS_PROXY'], self.development.proxy_url)
         call = self.guarded.call_args
         self.assertEqual(call.args[0], command)
         self.assertIs(call.kwargs['popen'], relay.popen)
         self.assertIs(call.kwargs['monitor'], relay.monitor)
-        self.assertIs(call.kwargs['checker'], self.runtime_factory.return_value)
+        self.assertIs(call.kwargs['checker'], self.strict_factory.return_value)
         relay.start.assert_called_once_with(child)
         self.oauth.set_child.assert_called_once_with(child)
         bridge.return_value.__exit__.assert_called_once()

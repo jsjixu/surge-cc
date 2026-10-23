@@ -53,6 +53,7 @@ class LinkedWorktreeTests(unittest.TestCase):
         self.hook = Path("/private/tmp/surge-cc-oauth-worktree-test/browser")
         self.native = self.temp_root / "synthetic-native"
         self.native.write_text("never executed")
+        self.native.chmod(0o700)
         self.fake_sandbox = self.temp_root / "synthetic-sandbox"
         self.fake_sandbox.write_text("never executed")
 
@@ -319,7 +320,7 @@ class LinkedWorktreeTests(unittest.TestCase):
         self.root.parent.chmod(0o777)
         self.assert_blocked()
 
-    def test_policy_has_readonly_shared_git_and_only_exact_index_writes(self):
+    def test_policy_shares_git_data_but_protects_configuration_and_other_worktrees(self):
         project = self.discover()
         policy = isolation.profile(project, self.native, self.hook)
         q = lambda p: json.dumps(str(p))
@@ -332,17 +333,24 @@ class LinkedWorktreeTests(unittest.TestCase):
             self.assertIn('(subpath ' + q(path) + ')', policy)
         write_lines = [line for line in policy.splitlines() if "(allow" in line and "file-write" in line]
         git_lines = [line for line in write_lines if str(self.main / ".git") in line]
-        self.assertEqual(git_lines, ['(allow file-read* file-write* (literal ' + q(self.admin / 'index')
-                                    + ') (literal ' + q(self.admin / 'index.lock') + '))'])
-        for path in (self.main / ".git/hooks", self.main / ".git/config.lock",
-                     self.admin / "config", self.admin / "HEAD.lock"):
-            self.assertNotIn(q(path), policy)
+        self.assertTrue(git_lines)
+        for path in (self.admin / "index", self.admin / "index.lock", self.admin / "HEAD.lock",
+                     self.main / ".git/packed-refs.lock"):
+            self.assertTrue(any('(literal ' + q(path) + ')' in line for line in git_lines))
+        for path in (self.main / ".git/objects", self.main / ".git/refs", self.main / ".git/logs/refs"):
+            self.assertTrue(any('(subpath ' + q(path) + ')' in line for line in git_lines))
+        for path in (self.main / ".git/hooks", self.main / ".git/config", self.main / ".git/config.lock",
+                     self.admin / "config", self.admin / "config.worktree", self.admin / "commondir",
+                     self.main / ".git/objects/info/alternates"):
+            self.assertTrue(any('(subpath ' + q(path) + ')' in line for line in policy.splitlines()
+                                if line.startswith('(deny file-write* file-link ')))
         self.assertNotIn("(allow mach-lookup", policy)
         self.assertNotIn("(allow network*)", policy)
         self.assertIn("(deny file-link)", policy)
+        self.assertIn('(allow file-link (subpath ' + q(project.root) + ') (subpath ' + q(project.home) + '))', policy)
 
     @unittest.skipUnless(sys.platform == "darwin" and isolation.SANDBOX.is_file(), "macOS Seatbelt unavailable")
-    def test_real_sandbox_git_reads_edits_and_shared_metadata_write_denial(self):
+    def test_real_sandbox_git_commit_fetch_push_and_shared_control_write_denial(self):
         project = self.discover()
         self.command(project)
         (self.root / "tracked.txt").write_text("synthetic changed\n")
@@ -367,6 +375,21 @@ class LinkedWorktreeTests(unittest.TestCase):
         self.assertIn("synthetic fixture", history.stdout)
         normal_git = sandbox("/bin/sh", "-c", "git status --short")
         self.assertEqual(normal_git.returncode, 0, normal_git.stderr)
+        stage = sandbox(native, "add", "tracked.txt")
+        self.assertEqual(stage.returncode, 0, stage.stderr)
+        commit = sandbox(native, "commit", "-m", "synthetic sandbox commit")
+        self.assertEqual(commit.returncode, 0, commit.stderr)
+        branch = sandbox(native, "branch", "synthetic-shared-branch")
+        self.assertEqual(branch.returncode, 0, branch.stderr)
+        # A disposable local bare remote is inside this worktree; this verifies
+        # real Git transfer/write behavior without credentials or the network.
+        remote = self.root / "synthetic-remote.git"
+        self.git("clone", "--bare", "--no-hardlinks", str(self.main), str(remote))
+        fetched = sandbox(native, "fetch", "--no-tags", str(remote),
+                          "refs/heads/synthetic-worktree:refs/remotes/synthetic/worktree")
+        self.assertEqual(fetched.returncode, 0, fetched.stderr)
+        pushed = sandbox(native, "push", str(remote), "HEAD:refs/heads/from-sandbox")
+        self.assertEqual(pushed.returncode, 0, pushed.stderr)
         for path in (self.main / "tracked.txt", self.main_home):
             command = "/bin/ls" if path.is_dir() else "/bin/cat"
             result = sandbox(command, path)
@@ -383,6 +406,16 @@ class LinkedWorktreeTests(unittest.TestCase):
             result = sandbox("/bin/ln", self.main / ".git/config", destination)
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertFalse(destination.exists())
+        internal = project.home / "internal-link"
+        result = sandbox("/bin/ln", self.root / "tracked.txt", internal)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(internal.stat().st_ino, (self.root / "tracked.txt").stat().st_ino)
+        # Both endpoints matter, even if the destination is another granted
+        # writable area (the shared Git object store).
+        destination = self.main / ".git/objects/forbidden-project-link"
+        result = sandbox("/bin/ln", self.root / "tracked.txt", destination)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(destination.exists())
         index_lock = self.admin / "index.lock"
         result = sandbox("/bin/sh", "-c", 'printf synthetic-lock > "$1"', "sh", index_lock)
         self.assertEqual(result.returncode, 0, result.stderr)

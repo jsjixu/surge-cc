@@ -183,18 +183,31 @@ def _optional_git_entry(path: Path, *, directory: bool = False) -> None:
                 raise ValueError("unsafe git metadata")
 
 
-def _git_access(worktree: LinkedWorktree) -> tuple[list[Path], list[Path], list[Path]]:
-    """Only repository data and this worktree's metadata; never hooks or siblings."""
+def _git_access(worktree: LinkedWorktree) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    """Share repository data, not host Git configuration or sibling worktrees.
+
+    Objects/refs are deliberately shared within one registered repository: a
+    commit, fetch or push can update its branches. Working files, other private
+    worktree metadata, hooks and configuration remain outside that grant.
+    """
     common, admin = worktree.common_dir, worktree.git_dir
-    dirs = [common / "objects", common / "refs", admin / "refs"]
+    write_dirs = [common / "objects", common / "refs", common / "logs/refs",
+                  admin / "refs", admin / "logs", admin / "rebase-apply", admin / "rebase-merge",
+                  admin / "sequencer", admin / "rr-cache"]
+    dirs = list(write_dirs)
     files = [common / name for name in (
         "HEAD", "config", "config.worktree", "packed-refs", "shallow", "info/grafts", "info/exclude")]
     files += [admin / name for name in (
         "HEAD", "index", "commondir", "gitdir", "config.worktree", "ORIG_HEAD", "FETCH_HEAD",
         "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "CHERRY_PICK_HEAD", "REVERT_HEAD",
         "AUTO_MERGE", "shallow", "info/sparse-checkout", "logs/HEAD")]
-    writes = [admin / "index", admin / "index.lock"]
-    return dirs, files, writes
+    state = ("HEAD", "index", "COMMIT_EDITMSG", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE",
+             "CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE", "REBASE_HEAD", "SQUASH_MSG",
+             "BISECT_LOG", "BISECT_NAMES", "BISECT_EXPECTED_REV", "BISECT_START", "BISECT_TERMS",
+             "BISECT_HEAD", "shallow", "info/sparse-checkout")
+    writes = [admin / (name + suffix) for name in state for suffix in ("", ".lock")]
+    writes += [common / (name + suffix) for name in ("packed-refs", "shallow") for suffix in ("", ".lock")]
+    return dirs, files, writes, write_dirs
 
 
 def _validate_worktree(root: Path, name: str, main_root: Path) -> LinkedWorktree:
@@ -219,11 +232,11 @@ def _validate_worktree(root: Path, name: str, main_root: Path) -> LinkedWorktree
     if _git_path(admin / "gitdir") != root / ".git":
         raise ValueError("worktree backlink mismatch")
     result = LinkedWorktree(main_root, admin)
-    dirs, files, writes = _git_access(result)
+    dirs, files, writes, _ = _git_access(result)
     for directory in dirs:
         _optional_git_entry(directory, directory=True)
     # Validate intermediate metadata directories even for currently absent leaves.
-    for directory in (common / "info", admin / "info", admin / "logs"):
+    for directory in (common / "info", common / "logs", admin / "info", admin / "logs"):
         _optional_git_entry(directory, directory=True)
     for file in set(files + writes):
         _optional_git_entry(file)
@@ -340,9 +353,20 @@ def for_cwd(config_path: Path, cwd: Path) -> Project | None:
         raise Blocked("文件隔离注册信息无效，已阻止启动；不会退回普通启动。") from None
 
 
-def environment(project: Project, proxy: str, inherited: dict | None = None, *, token_auth: bool = False) -> dict:
+def _development_port(proxy: str) -> int:
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{4,5})", proxy)
+    port = int(match.group(1)) if match else 0
+    if not 1024 <= port <= 65535 or port in (6152, 6153, 62919):
+        raise Blocked("开发代理入口必须是独立的本机受控端口，未启动。")
+    return port
+
+
+def environment(project: Project, proxy: str, inherited: dict | None = None, *, token_auth: bool = False,
+                development_proxy: str | None = None) -> dict:
     if proxy != "http://127.0.0.1:62919":
         raise Blocked("当前文件沙箱只允许专用代理 127.0.0.1:62919；代理设置不匹配，未启动。")
+    if development_proxy is not None:
+        _development_port(development_proxy)
     inherited = os.environ if inherited is None else inherited
     # Deliberately do not inherit provider tokens, SSH sockets, IDE/Orca handles,
     # DYLD/NODE/PYTHON injection flags, Git config, or any real-home paths.
@@ -356,9 +380,14 @@ def environment(project: Project, proxy: str, inherited: dict | None = None, *, 
         "XDG_CONFIG_HOME": str(project.home / ".config"),
         "XDG_CACHE_HOME": str(project.home / ".cache"),
         "XDG_DATA_HOME": str(project.home / ".local/share"),
-        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "NPM_CONFIG_CACHE": str(project.home / ".cache/npm"),
+        "NPM_CONFIG_PREFIX": str(project.home / ".local"),
+        "PNPM_HOME": str(project.home / ".local/share/pnpm"),
+        "PATH": str(project.home / ".local/bin") + ":" + str(project.root / "node_modules/.bin")
+                + ":/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1", "DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1",
+        "NODE_USE_ENV_PROXY": "1",
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_ATTR_NOSYSTEM": "1",
     })
@@ -387,26 +416,36 @@ def environment(project: Project, proxy: str, inherited: dict | None = None, *, 
                       Path("/Applications/Xcode.app/Contents/Developer")):
         if developer.resolve() == developer and (developer / "usr/bin/git").is_file():
             base["DEVELOPER_DIR"] = str(developer)
-            base["PATH"] = str(developer / "usr/bin") + ":" + base["PATH"]
+            base["PATH"] += ":" + str(developer / "usr/bin")
             break
-    return proxy_env(proxy, base=base)
+    return proxy_env(development_proxy or proxy, base=base)
 
 
 def arguments(values: list[str], *, theme: str | None = None,
               memory_directory: Path | None = None, local_messaging: bool = False,
-              default_model: str = "", default_effort: str = "") -> list[str]:
+              default_model: str = "", default_effort: str = "",
+              title_hook: Path | None = None, project: Project | None = None,
+              protected_env: dict | None = None) -> list[str]:
     # Custom integrations may read outside the copy using an unsandboxed host.
     # Re-enable integrations only after a separate boundary review.
     forbidden = {"--settings", "--setting-sources", "--mcp-config", "--plugin-dir",
-                 "--plugin-url", "--chrome", "--ide", "--add-dir", "--worktree", "-w"}
+                 "--plugin-dir-no-mcp", "--managed-settings", "--plugin-url",
+                 "--chrome", "--ide", "--add-dir", "--worktree", "-w"}
     if any(v.split("=", 1)[0] in forbidden for v in values):
         raise Blocked("隔离项目暂不允许额外设置、目录、插件、MCP 或 IDE/Chrome 集成。")
-    # Native user/project settings remain disabled at this boundary. Supply
-    # the requested startup defaults here instead of inheriting a mutable
-    # settings file or a higher-priority effort environment variable. Native
-    # --model/--effort flags and in-session choices can still override them.
+    # The current isolated HOME/project may use ordinary plugin/settings
+    # sources. The registered caller supplies their scope and fixed overrides;
+    # bare argument validation does not read any user files.
     settings = {"disableAllHooks": True, "remoteControlAtStartup": False,
                 "forceLoginMethod": "claudeai"}
+    if title_hook is not None:
+        # The short-lived title bridge merges with scoped development hooks.
+        import shlex
+        hook = _title_bridge_hook(title_hook)
+        settings["disableAllHooks"] = False
+        settings["hooks"] = {
+            event: [{"hooks": [{"type": "command", "command": shlex.quote(str(hook)), "timeout": 4}]}]
+            for event in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")}
     if default_model:
         settings["model"] = default_model
     if default_effort:
@@ -424,7 +463,12 @@ def arguments(values: list[str], *, theme: str | None = None,
         settings["isolatePeerMachines"] = True
         settings["disableRemoteControl"] = True
         settings["autoUploadSessions"] = False
-    return ["--setting-sources", "", "--settings", json.dumps(settings),
+    sources = ""
+    if project is not None:
+        from . import development
+        settings = development.runtime_settings(project, settings, protected_env)
+        sources = "user,project,local"
+    return ["--setting-sources", sources, "--settings", json.dumps(settings),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", *values]
 
 
@@ -441,8 +485,32 @@ def _q(value: Path | str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def _title_bridge_hook(path: Path) -> Path:
+    try:
+        path = Path(path)
+        parent = path.parent
+        if (path.name != "hook" or parent.parent != Path("/private/tmp")
+                or not re.fullmatch(r"surge-cc-title-[A-Za-z0-9_-]+", parent.name)
+                or path.resolve(strict=True) != path):
+            raise ValueError("invalid title hook location")
+        directory, info = parent.lstat(), path.lstat()
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+                or directory.st_mode & 0o077 or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid() or info.st_nlink != 1
+                or info.st_mode & 0o077 or not info.st_mode & stat.S_IXUSR):
+            raise ValueError("unsafe title hook permissions")
+        return path
+    except (OSError, ValueError, TypeError):
+        raise Blocked("Orca 标题通知入口不符合隔离要求，未启动。") from None
+
+
 def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path | None = None,
-            token_auth: bool = False, terminal_device: Path | None = None) -> str:
+            token_auth: bool = False, terminal_device: Path | None = None,
+            title_hook: Path | None = None, development_port: int | None = None) -> str:
+    if development_port is not None:
+        if isinstance(development_port, bool):
+            raise Blocked("开发代理端口无效，未启动。")
+        _development_port(f"http://127.0.0.1:{development_port}")
     hook = browser_hook.resolve()
     if hook.parent.parent != Path("/private/tmp") or not hook.parent.name.startswith("surge-cc-oauth-"):
         raise Blocked("授权桥目录不符合隔离要求。")
@@ -451,14 +519,28 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
                  "/opt/homebrew/Cellar", "/opt/homebrew/opt", "/opt/homebrew/bin",
                  "/opt/homebrew/lib", "/opt/homebrew/share"]
     read_files = ["/", "/private/etc/localtime", "/private/etc/passwd", "/private/etc/group",
-                  "/private/etc/hosts", "/dev/null", "/dev/urandom", "/dev/random",
+                  "/private/etc/hosts", "/private/etc/ssl/openssl.cnf", "/private/etc/ssl/cert.pem",
+                  "/etc/ssl/openssl.cnf", "/etc/ssl/cert.pem", "/private/var/select/sh",
+                  "/opt/homebrew/etc/openssl@3/openssl.cnf", "/opt/homebrew/etc/openssl@3/cert.pem",
+                  "/opt/homebrew/etc/ca-certificates/cert.pem",
+                  "/dev/null", "/dev/urandom", "/dev/random",
                   native.resolve(), hook, Path(sys.executable).resolve()]
     if probe is not None:
         read_files.append(probe.resolve())
     metadata = {Path("/private"), Path("/private/etc"), Path("/private/var"), Path("/opt"),
-                Path("/opt/homebrew"), Path("/System"), Path("/dev"), hook.parent}
+                Path("/opt/homebrew"), Path("/System"), Path("/dev"), hook.parent,
+                Path("/etc"), Path("/etc/ssl"), Path("/private/etc/ssl"), Path("/private/var/select"),
+                Path("/opt/homebrew/etc"), Path("/opt/homebrew/etc/openssl@3"),
+                Path("/opt/homebrew/etc/ca-certificates")}
+    read_dirs.extend(("/private/etc/ssl/certs", "/etc/ssl/certs", "/opt/homebrew/etc/openssl@3/certs"))
     for path in (project.root, project.home, native.resolve(), hook, Path(sys.executable).resolve()):
         metadata.update(path.parents)
+    title_rules = ""
+    if title_hook is not None:
+        title_hook = _title_bridge_hook(title_hook)
+        read_files.append(title_hook)
+        metadata.update(title_hook.parents)
+        title_rules = f"(allow network-outbound (literal {_q(title_hook.parent / 's')}))\n"
     from . import isolated_auth
     shared_auth = None if token_auth else isolated_auth.prepare(project)
     auth_writes = ""
@@ -484,13 +566,30 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
             auth_writes += "(deny file-read* file-write* (subpath " + _q(project.config / ".credentials.json") + "))\n"
     git_writes = ""
     if project.worktree:
-        git_dirs, git_files, writable = _git_access(project.worktree)
+        git_dirs, git_files, writable, write_dirs = _git_access(project.worktree)
         read_dirs.extend(git_dirs)
         read_files.extend(git_files)
         for path in [*git_dirs, *git_files, *writable]:
             metadata.update(path.parents)
         git_writes = "(allow file-read* file-write* " + " ".join(
-            "(literal " + _q(path) + ")" for path in writable) + ")\n"
+            "(literal " + _q(path) + ")" for path in writable) + " " + " ".join(
+            "(subpath " + _q(path) + ")" for path in write_dirs) + ")\n"
+        git_writes += "(allow file-write-create " + " ".join(
+            "(literal " + _q(path) + ")" for path in (
+                project.worktree.common_dir / "logs", project.worktree.git_dir / "info")) + ")\n"
+    # Main repositories are inside root's writable tree. Protect their control
+    # files explicitly too, so a sandboxed process cannot install a host-side
+    # hook or alter another worktree's linkage through the shared repository.
+    common = project.worktree.common_dir if project.worktree else project.root / ".git"
+    controls = [common / name for name in ("config", "config.lock", "config.worktree", "config.worktree.lock",
+                                          "hooks", "objects/info/alternates", "objects/info/http-alternates")]
+    if project.worktree:
+        controls += [project.worktree.git_dir / name for name in (
+            "config", "config.lock", "config.worktree", "config.worktree.lock", "commondir", "gitdir")]
+    else:
+        controls += [common / "worktrees"]
+    git_writes += "(deny file-write* file-link " + " ".join("(subpath " + _q(path) + ")" for path in controls) + ")\n"
+    git_writes += f"(deny file-write-unlink (literal {_q(project.root)}) (literal {_q(common)}))\n"
     from . import shared_history
     history = shared_history.history(project)
     history_rules = ""
@@ -540,6 +639,10 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
     return f'''(version 1)
 (deny default)
 (deny file-link)
+; Seatbelt applies file-link path filters to both source and destination.
+; Never include readonly shared Git/runtime roots here: linking their inodes
+; into a writable HOME would otherwise allow writes through the new name.
+(allow file-link (subpath {_q(project.root)}) (subpath {_q(project.home)}))
 (allow process-exec process-fork)
 (allow process-info* (target self))
 (allow signal (target same-sandbox))
@@ -551,15 +654,17 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
 (allow file-read* file-write* (subpath {_q(project.root)}) (subpath {_q(project.home)}))
 {git_writes}{auth_writes}{history_rules}{peer_rules}(allow file-write-data (literal "/dev/null"))
 (allow file-read* file-write-data file-ioctl {tty_rules})
-(allow network-outbound (remote tcp "localhost:62919"))
+(allow network-outbound (remote tcp "localhost:{development_port or 62919}"))
 (allow network-outbound (literal {_q(hook.parent / 's')}))
-(allow network-bind network-inbound (local tcp "localhost:*"))
+{title_rules}(allow network-bind network-inbound (local tcp "localhost:*"))
 '''
 
 
 def command(project: Project, native: Path, values: list[str], browser_hook: Path, *,
             token_auth: bool = False, terminal_device: Path | None = None,
-            default_model: str = "", default_effort: str = "") -> list[str]:
+            default_model: str = "", default_effort: str = "",
+            title_hook: Path | None = None, development_port: int | None = None,
+            protected_env: dict | None = None) -> list[str]:
     if not SANDBOX.is_file():
         raise Blocked("本机缺少文件沙箱，已阻止隔离项目启动。")
     arguments(values)  # Validate before creating or changing runtime state.
@@ -583,7 +688,10 @@ def command(project: Project, native: Path, values: list[str], browser_hook: Pat
             clean_path(project.root)
     except (OSError, ValueError, TypeError):
         raise Blocked("隔离 HOME 或 Git worktree 关联已变更或权限不安全，已阻止启动。") from None
-    from . import isolated_preferences, isolated_trust, shared_history, messaging
+    from . import isolated_preferences, isolated_trust, shared_history, messaging, development, legacy_permissions
+    if legacy_permissions.repair(project) is not None:
+        print("[Surge CC] 已备份并修正旧版 Orca 目录拒绝规则；当前项目可读写，其他目录仍由文件沙箱隔离。", file=sys.stderr)
+    development.prepare(project, native)
     isolated_preferences.prepare(project)
     # Trust is a separate, exact-project opt-in. Apply only after the repeated
     # worktree linkage checks; it never changes the Seatbelt or proxy policy.
@@ -593,9 +701,11 @@ def command(project: Project, native: Path, values: list[str], browser_hook: Pat
     args = arguments(values, theme=isolated_preferences.theme(project),
                      memory_directory=private_memory(project) if history is not None else None,
                      local_messaging=peers is not None,
-                     default_model=default_model, default_effort=default_effort)
+                     default_model=default_model, default_effort=default_effort,
+                     title_hook=title_hook, project=project, protected_env=protected_env)
     return [str(SANDBOX), "-p", profile(project, native, browser_hook, token_auth=token_auth,
-                                      terminal_device=terminal_device), str(native), *args]
+                                      terminal_device=terminal_device, title_hook=title_hook,
+                                      development_port=development_port), str(native), *args]
 
 
 def diagnose(project: Project, native: Path, config: dict, config_path: Path, *, token_auth: bool = False) -> dict:

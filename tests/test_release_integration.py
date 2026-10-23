@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from surge_cc import cli, core, guard, isolation, keychain_auth, shortcuts, workspaces
+from surge_cc import cli, core, dev_proxy, guard, isolation, keychain_auth, shortcuts, workspaces
 
 
 class Fixture(unittest.TestCase):
@@ -196,6 +196,11 @@ class NativeLaunchIntegrationTests(Fixture):
         self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
         self.stack.enter_context(patch.object(cli, 'migrate_accounts'))
         self.stack.enter_context(patch.object(guard, 'RuntimeChecker'))
+        self.stack.enter_context(patch.object(dev_proxy, 'StrictRuntimeChecker'))
+        development = self.stack.enter_context(patch.object(dev_proxy, 'Session'))
+        self.development = development.return_value.__enter__.return_value
+        self.development.port = 49152
+        self.development.proxy_url = 'http://127.0.0.1:49152'
         self.stack.enter_context(patch.object(keychain_auth, 'load', return_value=None))
         self.stack.enter_context(patch.object(cli, 'code_settings_ok', return_value=True))
         factory = self.stack.enter_context(patch.object(cli, 'OAuthSession'))
@@ -253,9 +258,10 @@ class NativeLaunchIntegrationTests(Fixture):
         self.assertEqual(command[3], str(self.native))
         settings = json.loads(command[command.index('--settings') + 1])
         self.assertEqual((settings['model'], settings['effortLevel']), ('claude-opus-5-5', 'high'))
-        self.assertTrue(settings['disableAllHooks'])
+        self.assertFalse(settings['disableAllHooks'])
+        self.assertEqual(command[command.index('--setting-sources') + 1], 'user,project,local')
         self.assertEqual(call.kwargs['env']['HOME'], str(home))
-        self.assertEqual(call.kwargs['env']['HTTPS_PROXY'], self.config['proxy_url'])
+        self.assertEqual(call.kwargs['env']['HTTPS_PROXY'], self.development.proxy_url)
         self.assertEqual(call.kwargs['env']['NO_PROXY'], '')
         self.assertIn('--strict-mcp-config', command)
 

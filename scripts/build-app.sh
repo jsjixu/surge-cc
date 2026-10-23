@@ -145,8 +145,8 @@ cat > "$STAGE_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Surge CC</string>
   <key>CFBundleIconFile</key><string>SurgeCCIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.5.0</string>
-  <key>CFBundleVersion</key><string>16</string>
+  <key>CFBundleShortVersionString</key><string>0.5.1</string>
+  <key>CFBundleVersion</key><string>17</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
