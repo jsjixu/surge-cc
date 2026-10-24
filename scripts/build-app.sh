@@ -155,8 +155,8 @@ cat > "$STAGE_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Surge CC</string>
   <key>CFBundleIconFile</key><string>SurgeCCIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.5.2</string>
-  <key>CFBundleVersion</key><string>18</string>
+  <key>CFBundleShortVersionString</key><string>0.5.3</string>
+  <key>CFBundleVersion</key><string>19</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>Open requested webpages in the verified dedicated browser while preserving personal Chrome.</string>

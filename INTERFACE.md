@@ -1,6 +1,6 @@
-# Surge CC 0.5.2 接口合约
+# Surge CC 0.5.3 接口合约
 
-本文对应 **v0.5.2 / Build 18**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
+本文对应 **v0.5.3 / Build 19**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 终端入口
 
@@ -32,7 +32,7 @@ Devin CLI 等其他客户端使用 Claude 模型，不等于调用被接管的�
 
 `oauth.validate_authorization_url` 只接受明确的官方 HTTPS authorize 端点，保留原 URL；要求 code/S256/state/PKCE，拒绝重复查询键、用户信息、fragment、控制字符和非 loopback callback。`callback_owned_by` 以活 CLI 进程句柄及 lsof 验证精确端口仅绑定回环地址。
 
-`cli.oauth_checks` 执行完整检查，随后 `oauth_gate.verify_proxy_exit` 经实际专用 HTTP 入口访问固定 HTTPS 回显服务。超时、重定向、非 200、未知或不一致 IP 均失败；打开前还复核当前线路状态。只在成功后创建独立授权浏览器，打开后再次检查。
+`cli.oauth_checks` 在规则模式下执行完整必需检查（跳过可选外部 DNS 测量），随后 `oauth_gate.verify_proxy_exit` 经实际专用 HTTP 入口访问固定 HTTPS 回显服务。超时、重定向、非 200、未知或不一致 IP 均失败；打开前还复核当前线路状态，打开后再次检查。OAuth 沿用原有非隔离 CLI 的明确全局挂起例外：`OAuthSession._check` 接受有效的 `global_mode_allowed` 报告，此分支不证明固定出口保护，且不会执行上述实际出口探测。v0.5.3 的严格 `BrowserRuntimeChecker` 作用于普通专用网页，不替换 OAuth 检查器；已登记隔离项目仍由其严格开发代理和守护约束。
 
 网页与授权浏览器统一使用 `workspace/data/Browser`，启动参数明确指定 `--profile-directory=Default`。共享工作区锁阻止备份/恢复，共同的 `.browser.lock` 排他锁覆盖偏好准备至浏览器退出；OAuth 仍持有 `.oauth.lock`。已有窗口占用时拒绝 Chrome 进程转交，提示先关闭再重试，不改用另一资料。旧 `OAuthBrowser` 保留供备份/恢复，不再作为启动路径。回调 bypass 是 `<-loopback>` 后追加精确 HTTP host:port，其他连接仍走原专用代理。`OAuthSession` 关闭时只停止它持有的授权浏览器，未修改系统默认浏览器、Surge 配置或其他策略组。
 
@@ -123,7 +123,9 @@ GUI 调用任一命令成功后清除旧错误并自动执行新的 `check`；�
 | `repair --plan-id ID` | 核对原计划仍匹配后执行；配置改写先备份与语法验证，失败时尝试回滚可确认的本次改动 |
 | `browser-locks repair --workspace NAME` | 离线检查当前工作区的专用浏览器运行锁，仅归档可确认过期的锁链接；不结束进程或执行线路检查 |
 | `browser-locks recover --workspace NAME` | 请求经过核验的当前专用窗口正常退出，再归档过期锁；不强杀 CLI，不执行线路检查或启动 |
-| `launch web` | 完整检查后启动所选工作区的独立 Chrome 和专属监控进程；不复用个人 Chrome |
+| `launch web` | 完整检查后交给严格网页守护复核规则模式、增强模式及实际专用入口出口，再启动独立 Chrome；不复用个人 Chrome、不接受全局挂起 |
+| `shortcut open --launcher-config PATH --json` | 复用已核验窗口，或由独立守护执行一次必要启动门禁；不运行完整隐私诊断 |
+| `shortcut open --launcher-config PATH --url-stdin --json` | 从 stdin 读取普通网页请求，经过同一账号和线路门禁后递送到精确核验的专用浏览器进程 |
 | `launch code --terminal` | 完整检查后打开私有 `.command`；终端内再次执行完整检查，然后启动受监控 CLI |
 | `launch code -- CLAUDE_ARGS...` | 在当前项目目录同步运行受监控 Claude Code；显式代理与工作区 `CLAUDE_CONFIG_DIR`；不对参数做 shell 求值 |
 | `launch code --passthrough -- CLAUDE_ARGS...` | 与上述启动检查相同，但不污染子进程 stdout；检查失败回执写入 stderr，供终端包装器使用 |
@@ -180,13 +182,13 @@ GUI 每行默认显示短摘要，长说明和可选证据折叠在「查看完�
 
 `core.result` 的检查通过条件：检查非空、ID 不重复、包含全部基础检查 ID（`surge`、`mode`、`group`、`definition`、`route`、`proxy`、`exit`、`stable`），且所有必需行均为 `pass`。非必需的 `unknown`/`warn`/`fail` 会使摘要提示仍有待确认项目。保存、工作区、修复及读取保护状态属于操作回执，可返回 `ok:true` 与空 `checks`；这只表示该操作完成，不是线路检查通过。GUI 不应将这类操作回执转为绿色启动状态。
 
-v0.3.0 在已确认 `Surge.mode=proxy`（全局代理）时返回挂起报告：`ok:false`、必需 `mode` 行 `status:"fail"`，并包含 `paused:true`、`pause_reason:"surge-global-mode"`、`surge_mode:"proxy"`、`launch_allowed:true`、`protection_active:false`。`check` 仍退出 `2`，不执行后续浏览器/DNS 探针；但 `launch` 可按明确的全局代理分支启动。成功的 GUI 网页/Terminal 启动回执保持这些挂起字段，改为 `ok:true`、`launched:true`、`target:"web"` 或 `"code-terminal"`，退出 `0`。同步 CLI 非零结束不得当作启动成功或检查通过。上述挂起分支仅用于专用网页和未启用项目文件沙箱的 CLI。v0.5.1 的已登记隔离开发项目要求规则模式；全局模式阻止该项目启动，不进入挂起分支。其他入口在全局模式下依 Surge 全局策略联网，固定出口与断线阻断暂停，工作区分离保留。
+在已确认 `Surge.mode=proxy`（全局代理）时，通用 `check` 保留挂起报告：`ok:false`、必需 `mode` 行 `status:"fail"`，并包含 `paused:true`、`pause_reason:"surge-global-mode"`、`surge_mode:"proxy"`、`launch_allowed:true`、`protection_active:false`。`check` 仍退出 `2`，不执行后续浏览器/DNS 探针；这不是所有启动入口的授权。未启用项目文件沙箱的 CLI 保留明确的全局启动分支，成功的 Terminal 启动回执为 `ok:true`、`launched:true`、`target:"code-terminal"` 并保留挂起字段；同步 CLI 非零结束不得当作启动成功或检查通过。v0.5.3 的专用网页（含 `launch web`、快捷入口和默认浏览器链接）不接受该例外，必须保持规则模式与增强模式；v0.5.1 起的已登记隔离开发项目也要求规则模式。非隔离 CLI 及其 OAuth 打开器沿用原有全局挂起行为，此时依 Surge 全局策略联网，固定出口与断线阻断暂停，工作区分离保留。
 
 GUI 只有在全部全局挂起字段类型和值一致、检查行非空且 ID 唯一、状态有效、必需 `surge:pass` 和 `mode:fail` 存在且其他必需项全部通过时识别「保护已挂起」。检查回执须为 `ok:false` / 退出 `2` / 未启动；成功启动须为 `ok:true` / 退出 `0` / `launched:true` / 已知 GUI 目标。缺字段、未知原因、直连冒用全局标记、矛盾退出码或其他必需失败均按阻止处理，不能变为绿色检查通过。
 
 `direct`（直连）保留 `paused:true`、`pause_reason:"surge-mode"`、`surge_mode:"direct"` 的阻止启动报告；未知或不可读取模式是一般失败。切回规则模式后重新检查恢复保护；没有自动切换 Surge 模式的命令。
 
-默认严格模式让 DNS 接管、浏览器 ICE 等无法确认项阻止启动。已观察到预期出口之外的公网 ICE 地址始终是必需 `fail`，关闭严格模式也不放行。浏览器有显式语言或时区预期时，其回执行始终必需；缺失为 `unknown`，不一致为 `warn`。系统环境和 GeoIP/ASN 的显式预期同样产生必需比较。
+完整检查路径的默认严格模式让 DNS 接管、浏览器 ICE 等无法确认项阻止通过。已观察到预期出口之外的公网 ICE 地址始终是必需 `fail`，关闭严格模式也不放行。浏览器有显式语言或时区预期时，其回执行始终必需；缺失为 `unknown`，不一致为 `warn`。系统环境和 GeoIP/ASN 的显式预期同样产生必需比较。v0.5.3 快捷入口使用下述必要门禁，不运行这些完整诊断，也不读取缓存诊断作为启动许可；快捷打开成功不代表刚完成 DNS、ICE 或环境实测。
 
 0.2.3 的 `dns_egress` 经固定专用 HTTP 入口执行 dnsleak.dev 随机域名权威观测。完整、有效、前后保护与实际出口一致且服务分类为 `no_leak` 的回执显示非必需 `info`；`split` 为非必需 `warn`；不完整、超时、限流、无结论为非必需 `unknown`。专用范围、实际出口或配置稳定性核验失败是必需 `fail`，撤回启动资格。快速检查与 OAuth 内部复核不执行此补充检测，保留 `unknown` 而非复用缓存。递归器 IP 不必等于住宅代理 IP；`info` 仅为本次专用代理链的观测，不证明全系统无泄漏。FakeIP 接管与权威观测分别展示。
 
@@ -238,15 +240,17 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 ## 运行监控合约
 
-`guard.run_guarded` 在启动前持有工作区共享锁，执行基础线路复核、建立运行基线并再次检查出口。它只持有自己 `Popen` 创建的独立会话子进程，不根据保存的 PID 或通用进程名终止其他程序。网页子进程若立即退出或交接而无法持续持有，不算已建立监控会话。
+`guard.run_guarded` 在启动前持有工作区共享锁。CLI 路径保留基础线路预检及运行检查；网页路径默认由 `BrowserRuntimeChecker` 建立基线并经实际专用入口核验一次出口，不重复调用通用 `run_checks`。显式注入的自定义预检仍须通过，网页不接受挂起报告。它只持有自己 `Popen` 创建的独立会话子进程，不根据保存的 PID 或通用进程名终止其他程序。网页子进程若立即退出或交接而无法持续持有，不算已建立监控会话。
 
 `RuntimeChecker` 保存配置路径、组状态和生效配置摘要，周期复核：规则模式、单节点拓扑、选中节点、完整配置摘要、本地端口属于 Surge、所有基线域名的该目标程序路由，并在规定周期核对实际出口。`browser_path` 非空时额外要求增强模式有效，并逐轮调用 `validate_scope`；异步路由/出口检查结束后复读配置基线。它不周期重跑 DNS、WebRTC、语言、时区、GeoIP/ASN 或所有项目文件审计。
 
 默认巡检目标间隔为 `guard_interval=10` 秒；出口复查为 `max(30, guard_interval)` 秒。每次检查完成后再计算下一轮，检测耗时会增加实际间隔。检查错误或未知异常触发清理；停止先 TERM，必要时核对仍属于自身后 KILL。清理失败使用 `stop_failed`，不会报告已确认停止。
 
-专用网页与未启用项目文件沙箱的 CLI 在运行期间，由监控在轮询识别到全局代理模式后挂起固定出口与断线阻断，允许已持有会话继续运行，并记录 `suspended` 状态。切回规则模式后，监控在轮询识别到变化后重新核验保护前提，通过后恢复运行保护，失败则停止对应受控程序；直连和未知模式仍触发停止。模式切换与监控响应之间存在轮询延迟，不是切换瞬间的原子防火墙操作。挂起不修改 Surge 模式、策略或个人 Chrome。已登记隔离开发会话使用 `dev_proxy.StrictRuntimeChecker`，不支持挂起；发现全局、直连、未知模式或保护失败时，开发代理关闭连接并锁定本次启动，守护停止对应受控进程。成功的连接前检查最多在同次启动内复用一秒；保护仍有检查和轮询延迟，不构成瞬时防火墙。
+专用网页使用 `BrowserRuntimeChecker`，设置 `allow_global_suspend=False`，在启动和运行期间都要求规则模式、增强模式、固定单节点与专用入口边界。发现全局、直连、未知模式、出口或边界核验失败时，阻止启动或停止它持有的浏览器；不进入 `suspended`，也不转交个人 Chrome。出口检查使用 `oauth_gate.verify_proxy_exit`，经浏览器实际使用的代理入口查询，而非仅查询节点策略。
 
-私有状态/回执字段：`schema`、`target`、`state`、`ok`、`checked_at`、`detail`，不存 PID、CLI 参数或配置明文。可能状态为 `starting`、`running`、`suspended`、`exited`、`blocked`、`stopped`、`stop_failed`。首次有效 `running` 或 `suspended` 回执确认对应模式下的启动；`suspended` 不能作为保护已生效的证据。后续状态文件记录监控进展。`guard-status` 仅在 `state=running` 且时间差处于 `0..max(90, guard_interval*3)` 秒时视为近期回执，负时间差或过期不计入。
+未启用项目文件沙箱的 CLI 仍使用允许全局挂起的 `RuntimeChecker`：轮询识别到全局代理模式后暂停固定出口与断线阻断，允许持有的 CLI 继续运行；切回规则模式后重新核验，通过后恢复，失败则停止。OAuth 打开器的既有挂起例外见上文。已登记隔离开发会话使用 `dev_proxy.StrictRuntimeChecker`，不支持挂起；发现保护失败时，开发代理关闭连接并锁定本次启动，守护停止对应受控进程。成功的连接前检查最多在同次启动内复用一秒。以上模式响应与运行保护均存在检查或轮询延迟，不是模式切换瞬间的原子防火墙操作，且不主动修改 Surge 模式、其他策略或个人 Chrome。
+
+私有状态/回执字段：`schema`、`target`、`state`、`ok`、`checked_at`、`detail`，不存 PID、CLI 参数或配置明文。通用状态包含 `starting`、`running`、`suspended`、`exited`、`blocked`、`stopped`、`stop_failed`；`suspended` 仅用于仍支持挂起的 CLI，不能作为保护已生效的证据。网页状态与启动回执另含 `web_guard_version:2`；成功启动须同时有 `target:"web"`、`state:"running"`、`ok:true`、`protection_active:true`、`suspended:false`。快捷入口核验该回执及近期 `running` 状态，旧版本守护要求正常退出专用浏览器后重开，不接受旧挂起窗口。后续状态文件记录监控进展。`guard-status` 仅在 `state=running` 且时间差处于 `0..max(90, guard_interval*3)` 秒时视为近期回执，负时间差或过期不计入。
 
 网页使用独立监控进程，GUI 退出不自动停止它。CLI 监控在终端前台生命周期内同步执行。SIGINT/窗口大小变化可转发给子进程，正常停止会清理自有子进程；外部强杀、崩溃、系统问题或子进程脱离不构成可保证的即时网络阻断。
 
@@ -258,7 +262,7 @@ URL 覆盖键是单数 `ip_handling_url`。语言留空也会应用这些偏好�
 
 切换持有账号独占启动锁。新启动持有账号共享锁直到 CLI 监控已接管子进程（先 `oauth.set_child` 后释放启动锁）或网页监控已返回有效回执，防止在账号选择与实际启动之间切换。`--close-sessions` 写入私有停止代次，监控轮询时仅结束自己创建的程序；切换器不从回执 PID 批量杀进程。等旧及目标工作区 session 锁均可独占、确认浏览器锁无活动持有者后，才准备目标线路与账号提交。旧监控不响应、归属不明或锁未释放时拒绝切换。停止不保存网页草稿或恢复 CLI 任务，GUI 会先确认；失败时已退出的程序不自动重启。
 
-线路变化经 `workspace_routes.activate` 处理本地配置的专用入口、对应组与 Claude 域名规则，保留其他节点及无关配置。先备份与语法校验，再重载、选中目标节点并核验；失败尝试撤回可确认的本次改动。观察到外部并发更改时不强行覆盖。全局模式维持 `proxy` 状态；专用网页与普通 CLI 的固定出口保护仍挂起，已登记隔离开发项目则须切回规则模式才能启动。直连/未知状态不切换。Surge 配置路径或模式在过程中变化会阻止提交。相同线路不用重载；重载可能使其他既有连接短暂重连。
+线路变化经 `workspace_routes.activate` 处理本地配置的专用入口、对应组与 Claude 域名规则，保留其他节点及无关配置。先备份与语法校验，再重载、选中目标节点并核验；失败尝试撤回可确认的本次改动。观察到外部并发更改时不强行覆盖。全局模式维持 `proxy` 状态；普通非隔离 CLI 沿用挂起行为，专用网页与已登记隔离开发项目须切回规则模式才能启动。直连/未知状态不切换。Surge 配置路径或模式在过程中变化会阻止提交。相同线路不用重载；重载可能使其他既有连接短暂重连。
 
 快照只复制工作区 `data` 并校验清单，不包括根目录认证引用、线路设置、系统钥匙串 Token 或工作区外项目。原生 OAuth 在所选认证目录的明文回退文件（`data/Auth/.credentials.json` 或迁移保留的 `data/Claude/.credentials.json`）和浏览器登录资料可能包含在快照中，须私下保存。恢复不覆盖钥匙串引用，也不会切换另一账号；OAuth 在钥匙串中的原生值不会随文件快照恢复。快照和恢复要求工作区独占锁，恢复前自动备份并保留 `previous-*`。这些是本地账号数据分离，不是独立系统用户、设备身份或服务端不关联保证。
 
@@ -415,12 +419,24 @@ Git 可读同仓库历史，可写 objects、refs、reflogs 及当前工作树�
 - `setup plan` / `setup apply --plan-id`：审核后准备完整专用 Chrome 与当前工作区设置。应用前重复核对摘要；不在此命令隐式修改 Surge。`first-run.sh` 顺序编排后续 repair、终端和项目步骤。
 - `project status`、`project plan --source --name`、`project apply --plan-id`：只读盘点、预览和建立隔离副本，原目录不写入；状态变化使计划失效。`--trust` 仅信任明确项目。
 - `project enable-plan --name`：读取当前账号已登记隔离 HOME 的候选历史数量；`project enable --name` 在账号及会话排他锁内初始化历史并启用开关。其他项目/账号不混入，旧原始记录保留。`--no-shared-history` 与 `--no-messaging` 表示本次不新增对应功能，不撤销已经启用的功能。
-- `shortcut install --name --workspace --start-page --app`：复制发布包的预编译模板并签名，保存安装路径引用，不复制后端。已存在目标拒绝覆盖。`shortcut open --launcher-config --json` 返回原始 `action=focus|needs_switch|blocked`，失败不回退普通浏览器。
+- `shortcut install --name --workspace --start-page --app`：复制发布包的预编译模板并签名，保存安装路径引用，不复制后端。已存在目标拒绝覆盖。入口声明 HTTP/HTTPS URL 处理能力，不声明 HTML/XHTML 文件处理，也不自动改变系统默认浏览器。旧入口须重新创建才能取得新版原生处理器和元数据。`shortcut open --launcher-config --json` 返回原始 `action=focus|needs_switch|blocked`，失败不回退普通浏览器。
 
 配置新增 `default_model`（空字符串为原生默认）、`default_effort`（空或 low/medium/high/max）、`browser_start_page`（claude/newtab），按工作区保存。旧工作区缺字段时使用各自兼容默认，不继承其他账号的值。模型/effort通过JSON设置传给原生CLI，显式CLI参数保留；配置effort时仅在受控子进程移除冲突的继承环境变量。启动页由主启动器和守护共同核对，OAuth单独使用本次授权地址。
 
 `configure --cli-process-path PATH` 可重复提供进程范围，不必手工编辑配置JSON；首次向导从已验证的原生安装生成范围。变更范围后须重新应用并验证Surge规则，保存字段本身不代表保护已生效。
 
+
+## 专用快捷入口与系统默认浏览器
+
+`shortcut open --launcher-config PATH --url-stdin --json` 仅从 stdin 接收单个 JSON 对象 `{"url":"https://example.com/"}`，只允许 `url` 字段；请求上限 32 KiB，URL 上限 16 KiB。只接受无账号密码、控制字符或反斜杠的普通 HTTP/HTTPS 地址，不支持文件、HTML 文档或额外浏览器参数。无 `--url-stdin` 时保持 Dock 打开语义，不读取 stdin；此选项不能用于安装。
+
+原生入口注册 GURL 事件，冷启动由事件类型决定打开网址或启动页，不额外重复执行 Dock 打开；最多顺序处理 32 个待处理或正在处理的链接。网址通过 stdin 和指向精确 PID 的 Apple Event 传递，不写入 argv 或诊断输出。绑定工作区只来自私有启动器配置，请求不能指定工作区、Profile、代理或浏览器路径。跨工作区仍须明确确认切换；取消和错误均不回退其他浏览器。
+
+冷启动调用 `launch_shortcut_browser`，账号门禁保持到拥有浏览器的后台守护接管。守护持有浏览器租约、准备专用偏好并执行一次必要线路门禁，在创建 Chrome 前验证规则模式、增强模式、专用端口归属、单节点拓扑、旁路拒绝规则及实际专用入口出口。此路径不重复执行父进程完整隐私诊断；GUI 的 `launch web` 和手动 `check` 仍保留各自完整检查。
+
+已有窗口时，快捷入口核对当前用户、PID、启动时间、完整 Chrome 参数、专用 Profile、父守护、原配置、工作区与版本 2 回执，再用 `BrowserRuntimeChecker.check(include_exit=False)` 检查当前本地保护边界。检查后复核进程及账号仍一致，才聚焦或递送网址；不重新启动 Chrome，不访问外部出口服务或执行 DNS/WebRTC 探针。拥有窗口的守护继续定期验证实际出口；热打开不是完整诊断缓存通行证。
+
+成功递送返回 `opened:true`；`focused:false` 只表示未保持前台，不重发已被 Chrome 接受的链接。普通 Dock 打开仍要求 `focused:true`。快捷入口成功回执含 `suspended:false`，但不是完整隐私报告。系统默认浏览器设为该入口后，所有交给默认 HTTP/HTTPS 处理器的链接进入绑定工作区，不再按来源应用分流；显式指定其他浏览器的调用不在此范围。个人 Chrome 可独立启动，其资料不迁移。下述 Links 分流器是可选旧模式，使用默认专用入口不需要安装它或同步 shell 分流。
 
 ## 网页链接入口
 
@@ -435,5 +451,5 @@ Git 可读同仓库历史，可写 objects、refs、reflogs 及当前工作树�
 - 安装在 `~/.zshrc` 末尾添加受管理区块，保留原字节私有备份；移除仅删除该区块，保留用户后来在其他位置的修改。安装和撤销都需新建交互式 zsh 终端后生效，不向既有终端注入命令。`shell-status` 只反映磁盘状态。
 - 已有 `open`、`/usr/bin/open` 同名函数或别名会保留；来源无法核验会提示入口未启用。只有已核验 Orca 来源才定义两个函数，不替换 `/usr/bin/open` 二进制。受控 Claude 的私有 `BROWSER`／PATH 入口优先，防止 B 子 shell 借用 A。
 - 同步入口接受单个 HTTP(S) URL 或 `-- URL`，请求上限 64 KiB；已识别网页在来源、线路或目标校验失败时退出 `78`，不回落个人浏览器。多网页或附加选项的网页调用拒绝；非网页及显式 `-a`／`-b` 调用交给系统。
-- 同步入口固定工作区 A，当前 B 时要求用户先手动切换，不自动结束会话；系统链接分流器仍可使用明确的跨工作区确认。受控 Claude 私有打开器使用其所属工作区，普通网页保留现有全局代理挂起语义。
+- 同步入口固定工作区 A，当前 B 时要求用户先手动切换，不自动结束会话；系统链接分流器仍可使用明确的跨工作区确认。受控 Claude 私有打开器使用其所属工作区。所有普通专用网页走严格网页守护，不接受全局代理挂起；OAuth 的独立检查语义见上文。
 - zsh 函数消除普通 `open` 在 Apple Event 到达前退出的竞态；`command /usr/bin/open`、`env /usr/bin/open`、程序直接 exec、其他 shell 或未加载 `~/.zshrc` 的终端可以绕过。绕过后的系统事件仍受来源可用性限制，不提供全机器拦截保证。

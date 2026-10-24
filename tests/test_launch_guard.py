@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from surge_cc import cli, core, workspaces
@@ -34,7 +34,8 @@ class WorkerLaunchTests(unittest.TestCase):
         return Mock(side_effect=spawn)
 
     def test_valid_running_receipt_and_live_worker_succeeds(self):
-        payload = {"schema": 1, "target": "web", "state": "running", "ok": True}
+        payload = {"schema": 1, "target": "web", "state": "running", "ok": True, "web_guard_version": 2,
+                   "protection_active": True, "suspended": False}
         spawn = self.spawn_with_receipt(payload)
         result = cli.start_web_guard(config(), self.path, ["/test/Chrome", "--fixture"],
                                      self.loc, popen=spawn, timeout=0.1)
@@ -47,16 +48,20 @@ class WorkerLaunchTests(unittest.TestCase):
         self.assertTrue(spawn.call_args.kwargs["start_new_session"])
         self.worker.terminate.assert_not_called()
 
-    def test_suspended_runtime_receipt_acknowledges_launch_without_claiming_protection(self):
+    def test_suspended_runtime_receipt_stops_owned_worker(self):
         payload = {"schema": 1, "target": "web", "state": "running", "ok": True,
-                   "suspended": True, "protection_active": False,
-                   "detail": "Started; fixed-exit protection is suspended."}
-        outcome = cli.start_web_guard(
-            config(), self.path, ["/test/Chrome"], self.loc,
-            popen=self.spawn_with_receipt(payload), timeout=0.1)
-        self.assertEqual(outcome, payload)
-        self.assertIs(outcome["protection_active"], False)
-        self.worker.terminate.assert_not_called()
+                   "web_guard_version": 2, "suspended": True, "protection_active": False}
+        with self.assertRaises(core.Blocked):
+            cli.start_web_guard(config(), self.path, ["/test/Chrome"], self.loc,
+                               popen=self.spawn_with_receipt(payload), timeout=0.1)
+        self.worker.terminate.assert_called_once()
+
+    def test_old_running_receipt_requires_upgrade(self):
+        payload = {"schema": 1, "target": "web", "state": "running", "ok": True}
+        with self.assertRaises(core.Blocked):
+            cli.start_web_guard(config(), self.path, ["/test/Chrome"], self.loc,
+                               popen=self.spawn_with_receipt(payload), timeout=0.1)
+        self.worker.terminate.assert_called_once()
 
     def test_unknown_receipt_never_succeeds_and_stops_owned_worker(self):
         for payload in ([], None, {}, {"schema": 1, "target": "web", "ok": True, "state": "unknown"},
@@ -108,6 +113,57 @@ class WorkerLaunchTests(unittest.TestCase):
                                 popen=Mock(return_value=self.worker), timeout=0)
         self.worker.terminate.assert_called_once()
         self.worker.kill.assert_not_called()
+
+
+class ShortcutColdLaunchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.binary = self.root / "Surge CC Browser.app/Contents/MacOS/Google Chrome"
+        self.binary.parent.mkdir(parents=True)
+        self.binary.touch()
+        self.cfg = config()
+        self.cfg["browser_path"] = str(self.binary)
+        self.path = self.root / "config.json"
+        core.save_config(self.path, self.cfg)
+        self.receipt = {"schema": 1, "target": "web", "state": "running", "ok": True,
+                        "web_guard_version": 2, "protection_active": True, "suspended": False}
+
+    def test_one_worker_gate_no_parent_full_diagnostics(self):
+        worker = Mock(return_value=self.receipt)
+        with patch.object(cli, "full_checks", side_effect=AssertionError("expensive diagnostics")), \
+             patch.object(cli, "run_checks", side_effect=AssertionError("duplicate gate")):
+            result = cli.launch_shortcut_browser(self.cfg, self.path, web_guard=worker)
+        self.assertTrue(result["launched"])
+        self.assertTrue(result["protection_active"])
+        worker.assert_called_once()
+        command = worker.call_args.args[2]
+        self.assertIn("--user-data-dir=" + str(self.root / "workspaces/A/data/Browser"), command)
+        self.assertIn("--proxy-server=" + self.cfg["proxy_url"], command)
+
+    def test_worker_failure_cannot_claim_launch(self):
+        worker = Mock(side_effect=core.Blocked("出口检查失败"))
+        with self.assertRaisesRegex(core.Blocked, "出口检查失败"):
+            cli.launch_shortcut_browser(self.cfg, self.path, web_guard=worker)
+
+    def test_lock_or_stale_workspace_blocks_before_worker(self):
+        loc = workspaces.paths(self.path, "A")
+        (loc["browser"] / "SingletonLock").symlink_to("host-123")
+        worker = Mock()
+        with self.assertRaises(core.Blocked):
+            cli.launch_shortcut_browser(self.cfg, self.path, web_guard=worker)
+        worker.assert_not_called()
+        (loc["browser"] / "SingletonLock").unlink()
+        changed = dict(self.cfg, workspace="B")
+        with self.assertRaises(core.Blocked):
+            cli.launch_shortcut_browser(changed, self.path, web_guard=worker)
+        worker.assert_not_called()
+
+    def test_unprotected_receipt_is_not_success(self):
+        for change in ({"suspended": True}, {"protection_active": False}, {"web_guard_version": 1}):
+            with self.subTest(change=change), self.assertRaises(core.Blocked):
+                cli.launch_shortcut_browser(self.cfg, self.path, web_guard=Mock(return_value={**self.receipt, **change}))
 
 
 if __name__ == "__main__":

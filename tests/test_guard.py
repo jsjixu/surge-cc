@@ -186,6 +186,115 @@ class RuntimeCheckerTests(unittest.TestCase):
             self.checker.check(include_exit=True)
 
 
+class BrowserRuntimeCheckerTests(unittest.TestCase):
+    def setUp(self):
+        self.config = dict(config(), browser_path="/test/Surge CC Browser.app/Contents/MacOS/Google Chrome",
+                           proxy_url="http://127.0.0.1:62919")
+        self.surge = FakeSurge()
+        self.surge.status_value["features"]["enhanced-mode"] = True
+        self.listener = Mock(return_value=True)
+        self.exit_probe = Mock(return_value=True)
+        scope = patch("surge_cc.containment.validate_scope")
+        self.scope = scope.start()
+        self.addCleanup(scope.stop)
+
+    def checker(self):
+        return guard.BrowserRuntimeChecker(self.config, process=self.config["browser_path"],
+                                            surge=self.surge, listener=self.listener,
+                                            exit_probe=self.exit_probe)
+
+    def test_warm_check_keeps_scope_and_listener_without_external_exit_query(self):
+        checker = self.checker()
+        checker.check(include_exit=False)
+        self.scope.assert_called_once_with(self.config, self.surge)
+        self.listener.assert_called_once_with(self.config)
+        self.exit_probe.assert_not_called()
+        self.assertEqual(self.surge.exit_calls, 0)
+        self.assertEqual({host for host, _ in self.surge.route_calls}, set(self.config["hosts"]))
+
+    def test_cold_check_uses_exactly_one_actual_listener_exit_probe(self):
+        self.checker().check(include_exit=True)
+        self.exit_probe.assert_called_once_with(self.config)
+        self.assertEqual(self.surge.exit_calls, 0)
+
+    def test_default_exit_probe_uses_dedicated_listener_and_general_browser_error(self):
+        with patch("surge_cc.oauth_gate.verify_proxy_exit") as actual:
+            self.assertTrue(guard.BrowserRuntimeChecker._proxy_exit(self.config))
+            actual.assert_called_once_with(self.config)
+            actual.side_effect = Blocked("OAuth-specific error")
+            with self.assertRaisesRegex(Blocked, "专用浏览器入口"):
+                guard.BrowserRuntimeChecker._proxy_exit(self.config)
+
+    def test_no_personal_browser_default(self):
+        with self.assertRaisesRegex(Blocked, "专用浏览器路径"):
+            guard.BrowserRuntimeChecker(config(), process="/Applications/Google Chrome.app")
+
+    def test_global_direct_or_unknown_mode_cannot_start(self):
+        for mode in ("proxy", "direct", None):
+            with self.subTest(mode=mode):
+                self.surge.status_value["mode"] = mode
+                with self.assertRaises(Blocked):
+                    self.checker()
+        self.exit_probe.assert_not_called()
+
+    def test_global_transition_before_and_after_probe_is_not_suspended(self):
+        for phase in ("before", "route", "exit", "final"):
+            with self.subTest(phase=phase):
+                self.surge = FakeSurge()
+                self.surge.status_value["features"]["enhanced-mode"] = True
+                checker = self.checker()
+                if phase == "before":
+                    self.surge.status_value["mode"] = "proxy"
+                elif phase == "route":
+                    def route(*args):
+                        self.surge.status_value["mode"] = "proxy"
+                        raise Blocked("scope changed")
+                    self.surge.route = route
+                elif phase == "exit":
+                    def exit_probe(cfg):
+                        self.surge.status_value["mode"] = "proxy"
+                        return True
+                    checker.exit_probe = exit_probe
+                else:
+                    self.surge.status_calls = 0
+                    self.surge.final_mode = "proxy"
+                with self.assertRaises(Blocked):
+                    checker.check(include_exit=True)
+                self.assertFalse(checker.suspended)
+
+    def test_exit_failure_and_post_probe_drift_block(self):
+        for outcome in (False, None, Blocked("offline"), "changed"):
+            with self.subTest(outcome=outcome):
+                checker = self.checker()
+                def exit_probe(cfg):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    if outcome == "changed":
+                        self.surge.profile_value += "\n[General]\nipv6=true\n"
+                        return True
+                    return outcome
+                checker.exit_probe = exit_probe
+                with self.assertRaises(Blocked):
+                    checker.check(include_exit=True)
+
+    def test_missing_scope_listener_or_enhanced_mode_still_blocks_warm(self):
+        for failure in ("scope", "listener", "enhanced"):
+            with self.subTest(failure=failure):
+                self.scope.side_effect = None
+                self.listener.return_value = True
+                self.surge.status_value["features"]["enhanced-mode"] = True
+                checker = self.checker()
+                if failure == "scope":
+                    self.scope.side_effect = Blocked("raw path not rejected")
+                elif failure == "listener":
+                    self.listener.return_value = False
+                else:
+                    self.surge.status_value["features"]["enhanced-mode"] = False
+                with self.assertRaises(Blocked):
+                    checker.check(include_exit=False)
+        self.exit_probe.assert_not_called()
+
+
 class StateTests(unittest.TestCase):
     def test_private_atomic_whitelisted_receipt(self):
         with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
@@ -193,9 +302,19 @@ class StateTests(unittest.TestCase):
             guard.write_state(path, target="web", state="running", ok=True, detail="ready")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             data = json.loads(path.read_text())
-            self.assertEqual(set(data), {"schema", "target", "state", "ok", "checked_at", "detail"})
+            self.assertEqual(set(data), {"schema", "target", "state", "ok", "checked_at", "detail", "web_guard_version"})
+            self.assertEqual(data["web_guard_version"], 2)
             self.assertNotIn("203.0.113.10", path.read_text())
             self.assertFalse(list(path.parent.glob(".surge-cc-guard-*")))
+
+    def test_web_generation_marker_does_not_change_code_receipts(self):
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+            path = Path(directory) / "state.json"
+            for state in ("running", "blocked", "exited"):
+                guard.write_state(path, target="web", state=state, ok=False, detail="test")
+                self.assertEqual(json.loads(path.read_text())["web_guard_version"], 2)
+            guard.write_state(path, target="code", state="running", ok=True, detail="test")
+            self.assertNotIn("web_guard_version", json.loads(path.read_text()))
 
     def test_symlink_target_and_parent_refused(self):
         with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
@@ -412,6 +531,81 @@ class RunGuardTests(unittest.TestCase):
             options["monitor"].assert_not_called()
             self.assertFalse(json.loads(options["receipt_path"].read_text())["ok"])
 
+    def test_web_default_gate_has_one_strict_checker_and_no_redundant_preflight(self):
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+            child = Mock(pid=78201)
+            child.wait.side_effect = subprocess.TimeoutExpired("browser", .8)
+            checker = Mock(suspended=False)
+            with patch.object(guard, "BrowserRuntimeChecker", return_value=checker) as factory, \
+                    patch.object(guard, "RuntimeChecker") as ordinary, \
+                    patch.object(guard, "run_checks") as duplicate:
+                result, options, _ = self.run_fixture(
+                    directory, target="web", checker=None, preflight=duplicate,
+                    popen=Mock(return_value=child))
+            self.assertEqual(result, 0)
+            duplicate.assert_not_called()
+            ordinary.assert_not_called()
+            factory.assert_called_once()
+            checker.check.assert_called_once_with(include_exit=True)
+            receipt = json.loads(options["receipt_path"].read_text())
+            self.assertEqual(receipt["web_guard_version"], 2)
+            self.assertTrue(receipt["protection_active"])
+            self.assertFalse(receipt["suspended"])
+
+    def test_web_custom_preflight_is_honored_but_global_is_never_allowed(self):
+        surge = FakeSurge()
+        surge.status_value["mode"] = "proxy"
+        reports = [core.run_checks(config(), surge=surge), {"ok": False},
+                   {"ok": True, "paused": True}, {"ok": True, "suspended": True},
+                   {"ok": True, "protection_active": False}, {"ok": True, "surge_mode": "proxy"}]
+        for report in reports:
+            with self.subTest(report=report), tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+                preflight = Mock(return_value=report)
+                result, options, _ = self.run_fixture(directory, target="web", preflight=preflight)
+                self.assertEqual(result, 2)
+                preflight.assert_called_once()
+                options["popen"].assert_not_called()
+                options["checker"].check.assert_not_called()
+
+    def test_web_checker_failure_or_suspension_never_spawns(self):
+        for failure in ("offline", "suspended"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+                checker = Mock(suspended=failure == "suspended")
+                if failure == "offline":
+                    checker.check.side_effect = Blocked("dedicated listener offline")
+                result, options, _ = self.run_fixture(directory, target="web", checker=checker)
+                self.assertEqual(result, 2)
+                options["popen"].assert_not_called()
+                options["stop"].assert_called_once_with(None)
+
+    def test_web_runtime_failure_only_stops_owned_browser(self):
+        with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+            command = [sys.executable, "-c", "import time; time.sleep(60)"]
+            unrelated = subprocess.Popen(command)
+            owned = []
+            def spawn(*args, **kwargs):
+                child = subprocess.Popen(*args, **kwargs)
+                owned.append(child)
+                return child
+            try:
+                with patch.object(guard, "chrome_args", return_value=command):
+                    result, options, _ = self.run_fixture(
+                        directory, target="web", command=command, popen=spawn,
+                        stop=guard.stop_owned_child,
+                        monitor=Mock(side_effect=Blocked("SixtyNet exit offline")))
+                self.assertEqual(result, 2)
+                self.assertEqual(len(owned), 1)
+                self.assertIsNotNone(owned[0].poll())
+                self.assertIsNone(unrelated.poll())
+                self.assertEqual(json.loads(options["status_path"].read_text())["state"], "blocked")
+            finally:
+                unrelated.terminate()
+                unrelated.wait(timeout=2)
+                for child in owned:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=2)
+
     def test_web_browser_lease_held_from_preferences_through_owned_process_exit(self):
         with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
             root = Path(directory)
@@ -487,7 +681,7 @@ class SuperviseTests(unittest.TestCase):
             checker.suspended = current[0] < 2
         checker.check.side_effect = check
         with patch.object(guard, "write_state") as record:
-            result = guard.supervise(child, checker, target="web", interval=1, exit_interval=3,
+            result = guard.supervise(child, checker, target="code", interval=1, exit_interval=3,
                                      clock=lambda: current[0], sleep=sleep)
         self.assertEqual(result, 0)
         states = [call.kwargs for call in record.call_args_list]
@@ -495,6 +689,17 @@ class SuperviseTests(unittest.TestCase):
         self.assertFalse(states[0]["ok"])
         self.assertTrue(states[1]["ok"])
         child.terminate.assert_not_called()
+
+    def test_web_supervision_cannot_continue_with_suspended_checker(self):
+        current = [0.0]
+        child = Mock()
+        child.poll.return_value = None
+        checker = Mock(suspended=True)
+        def sleep(seconds):
+            current[0] += seconds
+        with self.assertRaisesRegex(Blocked, "固定线路保护已停止"):
+            guard.supervise(child, checker, target="web", interval=1, exit_interval=3,
+                            clock=lambda: current[0], sleep=sleep)
 
     def test_check_failure_is_not_swallowed(self):
         child = Mock()

@@ -50,6 +50,7 @@ private struct HelperResult: Decodable {
     let launched: Bool?
     let current: String?
     let focused: Bool?
+    let opened: Bool?
 }
 
 private struct LauncherFailure: LocalizedError {
@@ -206,7 +207,7 @@ private final class HelperInvocation: @unchecked Sendable {
         lock.unlock()
     }
 
-    func run(configuration: LauncherConfiguration, confirmedCurrent: String?,
+    func run(configuration: LauncherConfiguration, confirmedCurrent: String?, requestedURL: String?,
              completion: @escaping (Result<HelperResult, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             let outcome: Result<HelperResult, Error>
@@ -214,6 +215,13 @@ private final class HelperInvocation: @unchecked Sendable {
                 guard let launcherConfig = Bundle.main.url(forResource: "launcher", withExtension: "json") else {
                     throw LauncherFailure("启动器检查程序缺失。请重新安装 Surge CC 快捷入口。")
                 }
+                let requestBody: Data?
+                if let requestedURL = requestedURL {
+                    guard ordinaryWebURL(requestedURL) else {
+                        throw LauncherFailure("网页地址格式不支持。")
+                    }
+                    requestBody = try JSONSerialization.data(withJSONObject: ["url": requestedURL])
+                } else { requestBody = nil }
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: configuration.python)
                 child.arguments = ["-I", "-B", configuration.backend, "--config", configuration.config,
@@ -221,8 +229,11 @@ private final class HelperInvocation: @unchecked Sendable {
                 if let confirmedCurrent = confirmedCurrent {
                     child.arguments! += ["--confirm-switch-from", confirmedCurrent]
                 }
-                child.standardInput = FileHandle.nullDevice
+                let input = requestedURL == nil ? nil : Pipe()
+                if requestedURL != nil { child.arguments!.append("--url-stdin") }
+                child.standardInput = input ?? FileHandle.nullDevice
                 child.standardError = FileHandle.nullDevice
+                defer { try? input?.fileHandleForWriting.close() }
                 let pipe = Pipe()
                 child.standardOutput = pipe
                 let descriptor = pipe.fileHandleForReading.fileDescriptor
@@ -236,6 +247,18 @@ private final class HelperInvocation: @unchecked Sendable {
                 lock.unlock()
                 let deadline = DispatchWorkItem { [self] in expire() }
                 DispatchQueue.global().asyncAfter(deadline: .now() + 180, execute: deadline)
+                defer { deadline.cancel() }
+                if let requestBody = requestBody, let input = input {
+                    // Never place a document or callback URL in argv or logs.
+                    do {
+                        try input.fileHandleForWriting.write(contentsOf: requestBody)
+                        try input.fileHandleForWriting.close()
+                    } catch {
+                        expire()
+                        child.waitUntilExit()
+                        throw LauncherFailure("无法发送网页打开请求，未改用其他浏览器。")
+                    }
+                }
                 var bytes = Data()
                 var tooLarge = false
                 var readFailed = false
@@ -297,10 +320,53 @@ private final class LauncherDelegate: NSObject, NSApplicationDelegate {
         configuration?.name ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Surge CC 浏览器")
     }
     private var busy = false
+    private var ready = false
+    private var receivedWebEvent = false
+    private var pendingURLs = [String]()
+    private var pendingDockOpen = false
+    private var currentURL: String?
     private var configuration: LauncherConfiguration?
     private var invocation: HelperInvocation?
     private var progress: NSPanel?
     private var progressDetail: NSTextField?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Register before AppKit dispatches the event that cold-started us.
+        NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(receive(_:reply:)),
+                                                     forEventClass: AEEventClass(kInternetEventClass),
+                                                     andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc private func receive(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        receivedWebEvent = true
+        pendingDockOpen = false
+        guard let url = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              ordinaryWebURL(url), pendingURLs.count + (busy ? 1 : 0) < 32 else {
+            // Return a bounded generic error. Never interrupt an active account
+            // switch with another alert, or forward rejected links elsewhere.
+            reply.setParam(NSAppleEventDescriptor(int32: -1700), forKeyword: AEKeyword(keyErrorNumber))
+            reply.setParam(NSAppleEventDescriptor(string: "网页地址无效或待打开链接过多，请稍后重试。"),
+                           forKeyword: AEKeyword(keyErrorString))
+            NSSound.beep()
+            return
+        }
+        pendingURLs.append(url)
+        next()
+    }
+
+    // AppKit requests an untitled window for a normal Dock/application launch,
+    // but not for a GURL launch. Do not unconditionally open a start page from
+    // didFinishLaunching: that races the first system URL and duplicates work.
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        !receivedWebEvent && pendingURLs.isEmpty && !busy
+    }
+
+    func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        guard !receivedWebEvent else { return true }
+        pendingDockOpen = true
+        DispatchQueue.main.async { self.next() }
+        return true
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -311,26 +377,37 @@ private final class LauncherDelegate: NSObject, NSApplicationDelegate {
         applicationItem.submenu = applicationMenu
         menu.addItem(applicationItem)
         NSApp.mainMenu = menu
-        begin()
+        ready = true
+        next()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !busy { begin() }
+        if !busy {
+            pendingDockOpen = true
+            next()
+        }
         return false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard busy else { return .terminateNow }
+        guard busy || !pendingURLs.isEmpty || pendingDockOpen else { return .terminateNow }
         // Do not interrupt an in-flight profile switch halfway through its work.
         progressDetail?.stringValue = "正在完成当前操作；完成后即可退出。"
         NSSound.beep()
         return .terminateCancel
     }
 
-    private func begin() {
-        guard !busy else { return }
+    private func next() {
+        guard ready, !busy else { return }
+        if !pendingURLs.isEmpty {
+            currentURL = pendingURLs.removeFirst()
+            pendingDockOpen = false
+        } else if pendingDockOpen {
+            currentURL = nil
+            pendingDockOpen = false
+        } else { return }
         busy = true
         showProgress()
         do {
@@ -345,7 +422,8 @@ private final class LauncherDelegate: NSObject, NSApplicationDelegate {
     private func invoke(_ configuration: LauncherConfiguration, confirmedCurrent: String?) {
         let operation = HelperInvocation()
         invocation = operation
-        operation.run(configuration: configuration, confirmedCurrent: confirmedCurrent) { [weak self] outcome in
+        operation.run(configuration: configuration, confirmedCurrent: confirmedCurrent,
+                      requestedURL: currentURL) { [weak self] outcome in
             guard let self = self else { return }
             self.invocation = nil
             switch outcome {
@@ -359,12 +437,14 @@ private final class LauncherDelegate: NSObject, NSApplicationDelegate {
     private func handle(_ result: HelperResult, configuration: LauncherConfiguration) {
         switch result.action {
         case .focus:
-            guard result.focused == true else {
-                showError("浏览器检查未确认窗口已显示，已停止后续操作。请重试。")
+            // Once Chrome accepted a URL, losing focus is not a failure and
+            // must never cause a retry or a second tab. Dock focus stays strict.
+            guard currentURL == nil ? result.focused == true : result.opened == true else {
+                showError(currentURL == nil ? "浏览器检查未确认窗口已显示，已停止后续操作。请重试。"
+                          : "未能确认网页已在专用浏览器中打开，未改用其他浏览器。")
                 return
             }
-            closeProgress()
-            busy = false
+            finish()
         case .blocked:
             showError(result.message.isEmpty ? "当前状态不允许打开 Surge CC 快捷入口。" : result.message)
         case .needsSwitch:
@@ -385,9 +465,18 @@ private final class LauncherDelegate: NSObject, NSApplicationDelegate {
                 showProgress(detail: "正在切换到 \(configuration.workspace) 并检查浏览器…")
                 invoke(configuration, confirmedCurrent: current)
             } else {
-                busy = false
+                finish()
             }
         }
+    }
+
+    private func finish() {
+        closeProgress()
+        busy = false
+        currentURL = nil
+        // Yield between requests so AppKit can receive subsequent URLs and
+        // user actions; next() still runs exactly one helper at a time.
+        DispatchQueue.main.async { self.next() }
     }
 
     private func showProgress(detail: String = "正在确认工作区与现有浏览器进程…") {
@@ -442,13 +531,13 @@ private final class LauncherDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
-        busy = false
         if response == .alertSecondButtonReturn, let configuration = configuration {
             let options = NSWorkspace.OpenConfiguration()
             options.activates = true
             NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: configuration.app),
                                                configuration: options, completionHandler: nil)
         }
+        finish()
     }
 
 

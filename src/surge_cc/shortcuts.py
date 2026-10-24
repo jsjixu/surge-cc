@@ -20,6 +20,7 @@ from . import core, workspaces, browser_locks, sessions, workspace_routes
 from .web_urls import validate_url as validate_web_url
 # cli imports this module only within its shortcut command branch.
 from . import cli
+from .guard import BrowserRuntimeChecker
 
 
 class LauncherError(core.Blocked):
@@ -161,7 +162,10 @@ def install(config_path: Path, workspace: str, name: str, start_page: str,
                           "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
                           "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
                           "NSAppleEventsUsageDescription": "Send requested web links to the verified dedicated browser window.",
-                          "NSPrincipalClass": "NSApplication"}, handle)
+                          "NSPrincipalClass": "NSApplication",
+                          "CFBundleURLTypes": [{"CFBundleURLName": "Web links",
+                                                "CFBundleTypeRole": "Viewer",
+                                                "CFBundleURLSchemes": ["http", "https"]}]}, handle)
         try:
             subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(stage)],
                            stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=30)
@@ -228,13 +232,16 @@ def validate_guard_files(arguments, config_path, config):
         value = private_json(path, 8192)
         if value.get("schema") != 1 or value.get("target") != "web":
             raise LauncherError("浏览器守护回执无法验证。")
+        if value.get("web_guard_version") != 2:
+            raise LauncherError("现有 Lia 窗口仍使用旧版守护，请正常退出该专用浏览器后重新打开；个人 Chrome 无需退出。")
         if key == "--receipt":
-            if value.get("state") != "running" or value.get("ok") is not True:
+            if (value.get("state") != "running" or value.get("ok") is not True
+                    or value.get("protection_active") is not True or value.get("suspended") is not False):
                 raise LauncherError("未找到成功启动浏览器的守护回执。")
         else:
-            if value.get("state") not in {"running", "suspended"}:
+            if value.get("state") != "running":
                 raise LauncherError("浏览器线路守护已停止，请在 Surge CC 中检查。")
-            if value.get("ok") is not (value["state"] == "running"):
+            if value.get("ok") is not True:
                 raise LauncherError("浏览器守护状态互相矛盾，未切换窗口。")
             checked = dt.datetime.fromisoformat(value["checked_at"])
             age = (dt.datetime.now(dt.timezone.utc) - checked).total_seconds()
@@ -320,8 +327,14 @@ def failure_message(report):
     return str(report.get("summary", "线路检查未通过，未打开浏览器。"))[:1024]
 
 
-def report_allowed(report):
-    return report.get("ok") is True or core.global_mode_allowed(report)
+def check_running_browser(config):
+    """Local, current boundary checks, not another privacy or internet probe.
+
+    The owning guard continues checking the actual proxy exit periodically.
+    No cached full-diagnostic pass is used to authorize an unverified window.
+    """
+    checker = BrowserRuntimeChecker(config, process=str(core.browser_executable(config)))
+    checker.check(include_exit=False)
 
 
 def focus_native(process, native):
@@ -413,15 +426,12 @@ def _open_browser(config_path: Path, workspace: str, start_page: str,
         process = existing_browser(config_path, config)
         launched = process is None
         if process is not None:
-            report = cli.full_checks(config, external_dns=False)
-            if not report_allowed(report):
-                raise LauncherError(failure_message(report))
+            check_running_browser(config)
             fresh = existing_browser(config_path, config)
             if fresh != process:
                 raise LauncherError("检查期间窗口已经退出或改变，请再点击一次。")
         else:
-            report = cli.launch(config, config_path, "web", False, [],
-                                checker=lambda c: cli.full_checks(c, external_dns=False))
+            report = cli.launch_shortcut_browser(config, config_path)
             if report.get("launched") is not True:
                 raise LauncherError(failure_message(report))
             process = wait_for_browser(config_path, config)
@@ -433,12 +443,11 @@ def _open_browser(config_path: Path, workspace: str, start_page: str,
             if before_delivery is not None:
                 before_delivery()
             focused = open_url_native(process, focus_executable, requested_url) is True
-        suspended = report.get("paused") is True and report.get("protection_active") is False
         result = {"schema": 1, "ok": True, "action": "focus", "pid": process.pid,
                 "started": list(process.started), "executable": process.executable,
-                "launched": launched, "suspended": suspended, "focused": focused,
-                "message": "全局模式：保护挂起，沿用 Surge 全局出口。" if suspended
-                           else "线路检查通过，已打开专用浏览器。"}
+                "launched": launched, "suspended": False, "focused": focused,
+                "message": "必要线路检查通过，已启动专用浏览器。" if launched
+                           else "窗口与本地线路保护已核验，已切回专用浏览器。"}
         if requested_url is not None:
             result["opened"] = True
         return result
@@ -451,3 +460,23 @@ def open_launcher(launcher_config: Path, confirmed_from=None, *, expected_config
     native = launcher_config.parent.parent / "MacOS/SurgeCCShortcut"
     return open_browser(Path(settings["config"]), settings["workspace"], settings["start_page"],
                         native, confirmed_from)
+
+
+def open_launcher_url(launcher_config: Path, request: dict, confirmed_from=None, *,
+                      expected_config: Path | None = None) -> dict:
+    """The default-browser entry always uses its own registered workspace.
+
+    The native launcher sends the URL through stdin. Never accept an account,
+    browser path or proxy from the incoming request, or fall back to another app.
+    """
+    if not isinstance(request, dict) or set(request) != {"url"}:
+        raise LauncherError("网页请求无效；未打开网页。")
+    url = validate_web_url(request["url"])
+    settings = load_launcher(launcher_config)
+    config_path = Path(settings["config"])
+    if expected_config is not None and config_path != Path(expected_config):
+        raise LauncherError("快捷入口配置与请求不匹配。")
+    assert_start_page(config_path, core.load_config(config_path),
+                      settings["workspace"], settings["start_page"])
+    native = launcher_config.parent.parent / "MacOS/SurgeCCShortcut"
+    return open_url(config_path, settings["workspace"], url, native, confirmed_from)

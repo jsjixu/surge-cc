@@ -31,12 +31,15 @@ class RuntimeChecker:
     """Keep baseline material in memory; never persist an effective profile."""
 
     def __init__(self, config: dict, *, process: str, surge=None,
-                 listener=listener_is_surge, preflight=run_checks):
+                 listener=listener_is_surge, preflight=run_checks,
+                 allow_global_suspend: bool = True, exit_probe=None):
         self.config = validate_config(config)
         self.process = process
         self.surge = surge or Surge()
         self.listener = listener
         self.preflight = preflight
+        self.allow_global_suspend = allow_global_suspend
+        self.exit_probe = exit_probe
         self.suspended = False
         self.path = self.group = self.digest = None
         try:
@@ -51,6 +54,8 @@ class RuntimeChecker:
     def _suspend_if_global(self, status=None):
         # This is an explicit user exception for proxy mode, never a general
         # error bypass. An unavailable/malformed/direct status stays blocked.
+        if not self.allow_global_suspend:
+            return False
         status = self.surge.status() if status is None else status
         if (isinstance(status, dict) and isinstance(status.get("features"), dict)
                 and status.get("mode") == "proxy"):
@@ -64,7 +69,7 @@ class RuntimeChecker:
             return None
         if (not isinstance(status, dict) or not isinstance(status.get("features"), dict)
                 or status.get("mode") != "rule"):
-            raise Blocked("运行期间 Surge 状态未知或进入直连模式。")
+            raise Blocked("运行期间 Surge 未保持规则模式，已停止受保护连接。")
         if self.config.get("browser_path") and status["features"].get("enhanced-mode") is not True:
             raise Blocked("专用浏览器的增强模式接管已停止或无法确认。")
         active_path = status.get("profile-path")
@@ -111,7 +116,7 @@ class RuntimeChecker:
                 if not route_is_fixed(self.surge.route(host, self.config, self.process), self.config):
                     raise Blocked("运行期间 Claude 域名不再固定到指定线路。")
             if ((include_exit or was_suspended or first_baseline) and
-                    self.surge.exit_matches(self.config) is not True):
+                    (self.exit_probe or self.surge.exit_matches)(self.config) is not True):
                 raise Blocked("运行期间出口变化或出口检测无法确认。")
             # Re-read after asynchronous checks; a deliberate global-mode
             # transition suspends protection instead of stopping the session.
@@ -131,6 +136,31 @@ class RuntimeChecker:
                 raise
 
 
+class BrowserRuntimeChecker(RuntimeChecker):
+    """Strict browser gate; only cold/periodic checks query the actual listener.
+
+    Local checks never spawn a diagnostic browser or query external services.
+    They retain topology, listener ownership, and raw-path rejection checks.
+    """
+
+    def __init__(self, config: dict, *, process: str, surge=None,
+                 listener=listener_is_surge, exit_probe=None):
+        if not config.get("browser_path"):
+            raise Blocked("专用浏览器路径尚未配置，未启动浏览器。")
+        super().__init__(config, process=process, surge=surge, listener=listener,
+                         allow_global_suspend=False,
+                         exit_probe=exit_probe or self._proxy_exit)
+
+    @staticmethod
+    def _proxy_exit(config):
+        from .oauth_gate import verify_proxy_exit
+        try:
+            verify_proxy_exit(config)
+        except Blocked:
+            raise Blocked("专用浏览器入口的实际出口检查失败；不会切换节点或转交个人浏览器。") from None
+        return True
+
+
 def write_state(path: Path | None, *, target: str, state: str, ok: bool, detail: str,
                 protection_active: bool | None = None, suspended: bool | None = None) -> None:
     """Write a small private receipt without config, command arguments, or PID."""
@@ -145,6 +175,8 @@ def write_state(path: Path | None, *, target: str, state: str, ok: bool, detail:
         raise Blocked("守护状态文件位置无效。")
     payload = {"schema": 1, "target": target, "state": state, "ok": bool(ok),
                "checked_at": now(), "detail": detail}
+    if target == "web":
+        payload["web_guard_version"] = 2
     for key, value in (("protection_active", protection_active), ("suspended", suspended)):
         if value is not None:
             if type(value) is not bool:
@@ -288,6 +320,8 @@ def supervise(child, checker, *, target: str, status_path: Path | None = None,
             if full:
                 last_exit = clock()
             suspended = getattr(checker, "suspended", False) is True
+            if target == "web" and suspended:
+                raise Blocked("专用浏览器的固定线路保护已停止，已停止连接。")
             write_state(status_path, target=target,
                         state="suspended" if suspended else "running", ok=not suspended,
                         detail=("保护已挂起；程序继续运行，流量跟随 Surge 全局代理，固定出口保护未生效。"
@@ -340,11 +374,22 @@ def run_guarded(command: list[str], *, env: dict | None, cwd: Path,
             if command != chrome_args(config, root / "data/Browser"):
                 raise Blocked("专用浏览器启动参数与当前工作区不一致，未启动。")
             locks.enter_context(workspaces.browser_session(root, config))
-        report = preflight(config)
-        if (not isinstance(report, dict) or
-                (report.get("ok") is not True and not global_mode_allowed(report))):
-            raise Blocked("启动前线路检查未通过，已阻止启动。")
-        checker = checker or RuntimeChecker(config, process=command[0])
+        # The dedicated web checker performs the necessary cold-start gate,
+        # including one request through the real proxy listener. Do not repeat
+        # run_checks' policy-only exit query and multi-process route scan first.
+        # Custom preflights remain authoritative (including in injected tests).
+        if target != "web" or preflight is not run_checks:
+            report = preflight(config)
+            if (not isinstance(report, dict) or
+                    (report.get("ok") is not True and
+                     (target == "web" or not global_mode_allowed(report))) or
+                    (target == "web" and (report.get("paused") is True or
+                                          report.get("suspended") is True or
+                                          report.get("protection_active") is False or
+                                          report.get("surge_mode") == "proxy"))):
+                raise Blocked("启动前线路检查未通过，已阻止启动。")
+        checker = checker or (BrowserRuntimeChecker(config, process=command[0])
+                              if target == "web" else RuntimeChecker(config, process=command[0]))
         if session_generation is not None:
             from .sessions import SessionChecker
             checker = SessionChecker(checker, Path(lock_path).parent, session_generation)
@@ -352,6 +397,8 @@ def run_guarded(command: list[str], *, env: dict | None, cwd: Path,
         # Verify state paths before starting a program. Failure to report must not
         # leave a detached unmonitored child behind.
         suspended = getattr(checker, "suspended", False) is True
+        if target == "web" and suspended:
+            raise Blocked("专用浏览器必须保持固定线路保护，未启动浏览器。")
         write_state(status_path, target=target,
                     state="suspended" if suspended else "starting", ok=not suspended,
                     detail=("保护已挂起，正在通过 Surge 全局代理启动程序。"

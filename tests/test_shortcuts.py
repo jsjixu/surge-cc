@@ -27,7 +27,11 @@ class LauncherTests(unittest.TestCase):
         self.core = NS(Blocked=module.LauncherError, load_config=Mock(return_value=self.config),
                        global_mode_allowed=Mock(return_value=False))
         self.cli = NS(full_checks=Mock(return_value={"ok": True}),
-                      launch=Mock(return_value={"ok": True, "launched": True}))
+                      launch_shortcut_browser=Mock(return_value={"ok": True, "launched": True}))
+        self.quick = Mock()
+        quick_patch = patch.object(module, "check_running_browser", self.quick)
+        quick_patch.start()
+        self.addCleanup(quick_patch.stop)
         self.workspaces = NS(account_session=session, assert_current=Mock(),
                              use=Mock(return_value={"workspace": "A"}))
         self.workspaces.name_ok = lambda value: value
@@ -78,28 +82,28 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(result["focused"])
         self.assertFalse(result["launched"])
         self.assertEqual(existing.call_count, 2)
-        self.cli.full_checks.assert_called_once()
-        self.cli.launch.assert_not_called()
+        self.quick.assert_called_once_with(self.config)
+        self.cli.full_checks.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
         focus.assert_called_once_with(self.process, Path("/Shortcut.app/Contents/MacOS/SurgeCCShortcut"))
         self.assertFalse(self.locked)
 
     def test_failed_route_does_not_focus_or_launch(self):
-        self.cli.full_checks.return_value = {"ok": False, "checks": [{"status": "fail", "detail": "线路异常"}]}
+        self.quick.side_effect = module.LauncherError("线路异常")
         with patch.object(module, "existing_browser", return_value=self.process), patch.object(module, "focus_native") as focus:
             with self.assertRaisesRegex(module.LauncherError, "线路异常"):
                 self.open()
         focus.assert_not_called()
-        self.cli.launch.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
 
-    def test_only_canonical_global_exception_is_accepted(self):
-        self.cli.full_checks.return_value = {"ok": False, "paused": True, "protection_active": False}
+    def test_global_mode_never_focuses_even_when_old_cli_allows_it(self):
+        self.core.global_mode_allowed.return_value = True
+        self.quick.side_effect = module.LauncherError("需规则模式")
         with patch.object(module, "existing_browser", return_value=self.process), patch.object(module, "focus_native") as focus:
             with self.assertRaises(module.LauncherError):
                 self.open()
-            focus.assert_not_called()
-            self.core.global_mode_allowed.return_value = True
-            result = self.open()
-        self.assertTrue(result["suspended"])
+        focus.assert_not_called()
+        self.cli.full_checks.assert_not_called()
 
     def test_changed_window_between_probes_is_blocked(self):
         with patch.object(module, "existing_browser", side_effect=[self.process, None]), patch.object(module, "focus_native") as focus:
@@ -111,12 +115,13 @@ class LauncherTests(unittest.TestCase):
         with patch.object(module, "existing_browser", side_effect=[None, self.process]), patch.object(module, "focus_native") as focus:
             result = self.open()
         self.assertTrue(result["launched"])
-        self.cli.launch.assert_called_once()
-        self.assertEqual(self.cli.launch.call_args.args[2:5], ("web", False, []))
+        self.cli.launch_shortcut_browser.assert_called_once()
+        self.cli.launch_shortcut_browser.assert_called_once_with(self.config, Path("/support/config.json"))
+        self.cli.full_checks.assert_not_called()
         focus.assert_called_once_with(self.process, Path("/Shortcut.app/Contents/MacOS/SurgeCCShortcut"))
 
     def test_failed_launch_never_focuses(self):
-        self.cli.launch.return_value = {"ok": False, "summary": "线路失败"}
+        self.cli.launch_shortcut_browser.return_value = {"ok": False, "summary": "线路失败"}
         with patch.object(module, "existing_browser", return_value=None), patch.object(module, "focus_native") as focus:
             with self.assertRaisesRegex(module.LauncherError, "线路失败"):
                 self.open()
@@ -175,7 +180,7 @@ class LauncherTests(unittest.TestCase):
              patch.object(module, "focus_native") as focus:
             with self.assertRaisesRegex(module.LauncherError, "wrong profile"):
                 self.open()
-        self.cli.launch.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
         focus.assert_not_called()
 
     def test_only_exact_canonical_command_is_accepted(self):
@@ -192,7 +197,7 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(module.LauncherError):
             self.open("B", start_page="claude")
         self.workspaces.use.assert_not_called()
-        self.cli.launch.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
 
     def test_target_workspace_uses_its_own_saved_page(self):
         self.config.update(workspace="B", browser_start_page="claude")
@@ -205,7 +210,7 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(module.LauncherError):
             self.open(workspace="missing")
         self.workspaces.use.assert_not_called()
-        self.cli.launch.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
 
     def open_url(self, url="https://example.com/private?id=fixture", **kwargs):
         return module.open_url(Path("/support/config.json"), "A", url,
@@ -223,7 +228,7 @@ class LauncherTests(unittest.TestCase):
             result = self.open_url(url)
         opener.assert_called_once()
         focus.assert_not_called()
-        self.cli.launch.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
         self.assertTrue(result["ok"])
         self.assertTrue(result["opened"])
         self.assertNotIn(url, json.dumps(result))
@@ -233,12 +238,13 @@ class LauncherTests(unittest.TestCase):
              patch.object(module, "open_url_native") as opener:
             result = self.open_url()
         self.assertTrue(result["launched"])
-        self.assertEqual(self.cli.launch.call_args.args[2:5], ("web", False, []))
+        self.cli.launch_shortcut_browser.assert_called_once_with(self.config, Path("/support/config.json"))
+        self.cli.full_checks.assert_not_called()
         opener.assert_called_once()
-        self.assertNotIn("example.com", repr(self.cli.launch.call_args))
+        self.assertNotIn("example.com", repr(self.cli.launch_shortcut_browser.call_args))
 
     def test_url_route_failure_never_delivers_to_any_browser(self):
-        self.cli.full_checks.return_value = {"ok": False, "summary": "route failed"}
+        self.quick.side_effect = module.LauncherError("route failed")
         with patch.object(module, "existing_browser", return_value=self.process), \
              patch.object(module, "open_url_native") as opener, \
              patch.object(module, "focus_native") as focus:
@@ -253,7 +259,7 @@ class LauncherTests(unittest.TestCase):
             result = self.open_url()
         self.assertEqual(result["action"], "needs_switch")
         self.workspaces.use.assert_not_called()
-        self.cli.launch.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
         opener.assert_not_called()
 
     def test_url_account_or_window_changed_before_delivery_blocks(self):
@@ -271,7 +277,8 @@ class LauncherTests(unittest.TestCase):
              patch.object(module, "open_url_native") as opener:
             with self.assertRaisesRegex(module.LauncherError, "owner exited"):
                 self.open_url(before_delivery=expired)
-        self.cli.full_checks.assert_called_once()
+        self.quick.assert_called_once_with(self.config)
+        self.cli.full_checks.assert_not_called()
         opener.assert_not_called()
 
     def test_native_url_uses_stdin_only_and_requires_confirmed_delivery(self):
@@ -297,7 +304,7 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(result["opened"])
         self.assertFalse(result["focused"])
         opener.assert_called_once()
-        self.cli.launch.assert_not_called()
+        self.cli.launch_shortcut_browser.assert_not_called()
 
     def test_native_url_failure_does_not_leak_url_or_fallback(self):
         failures = [NS(returncode=2, stdout=b'{}'),
@@ -340,7 +347,8 @@ class GuardEvidenceTests(unittest.TestCase):
             "--receipt": str(session) + ".receipt.json",
         }
         self.write("--config", self.config)
-        self.write("--receipt", {"schema": 1, "target": "web", "state": "running", "ok": True})
+        self.write("--receipt", {"schema": 1, "target": "web", "state": "running", "ok": True,
+                                "web_guard_version": 2, "suspended": False, "protection_active": True})
 
     def write(self, key, value):
         path = Path(self.arguments[key])
@@ -348,18 +356,28 @@ class GuardEvidenceTests(unittest.TestCase):
         path.chmod(0o600)
 
     def status(self, state="running", ok=True, age=0):
-        self.write("--status", {"schema": 1, "target": "web", "state": state, "ok": ok,
+        self.write("--status", {"schema": 1, "target": "web", "state": state, "ok": ok, "web_guard_version": 2,
                                  "checked_at": (dt.datetime.now(dt.timezone.utc) -
                                                 dt.timedelta(seconds=age)).isoformat()})
 
     def validate(self):
         module.validate_guard_files(self.arguments, self.config_path, self.config)
 
-    def test_canonical_running_and_suspended_are_accepted(self):
-        for state, ok in (("running", True), ("suspended", False)):
-            with self.subTest(state=state):
-                self.status(state, ok)
-                self.validate()
+    def test_only_current_running_guard_is_accepted(self):
+        self.status()
+        self.validate()
+        self.status("suspended", False)
+        with self.assertRaises(module.LauncherError):
+            self.validate()
+
+    def test_old_worker_requires_browser_restart(self):
+        self.status()
+        path = Path(self.arguments["--status"])
+        value = json.loads(path.read_text())
+        value.pop("web_guard_version")
+        self.write("--status", value)
+        with self.assertRaisesRegex(module.LauncherError, "旧版守护"):
+            self.validate()
 
     def test_contradictory_guard_state_is_rejected(self):
         for state, ok in (("running", False), ("suspended", True), ("running", None)):
@@ -494,6 +512,16 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(self.sign_mock.call_count, 2)
         self.assertEqual(module.core.load_config(self.config_path), self.config)
 
+    def test_installed_launcher_advertises_web_handling_without_setting_default(self):
+        import plistlib
+        result = self.install()
+        info = plistlib.loads((Path(result['app']) / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['CFBundleURLTypes'][0]['CFBundleURLSchemes'], ['http', 'https'])
+        self.assertNotIn('CFBundleDocumentTypes', info)
+        # Installation only signs and publishes; it must not silently take over
+        # the user's HTTP(S) handlers.
+        self.assertTrue(all(call.args[0][0] == '/usr/bin/codesign' for call in self.sign_mock.call_args_list))
+
     def test_same_name_is_never_overwritten(self):
         result = self.install()
         before = (Path(result['app']) / 'Contents/Resources/launcher.json').read_bytes()
@@ -597,6 +625,63 @@ class InstallationTests(unittest.TestCase):
                 module.open_launcher(path, expected_config=self.root / 'other/config.json')
         opener.assert_not_called()
 
+    def test_web_open_uses_launcher_workspace_and_native_helper(self):
+        result = self.install()
+        path = Path(result['app']) / 'Contents/Resources/launcher.json'
+        url = 'https://example.com/private?document=fixture'
+        with patch.object(module, 'open_url', return_value={'action': 'focus', 'opened': True}) as opener:
+            value = module.open_launcher_url(path, {'url': url}, 'B', expected_config=self.config_path)
+        self.assertTrue(value['opened'])
+        self.assertNotIn(url, json.dumps(value))
+        opener.assert_called_once_with(self.config_path, 'A', url,
+                                       Path(result['app']) / 'Contents/MacOS/SurgeCCShortcut', 'B')
+
+    def test_web_request_cannot_supply_workspace_or_browser(self):
+        result = self.install()
+        path = Path(result['app']) / 'Contents/Resources/launcher.json'
+        for request in ({'url': 'https://example.com/', 'workspace': 'B'},
+                        {'url': 'https://example.com/', 'browser': '/Applications/Google Chrome.app'},
+                        {}, None, [], {'url': ['https://example.com/']}):
+            with self.subTest(request=request), patch.object(module, 'open_url') as opener:
+                with self.assertRaises(module.core.Blocked):
+                    module.open_launcher_url(path, request)
+                opener.assert_not_called()
+
+    def test_web_request_invalid_url_is_blocked_without_echo(self):
+        result = self.install()
+        path = Path(result['app']) / 'Contents/Resources/launcher.json'
+        for url in ('file:///private/secret', 'javascript:private()',
+                    'https://account:secret@example.com/', 'https://example.com/%0aPRIVATE'):
+            with self.subTest(url=url), patch.object(module, 'open_url') as opener:
+                with self.assertRaises(module.core.Blocked) as failure:
+                    module.open_launcher_url(path, {'url': url})
+                self.assertNotIn(url, str(failure.exception))
+                opener.assert_not_called()
+
+    def test_web_open_config_mismatch_and_stale_page_are_blocked(self):
+        result = self.install()
+        path = Path(result['app']) / 'Contents/Resources/launcher.json'
+        with patch.object(module, 'open_url') as opener:
+            with self.assertRaises(module.LauncherError):
+                module.open_launcher_url(path, {'url': 'https://example.com/'},
+                                         expected_config=self.root / 'other/config.json')
+            current = module.core.load_config(self.config_path)
+            current['browser_start_page'] = 'claude'
+            module.core.save_config(self.config_path, current)
+            with self.assertRaises(module.LauncherError):
+                module.open_launcher_url(path, {'url': 'https://example.com/'})
+            opener.assert_not_called()
+
+    def test_web_open_failure_does_not_try_dock_or_other_browser(self):
+        result = self.install()
+        path = Path(result['app']) / 'Contents/Resources/launcher.json'
+        with patch.object(module, 'open_url', side_effect=module.LauncherError('线路异常')) as opener, \
+                patch.object(module, 'open_browser') as dock:
+            with self.assertRaisesRegex(module.LauncherError, '线路异常'):
+                module.open_launcher_url(path, {'url': 'https://example.com/'})
+            opener.assert_called_once()
+            dock.assert_not_called()
+
     def test_workspace_pages_do_not_bleed(self):
         from copy import deepcopy
         b = deepcopy(self.config)
@@ -646,8 +731,9 @@ class ExistingWindowIdentityTests(unittest.TestCase):
         status = Path(str(session) + '.status.json')
         self.guard_file = settings
         for path, value in ((settings, self.config),
-                            (receipt, {'schema': 1, 'target': 'web', 'state': 'running', 'ok': True}),
-                            (status, {'schema': 1, 'target': 'web', 'state': 'running', 'ok': True,
+                            (receipt, {'schema': 1, 'target': 'web', 'state': 'running', 'ok': True,
+                                       'web_guard_version': 2, 'protection_active': True, 'suspended': False}),
+                            (status, {'schema': 1, 'target': 'web', 'state': 'running', 'ok': True, 'web_guard_version': 2,
                                       'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()})):
             module.workspaces.write_json(path, value)
         self.parent_args = ['/fixture/python', '-B', '-m', 'surge_cc.guard',

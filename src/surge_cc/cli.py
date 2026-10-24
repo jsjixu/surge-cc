@@ -313,6 +313,9 @@ def start_web_guard(config: dict, config_path: Path, command: list[str], loc: di
                         state.get("target") != "web" or type(state.get("ok")) is not bool):
                     raise Blocked("启动回执格式未知，未确认浏览器受监控。")
                 if state["ok"] is True and state.get("state") == "running":
+                    if (state.get("web_guard_version") != 2 or state.get("protection_active") is not True
+                            or state.get("suspended") is not False):
+                        raise Blocked("专用浏览器没有确认固定出口保护，已停止启动。")
                     if worker.poll() is None:
                         return state
                     raise Blocked("运行监控提前退出，浏览器启动未得到确认。")
@@ -350,6 +353,31 @@ def interactive_paste_enabled(arguments: list[str]) -> bool:
            or (value.startswith("-p") and not value.startswith("--")) for value in arguments):
         return False
     return os.isatty(0) and os.isatty(1)
+
+
+def launch_shortcut_browser(config: dict, config_path: Path, *, web_guard=start_web_guard) -> dict:
+    """Cold Dock/URL launch: one mandatory gate in the owning worker.
+
+    Caller holds the account gate. The worker holds the browser lease, prepares
+    its private preferences and checks live scope plus actual proxy exit before
+    spawning Chrome. Full privacy diagnostics remain a separate user action.
+    """
+    workspaces.assert_current(config_path, config)
+    if not config.get("browser_path") or not browser_executable(config).is_file():
+        raise Blocked("未找到已配置的独立浏览器。")
+    loc = workspaces.paths(config_path, config["workspace"])
+    profile = loc["browser"]
+    if profile.is_symlink():
+        raise Blocked("专用网页资料目录异常，未启动浏览器。")
+    if os.path.lexists(profile / "SingletonLock"):
+        raise BrowserProfileBusy("专用浏览器仍在运行或留有锁文件，请检查后重试。")
+    receipt = web_guard(config, config_path, chrome_args(config, profile), loc)
+    if (receipt.get("ok") is not True or receipt.get("web_guard_version") != 2
+            or receipt.get("state") != "running" or receipt.get("target") != "web"
+            or receipt.get("protection_active") is not True or receipt.get("suspended") is not False):
+        raise Blocked("未能确认专用浏览器由固定出口守护运行。")
+    return command_result("必要线路检查通过，已启动专用浏览器。", config,
+                          launched=True, target="web", protection_active=True)
 
 
 def launch(config: dict, config_path: Path, target: str, terminal: bool, args: list[str],
@@ -740,6 +768,8 @@ def parser() -> argparse.ArgumentParser:
     shortcut.add_argument("--applications-dir", type=Path)
     shortcut.add_argument("--launcher-config", type=Path)
     shortcut.add_argument("--confirm-switch-from")
+    shortcut.add_argument("--url-stdin", action="store_true",
+                          help="从标准输入读取网页请求，不把地址写入命令行")
     shortcut.add_argument("--json", action="store_true")
     links = commands.add_parser("links", help="Orca 网页分流与原默认浏览器恢复")
     links.add_argument("action", choices=("install", "status", "enable", "disable", "open",
@@ -864,8 +894,16 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     if not options.launcher_config:
                         raise Blocked("请指定快捷入口资料。")
-                    data = shortcuts.open_launcher(options.launcher_config, options.confirm_switch_from,
-                                                   expected_config=config_path)
+                    if options.url_stdin:
+                        raw = sys.stdin.read(32769)
+                        if len(raw.encode("utf-8")) > 32768:
+                            raise Blocked("网页请求过长，未打开网页。")
+                        data = shortcuts.open_launcher_url(options.launcher_config, json.loads(raw),
+                                                           options.confirm_switch_from,
+                                                           expected_config=config_path)
+                    else:
+                        data = shortcuts.open_launcher(options.launcher_config, options.confirm_switch_from,
+                                                       expected_config=config_path)
                 except Blocked as exc:
                     data = {"schema": 1, "action": "blocked", "message": str(exc)}
                 except Exception:
@@ -874,6 +912,8 @@ def main(argv: list[str] | None = None) -> int:
                     signal.signal(signal.SIGTERM, previous)
                 print(json.dumps(data, ensure_ascii=False))
                 return 0 if data.get("action") in {"focus", "needs_switch"} else 2
+            if options.url_stdin:
+                raise Blocked("网页标准输入选项只能用于打开快捷入口。")
             if not all((options.name, options.workspace, options.start_page, options.app)):
                 raise Blocked("安装快捷入口需要名称、工作区、启动页和主应用路径。")
             data = shortcuts.install(config_path, options.workspace, options.name, options.start_page,
