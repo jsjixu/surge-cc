@@ -206,6 +206,8 @@ class NativeLaunchIntegrationTests(Fixture):
         factory = self.stack.enter_context(patch.object(cli, 'OAuthSession'))
         self.oauth = factory.return_value.__enter__.return_value
         self.oauth.browser_hook = Path('/private/tmp/surge-cc-oauth-release-fixture/browser')
+        self.oauth.child_environment.side_effect = lambda env: dict(env, BROWSER=str(self.oauth.browser_hook),
+            PATH=str(self.oauth.browser_hook.parent) + ":" + env.get("PATH", "/usr/bin:/bin"))
         self.guarded = Mock(side_effect=self.completed)
         self.checker = Mock(return_value={'ok': True, 'checks': [], 'summary': 'synthetic'})
         original = cli.launch
@@ -294,9 +296,10 @@ class BundleReleaseIntegrationTests(Fixture):
         return child.returncode, json.loads(child.stdout), child.stderr
 
     def test_bundle_contains_complete_onboarding_and_shortcut_runtime(self):
-        for file in ('scripts/surge-cc', 'scripts/first-run.sh', 'SurgeCCShortcut', 'SurgeCCIcon.icns',
+        for file in ('scripts/surge-cc', 'scripts/first-run.sh', 'SurgeCCShortcut', 'SurgeCCLinkRouter', 'SurgeCCIcon.icns',
                      'src/surge_cc/onboarding.py', 'src/surge_cc/projects.py', 'src/surge_cc/shortcuts.py',
                      'src/surge_cc/messaging.py', 'src/surge_cc/shared_history.py',
+                     'src/surge_cc/link_router.py', 'src/surge_cc/web_urls.py',
                      'src/surge_cc/paste_terminal.py', 'src/surge_cc/pasted_images.py'):
             self.assertTrue((self.resources / file).is_file(), file)
         info = plistlib.loads((self.app / 'Contents/Info.plist').read_bytes())

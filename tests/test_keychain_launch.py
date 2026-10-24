@@ -57,6 +57,8 @@ class KeychainLaunchTests(unittest.TestCase):
         self.oauth_factory = self.stack.enter_context(patch.object(cli, "OAuthSession"))
         self.session = self.oauth_factory.return_value.__enter__.return_value
         self.session.browser_hook = self.root / "private-browser-hook"
+        self.session.child_environment.side_effect = lambda env: dict(env, BROWSER=str(self.session.browser_hook),
+            PATH=str(self.session.browser_hook.parent) + ":" + env.get("PATH", "/usr/bin:/bin"))
         self.development_factory = self.stack.enter_context(patch.object(dev_proxy, "Session"))
         self.development = self.development_factory.return_value.__enter__.return_value
         self.development.port = 49152

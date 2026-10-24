@@ -6,7 +6,7 @@
 
 规则模式下，启动前核对节点和实际出口，检查 DNS 与 WebRTC，通过专用浏览器打开网页及 OAuth 授权，并在运行期间持续检查线路。普通网页和非隔离 CLI 可在全局代理模式挂起出口保护；已登记隔离项目必须使用规则模式。提供原生 macOS 窗口和命令行。
 
-当前版本：**0.5.1（Build 17）** · macOS 13+ · Apple Silicon 安装包 · 界面以中文为主
+当前版本：**0.5.2（Build 18）** · macOS 13+ · Apple Silicon 安装包 · 界面以中文为主
 
 Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方隶属关系。它管理本地连接和程序，不提供代理节点，也不保证账号状态或服务资格。
 
@@ -38,6 +38,7 @@ Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方�
 | 错误处理入口 | 按实际失败项提供浏览器恢复、终端维护、线路预览或系统设置入口；处理后重新检查 |
 | Surge CC 更新 | 手动检查正式发布，下载并验证安装包；同路径安装、自检失败回滚、保留旧 App |
 | Orca 启动诊断 | 显示不同入口的支持范围，并可在已登记的本机 Orca 项目里打开受控终端 |
+| 网页链接分流 | 受控 Claude 使用自身工作区；可选将 Orca 点击链接及普通 zsh 的网页打开命令送入 A，其他应用保留原默认浏览器 |
 
 **规则模式下“异常时停止”有明确范围：** 固定组不含备用节点，专用入口不会主动改走其他出口；进程监控仍有轮询间隔，依赖 Surge 的规则模式、增强模式和有效规则。它不是操作系统防火墙，也不能约束任意忽略代理的 CLI 子进程。完整边界见下文。
 
@@ -74,6 +75,21 @@ Surge CC 是独立社区工具，与 Surge、Anthropic 或 Google 没有官方�
 **先把 App 放到最终位置，再运行向导。** 终端与 Dock 入口引用主应用绝对路径；移动或删除主应用后，需要重新配置，缺失时会阻止启动。仅检查或下载安装包不会替换现用的安装；只有明确点击「安装并重新打开」并确认后，才会执行同路径升级。
 
 ## 日常使用
+
+### 网页链接分流
+
+受控 Claude 会话的 `BROWSER` 和会话内 `open URL` 在规则模式下先检查线路，再使用该会话工作区的专用浏览器。已打开时复用原窗口与登录资料，不另建空白 Profile。
+
+| 从哪里打开 | 使用哪个浏览器 | 启用条件 |
+| --- | --- | --- |
+| Orca 中点击外部链接 | A 的专用浏览器 | 安装并启用可选系统网页分流器；Orca 将链接交给系统 |
+| Orca 普通 zsh 输入 `open URL` 或 `/usr/bin/open URL` | A 的专用浏览器 | 再安装 `links shell-install`，新建 Orca 终端后生效 |
+| 受控 Claude 使用 `BROWSER` 或私有 `open URL` | 当前 Claude 会话的 A/B 专用浏览器 | 更新后正常重启 Claude 会话 |
+| 其他应用通过系统默认入口打开 | 安装分流器前的默认浏览器 | 分流器保存原浏览器，不改其资料 |
+
+已识别的受控网页打开失败时不会转交个人 Chrome。普通 Orca 终端在当前工作区为 B 时会要求先手动切回 A，保留 B 会话。全局代理模式沿用「保护挂起」行为，不能把成功打开当作固定出口检查通过。
+
+同步终端入口只作用于已配置的交互式 zsh。`command /usr/bin/open`、`env /usr/bin/open`、程序直接执行系统二进制及其他 shell 可绕过函数；它不是全机器拦截器。完整安装、撤销与适用范围见 [网页链接指南](docs/WEB-LINKS.md)。
 
 ### 网页与 CLI
 
@@ -421,10 +437,10 @@ git clone https://github.com/jsjixu/surge-cc.git
 cd surge-cc
 python3 -m unittest discover -s tests -v
 ./scripts/test-gui.sh
-SURGE_CC_APP_NAME='Surge CC 0.5.1.app' ./scripts/build-app.sh
+SURGE_CC_APP_NAME='Surge CC 0.5.2.app' ./scripts/build-app.sh
 ```
 
-使用 v0.5.1 源码时，输出为 `dist/Surge CC 0.5.1.app`，只构建当前机器架构。默认使用开发用 ad-hoc 签名，更新后可能需要重新授权 macOS 隐私权限；浏览器恢复和暂停提示没有改变这一限制。若要使用固定代码签名证书，设置 `SURGE_CC_SIGNING_IDENTITY` 为有效证书的 SHA-1 指纹或精确名称；证书缺失或签名失败会停止，不自动降级。证书申请、首次迁移、升级前连续性验证与公证边界见 [固定签名指南](SIGNING.md)。
+使用当前源码时，输出为 `dist/Surge CC 0.5.2.app`，只构建当前机器架构。默认使用开发用 ad-hoc 签名，更新后可能需要重新授权 macOS 隐私权限；浏览器恢复和暂停提示没有改变这一限制。若要使用固定代码签名证书，设置 `SURGE_CC_SIGNING_IDENTITY` 为有效证书的 SHA-1 指纹或精确名称；证书缺失或签名失败会停止，不自动降级。证书申请、首次迁移、升级前连续性验证与公证边界见 [固定签名指南](SIGNING.md)。
 
 构建不会安装、启动应用或修改代理。已有同名输出会被拒绝；用 `SURGE_CC_APP_NAME` 或 `SURGE_CC_DIST_DIR` 选择新文件名或目录，不会覆盖正在使用的应用。
 

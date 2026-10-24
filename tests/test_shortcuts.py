@@ -207,6 +207,118 @@ class LauncherTests(unittest.TestCase):
         self.workspaces.use.assert_not_called()
         self.cli.launch.assert_not_called()
 
+    def open_url(self, url="https://example.com/private?id=fixture", **kwargs):
+        return module.open_url(Path("/support/config.json"), "A", url,
+                               Path("/Shortcut.app/Contents/MacOS/SurgeCCShortcut"), **kwargs)
+
+    def test_url_delivery_reuses_verified_window_while_account_lock_held(self):
+        url = "https://example.com/private?id=fixture"
+        def deliver(process, native, requested_url):
+            self.assertTrue(self.locked)
+            self.assertEqual(process, self.process)
+            self.assertEqual(requested_url, url)
+        with patch.object(module, "existing_browser", return_value=self.process), \
+             patch.object(module, "focus_native") as focus, \
+             patch.object(module, "open_url_native", side_effect=deliver) as opener:
+            result = self.open_url(url)
+        opener.assert_called_once()
+        focus.assert_not_called()
+        self.cli.launch.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["opened"])
+        self.assertNotIn(url, json.dumps(result))
+
+    def test_cold_url_open_keeps_canonical_startup_command(self):
+        with patch.object(module, "existing_browser", side_effect=[None, self.process]), \
+             patch.object(module, "open_url_native") as opener:
+            result = self.open_url()
+        self.assertTrue(result["launched"])
+        self.assertEqual(self.cli.launch.call_args.args[2:5], ("web", False, []))
+        opener.assert_called_once()
+        self.assertNotIn("example.com", repr(self.cli.launch.call_args))
+
+    def test_url_route_failure_never_delivers_to_any_browser(self):
+        self.cli.full_checks.return_value = {"ok": False, "summary": "route failed"}
+        with patch.object(module, "existing_browser", return_value=self.process), \
+             patch.object(module, "open_url_native") as opener, \
+             patch.object(module, "focus_native") as focus:
+            with self.assertRaises(module.LauncherError):
+                self.open_url()
+        opener.assert_not_called()
+        focus.assert_not_called()
+
+    def test_url_workspace_switch_is_never_silent(self):
+        self.config["workspace"] = "B"
+        with patch.object(module, "open_url_native") as opener:
+            result = self.open_url()
+        self.assertEqual(result["action"], "needs_switch")
+        self.workspaces.use.assert_not_called()
+        self.cli.launch.assert_not_called()
+        opener.assert_not_called()
+
+    def test_url_account_or_window_changed_before_delivery_blocks(self):
+        with patch.object(module, "existing_browser", side_effect=[self.process, None]), \
+             patch.object(module, "open_url_native") as opener:
+            with self.assertRaises(module.LauncherError):
+                self.open_url()
+        opener.assert_not_called()
+
+    def test_url_owner_exited_during_checks_blocks_delivery(self):
+        def expired():
+            self.assertTrue(self.locked)
+            raise module.LauncherError("owner exited")
+        with patch.object(module, "existing_browser", return_value=self.process), \
+             patch.object(module, "open_url_native") as opener:
+            with self.assertRaisesRegex(module.LauncherError, "owner exited"):
+                self.open_url(before_delivery=expired)
+        self.cli.full_checks.assert_called_once()
+        opener.assert_not_called()
+
+    def test_native_url_uses_stdin_only_and_requires_confirmed_delivery(self):
+        url = "https://example.com/?private=fixture"
+        with patch.object(module.subprocess, "run", return_value=NS(
+                returncode=0, stdout=b'{"schema":1,"opened":true,"focused":true}')) as run:
+            self.assertTrue(module.open_url_native(self.process, Path("/shortcut"), url))
+        self.assertEqual(run.call_args.args[0], ["/shortcut", "--open-url-stdin"])
+        self.assertEqual(json.loads(run.call_args.kwargs["input"])["url"], url)
+        self.assertNotIn(url, repr(run.call_args.args))
+
+    def test_native_accepted_url_without_focus_succeeds_without_retry(self):
+        with patch.object(module.subprocess, "run", return_value=NS(
+                returncode=0, stdout=b'{"schema":1,"opened":true,"focused":false}')) as run:
+            self.assertFalse(module.open_url_native(self.process, Path("/shortcut"), "https://example.com/"))
+        run.assert_called_once()
+
+    def test_open_url_reports_delivery_and_focus_independently(self):
+        with patch.object(module, "existing_browser", return_value=self.process), \
+             patch.object(module, "open_url_native", return_value=False) as opener:
+            result = self.open_url()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["opened"])
+        self.assertFalse(result["focused"])
+        opener.assert_called_once()
+        self.cli.launch.assert_not_called()
+
+    def test_native_url_failure_does_not_leak_url_or_fallback(self):
+        failures = [NS(returncode=2, stdout=b'{}'),
+                    NS(returncode=2, stdout=b'{"schema":1,"opened":true,"focused":false}'),
+                    NS(returncode=0, stdout=b'{"schema":1,"opened":false,"focused":true}'),
+                    NS(returncode=0, stdout=b'{"schema":1,"opened":true,"focused":"false"}'),
+                    NS(returncode=0, stdout=b'{"opened":true,"focused":false}'),
+                    NS(returncode=0, stdout=b'[]'),
+                    NS(returncode=0, stdout=b'invalid'), OSError("private-test-url"),
+                    module.subprocess.TimeoutExpired(["private-test-url"], 15)]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), patch.object(module.subprocess, "run") as run:
+                if isinstance(failure, Exception):
+                    run.side_effect = failure
+                else:
+                    run.return_value = failure
+                with self.assertRaises(module.LauncherError) as caught:
+                    module.open_url_native(self.process, Path("/shortcut"), "https://example.com/private-test-url")
+                self.assertNotIn("private-test-url", str(caught.exception))
+                run.assert_called_once()
+
 
 class GuardEvidenceTests(unittest.TestCase):
     def setUp(self):

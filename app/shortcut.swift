@@ -64,6 +64,23 @@ private struct FocusRequest: Decodable {
     let executable: String
 }
 
+private struct OpenURLRequest: Decodable {
+    let pid: Int32
+    let started: [Int64]
+    let executable: String
+    let url: String
+
+    var identity: FocusRequest { FocusRequest(pid: pid, started: started, executable: executable) }
+}
+
+private func validIdentityRequest(_ request: FocusRequest) -> Bool {
+    request.pid > 0 && request.pid != getpid()
+        && request.started.count == 2 && request.started[0] > 0
+        && (0..<1_000_000).contains(request.started[1])
+        && (request.executable as NSString).isAbsolutePath
+        && !request.executable.contains("\0")
+}
+
 private func matchesKernelIdentity(_ request: FocusRequest) -> Bool {
     var info = proc_bsdinfo()
     let size = MemoryLayout<proc_bsdinfo>.size
@@ -81,12 +98,12 @@ private func matchesKernelIdentity(_ request: FocusRequest) -> Bool {
 // lifecycle or windows and does not read configuration or credential files.
 private func focusOnly(_ json: String) -> Bool {
     guard let bytes = json.data(using: .utf8),
-          let request = try? JSONDecoder().decode(FocusRequest.self, from: bytes),
-          request.pid > 0, request.pid != getpid(),
-          request.started.count == 2, request.started[0] > 0,
-          (0..<1_000_000).contains(request.started[1]),
-          (request.executable as NSString).isAbsolutePath,
-          !request.executable.contains("\0") else { return false }
+          let request = try? JSONDecoder().decode(FocusRequest.self, from: bytes) else { return false }
+    return focusVerified(request)
+}
+
+private func focusVerified(_ request: FocusRequest) -> Bool {
+    guard validIdentityRequest(request) else { return false }
     let expectedStart = Double(request.started[0]) + Double(request.started[1]) / 1_000_000
     var target: NSRunningApplication?
     for _ in 0..<50 {
@@ -114,6 +131,61 @@ private func focusOnly(_ json: String) -> Bool {
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
     }
     return false
+}
+
+private func ordinaryWebURL(_ value: String) -> Bool {
+    guard !value.isEmpty, value.utf8.count <= 16_384,
+          value.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil,
+          !value.contains("\\"),
+          value.range(of: "%(?![0-9A-Fa-f]{2})", options: .regularExpression) == nil,
+          let decoded = value.removingPercentEncoding,
+          decoded.rangeOfCharacter(from: .controlCharacters) == nil,
+          !decoded.contains("\\"),
+          let components = URLComponents(string: value),
+          ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+          let host = components.host, !host.isEmpty,
+          !host.contains("%"), components.user == nil, components.password == nil,
+          components.port == nil || (1...65535).contains(components.port!) else { return false }
+    return true
+}
+
+// URLs travel over stdin and an event addressed to this exact live PID. Never
+// use LaunchServices, the default browser, an app name, or a bundle ID here.
+// A successful reply confirms that Chrome accepted the request, not page load.
+private func openURLFromStandardInput() -> (opened: Bool, focused: Bool) {
+    var bytes = Data()
+    while true {
+        let chunk = FileHandle.standardInput.readData(ofLength: 4096)
+        if chunk.isEmpty { break }
+        guard bytes.count + chunk.count <= 131_072 else { return (false, false) }
+        bytes.append(chunk)
+    }
+    guard let request = try? JSONDecoder().decode(OpenURLRequest.self, from: bytes),
+          validIdentityRequest(request.identity), ordinaryWebURL(request.url),
+          matchesKernelIdentity(request.identity),
+          let target = NSRunningApplication(processIdentifier: request.pid),
+          !target.isTerminated, target.isFinishedLaunching,
+          target.executableURL?.path == request.executable else { return (false, false) }
+    let destination = NSAppleEventDescriptor(processIdentifier: request.pid)
+    let event = NSAppleEventDescriptor(eventClass: AEEventClass(0x4755524c),
+                                      eventID: AEEventID(0x4755524c),
+                                      targetDescriptor: destination,
+                                      returnID: AEReturnID(kAutoGenerateReturnID),
+                                      transactionID: AETransactionID(kAnyTransactionID))
+    event.setParam(NSAppleEventDescriptor(string: request.url), forKeyword: AEKeyword(0x2d2d2d2d))
+    guard matchesKernelIdentity(request.identity) else { return (false, false) }
+    do {
+        let reply = try event.sendEvent(options: [.waitForReply, .neverInteract, .dontRecord], timeout: 8)
+        guard reply.paramDescriptor(forKeyword: AEKeyword(0x6572726e))?.int32Value ?? 0 == 0,
+              matchesKernelIdentity(request.identity) else { return (false, false) }
+        // Delivery is complete once the exact process accepted the event and
+        // its identity was checked again. Focus is best effort: another app
+        // can take the foreground without undoing the accepted URL request.
+        return (true, focusVerified(request.identity))
+    } catch {
+        // AppleEvent errors can include the requested URL. Do not print them.
+        return (false, false)
+    }
 }
 
 // This object owns only the Python process it launched. It never signals Chrome,
@@ -380,6 +452,14 @@ private final class LauncherDelegate: NSObject, NSApplicationDelegate {
     }
 
 
+}
+
+if CommandLine.arguments.dropFirst().contains("--open-url-stdin") {
+    let result = CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--open-url-stdin"
+        ? openURLFromStandardInput() : (opened: false, focused: false)
+    let reply = "{\"schema\":1,\"opened\":\(result.opened ? "true" : "false"),\"focused\":\(result.focused ? "true" : "false")}\n"
+    FileHandle.standardOutput.write(Data(reply.utf8))
+    exit(result.opened ? 0 : 2)
 }
 
 if CommandLine.arguments.dropFirst().contains("--focus-only") {

@@ -51,6 +51,8 @@ class LaunchTests(unittest.TestCase):
         self.oauth_factory = self.stack.enter_context(patch.object(cli, "OAuthSession"))
         self.oauth = self.oauth_factory.return_value.__enter__.return_value
         self.oauth.browser_hook = self.folder / "private-oauth-opener"
+        self.oauth.child_environment.side_effect = lambda env: dict(env, BROWSER=str(self.oauth.browser_hook),
+            PATH=str(self.oauth.browser_hook.parent) + ":" + env.get("PATH", "/usr/bin:/bin"))
         self.stack.enter_context(patch.dict(os.environ, {"NO_PROXY": "*"}, clear=True))
 
     def test_every_code_launch_runs_fresh_check_and_failure_never_popen(self):

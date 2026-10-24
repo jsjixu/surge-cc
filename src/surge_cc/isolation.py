@@ -524,7 +524,7 @@ def profile(project: Project, native: Path, browser_hook: Path, *, probe: Path |
                   "/opt/homebrew/etc/openssl@3/openssl.cnf", "/opt/homebrew/etc/openssl@3/cert.pem",
                   "/opt/homebrew/etc/ca-certificates/cert.pem",
                   "/dev/null", "/dev/urandom", "/dev/random",
-                  native.resolve(), hook, Path(sys.executable).resolve()]
+                  native.resolve(), hook, hook.parent / "open", Path(sys.executable).resolve()]
     if probe is not None:
         read_files.append(probe.resolve())
     metadata = {Path("/private"), Path("/private/etc"), Path("/private/var"), Path("/opt"),

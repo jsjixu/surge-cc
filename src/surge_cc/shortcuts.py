@@ -17,6 +17,7 @@ import tempfile
 import time
 
 from . import core, workspaces, browser_locks, sessions, workspace_routes
+from .web_urls import validate_url as validate_web_url
 # cli imports this module only within its shortcut command branch.
 from . import cli
 
@@ -159,6 +160,7 @@ def install(config_path: Path, workspace: str, name: str, start_page: str,
                           "CFBundlePackageType": "APPL", "CFBundleIconFile": "SurgeCCIcon",
                           "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
                           "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
+                          "NSAppleEventsUsageDescription": "Send requested web links to the verified dedicated browser window.",
                           "NSPrincipalClass": "NSApplication"}, handle)
         try:
             subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(stage)],
@@ -335,6 +337,28 @@ def focus_native(process, native):
         raise LauncherError("已确认指定工作区的浏览器，但未能切到窗口；请查看 Dock 中已打开的专用浏览器。")
 
 
+def open_url_native(process, native, url):
+    """Deliver to the verified PID and return focus status, without URL argv.
+
+    Chrome accepting the event is distinct from staying in the foreground.
+    Never retry an accepted request merely because focus was unavailable.
+    """
+    request = {"pid": process.pid, "started": list(process.started),
+               "executable": process.executable, "url": validate_web_url(url)}
+    try:
+        completed = subprocess.run([str(native), "--open-url-stdin"],
+                                   input=json.dumps(request).encode("utf-8"),
+                                   capture_output=True, timeout=15)
+        result = json.loads(completed.stdout)
+        if (completed.returncode == 0 and isinstance(result, dict)
+                and type(result.get("schema")) is int and result["schema"] == 1
+                and result.get("opened") is True and type(result.get("focused")) is bool):
+            return result["focused"]
+    except (OSError, subprocess.SubprocessError, ValueError, UnicodeError):
+        pass
+    raise LauncherError("未能确认网页已在专用浏览器中打开；未转交默认浏览器。请检查 Surge CC 的自动化权限后重试。")
+
+
 def assert_start_page(config_path: Path, config: dict, workspace: str, start_page: str):
     entries = workspaces.listing(config_path, config)["workspaces"]
     target = next((item for item in entries if item["name"] == workspace), None)
@@ -348,6 +372,31 @@ def assert_start_page(config_path: Path, config: dict, workspace: str, start_pag
 def open_browser(config_path: Path, workspace: str, start_page: str,
                  focus_executable: Path, confirmed_from=None) -> dict:
     """Use the shared backend and account gate; a cancelled switch does nothing."""
+    return _open_browser(config_path, workspace, start_page, focus_executable, confirmed_from)
+
+
+def open_url(config_path: Path, workspace: str, url: str,
+             focus_executable: Path, confirmed_from=None, *, before_delivery=None) -> dict:
+    """Open an ordinary page in the account's canonical browser after checks.
+
+    The page is delivered after startup, so it cannot change browser argv,
+    callback bypasses, profile identity, or the parent guard's receipt.
+    """
+    url = validate_web_url(url)
+    workspace = workspaces.name_ok(workspace)
+    config = core.load_config(config_path)
+    entries = workspaces.listing(config_path, config)["workspaces"]
+    target = next((item for item in entries if item["name"] == workspace), None)
+    if target is None or not target.get("route_configured"):
+        raise LauncherError("请先在 Surge CC 中配置指定工作区。")
+    start_page = target["route"].get("browser_start_page", "claude")
+    return _open_browser(config_path, workspace, start_page, focus_executable, confirmed_from,
+                         requested_url=url, before_delivery=before_delivery)
+
+
+def _open_browser(config_path: Path, workspace: str, start_page: str,
+                  focus_executable: Path, confirmed_from=None, *, requested_url=None,
+                  before_delivery=None) -> dict:
     workspace = workspaces.name_ok(workspace)
     start_page = page_ok(start_page)
     config = core.load_config(config_path)
@@ -377,13 +426,22 @@ def open_browser(config_path: Path, workspace: str, start_page: str,
                 raise LauncherError(failure_message(report))
             process = wait_for_browser(config_path, config)
         workspaces.assert_current(config_path, config)
-        focus_native(process, focus_executable)
+        focused = True
+        if requested_url is None:
+            focus_native(process, focus_executable)
+        else:
+            if before_delivery is not None:
+                before_delivery()
+            focused = open_url_native(process, focus_executable, requested_url) is True
         suspended = report.get("paused") is True and report.get("protection_active") is False
-        return {"schema": 1, "action": "focus", "pid": process.pid,
+        result = {"schema": 1, "ok": True, "action": "focus", "pid": process.pid,
                 "started": list(process.started), "executable": process.executable,
-                "launched": launched, "suspended": suspended, "focused": True,
+                "launched": launched, "suspended": suspended, "focused": focused,
                 "message": "全局模式：保护挂起，沿用 Surge 全局出口。" if suspended
                            else "线路检查通过，已打开专用浏览器。"}
+        if requested_url is not None:
+            result["opened"] = True
+        return result
 
 
 def open_launcher(launcher_config: Path, confirmed_from=None, *, expected_config: Path | None = None) -> dict:

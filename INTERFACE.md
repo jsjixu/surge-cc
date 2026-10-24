@@ -1,6 +1,6 @@
-# Surge CC 0.5.1 接口合约
+# Surge CC 0.5.2 接口合约
 
-本文对应 **v0.5.1 / Build 17**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
+本文对应 **v0.5.2 / Build 18**。接口约定与实现范围如下；自动化及实机验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 终端入口
 
@@ -352,7 +352,7 @@ Seatbelt 仅新增当前空间 `sessions/` 与 `cc-socks/` 的文件读写，以
 
 已登记隔离项目的交互终端使用 PTY 粘贴通道。只有完整 `ESC[200~` / `ESC[201~`（bracketed paste）片段中、内容恰好为当前用户系统临时目录下 `orca-paste-<时间戳>-<UUID>.png` 路径时，才触发图片导入。通道不直接读取剪贴板，不扫描临时目录，也不处理子进程输出。普通键盘输入、其他粘贴内容、管道、`--print` / JSON 协议及认证和维护命令保留原处理方式。
 
-可信启动器检查源文件身份、链接及 PNG 结构，单图最多 **20 MiB**，然后复制到当前隔离 HOME 内本次启动的私有目录，将粘贴片段中的路径替换为副本路径。导入失败时以固定错误文字替换该片段，保留之后的输入；终端转发异常交由现有守护停止受控进程。原 `/var/folders/…/T` 目录及其中其他文件仍不可读，文件沙箱和 SixtyNet 等现有线路保护不因导入而放宽，个人 Chrome 和其他代理服务不受影响。
+可信启动器检查源文件身份、链接及 PNG 结构，单图最多 **20 MiB**，然后复制到当前隔离 HOME 内本次启动的私有目录，将粘贴片段中的路径替换为副本路径。导入失败时以固定错误文字替换该片段，保留之后的输入；终端转发异常交由现有守护停止受控进程。原 `/var/folders/…/T` 目录及其中其他文件仍不可读，文件沙箱和指定线路的现有保护不因导入而放宽，个人 Chrome 和其他代理服务不受影响。
 
 副本随该项目或工作树的隔离 HOME 保留，以便恢复会话时继续读取；关闭终端不会删除已导入图片。更新后需退出并重新启动已有 Claude 会话才能使用该通道。此支持针对已接管的隔离终端入口，不表示 Orca Native Chat、直接剪贴板读取或 GUI 安装包均已部署、验收。
 
@@ -420,3 +420,20 @@ Git 可读同仓库历史，可写 objects、refs、reflogs 及当前工作树�
 配置新增 `default_model`（空字符串为原生默认）、`default_effort`（空或 low/medium/high/max）、`browser_start_page`（claude/newtab），按工作区保存。旧工作区缺字段时使用各自兼容默认，不继承其他账号的值。模型/effort通过JSON设置传给原生CLI，显式CLI参数保留；配置effort时仅在受控子进程移除冲突的继承环境变量。启动页由主启动器和守护共同核对，OAuth单独使用本次授权地址。
 
 `configure --cli-process-path PATH` 可重复提供进程范围，不必手工编辑配置JSON；首次向导从已验证的原生安装生成范围。变更范围后须重新应用并验证Surge规则，保存字段本身不代表保护已生效。
+
+
+## 网页链接入口
+
+- `links install --app /absolute/Surge\ CC.app --json` 安装候选分流器并保存原 HTTP/HTTPS 浏览器；不直接改默认。
+- `links enable|disable|status --json` 启用、恢复或检查默认入口。`disable` 只恢复仍指向分流器的协议，不覆盖用户后来选择的浏览器。
+- `links open --router-config /absolute/router.json --json` 是原生分流器内部入口，从 stdin 接收有大小上限的 `{url, source}`；普通结果不含 URL。来源由系统 Apple Event 捕获并核对进程身份。
+- Orca 独立 Terminal Host 仅在固定缓存路径、私有文件权限及内容摘要与已登记 Orca 安装包一致时被认可；核验后再次检查进程身份。父系中的系统 `/usr/bin/login` 仅在实际用户为当前用户、有效用户为 root 时允许作为桥接；其本身不是 Orca 来源。前后 UID、PID、父 PID 与启动身份必须一致。普通 URL 已被目标接受时，即使 `focused=false` 仍报告投递成功，不重发。
+- 受控 Claude 子进程环境 `BROWSER` 指向私有 socket hook，`PATH` 仅在该会话前置同目录的 `open`。普通网页经独立网页守护，授权 URL 仍要求严格 OAuth 验证和本机会话回调所有权。
+- 明确指定其他程序、绝对 `/usr/bin/open`、不支持 `BROWSER` 的第三方打开器不能仅靠 PATH 接管。系统分流器仅处理经过系统 HTTP/HTTPS 默认入口的请求；已退出发送者可能无法核验来源，因此普通 Orca zsh 使用下述同步入口。
+
+- `links shell-install|shell-status|shell-remove --json` 管理 Orca zsh 同步入口及私有备份。`shell-eligible` 静默核验当前父链；`shell-open` 只从 NUL 分隔的 stdin 读取参数，再核验真实来源。不会通过用户指定 PID、前台窗口或 ORCA 环境变量授予来源身份。
+- 安装在 `~/.zshrc` 末尾添加受管理区块，保留原字节私有备份；移除仅删除该区块，保留用户后来在其他位置的修改。安装和撤销都需新建交互式 zsh 终端后生效，不向既有终端注入命令。`shell-status` 只反映磁盘状态。
+- 已有 `open`、`/usr/bin/open` 同名函数或别名会保留；来源无法核验会提示入口未启用。只有已核验 Orca 来源才定义两个函数，不替换 `/usr/bin/open` 二进制。受控 Claude 的私有 `BROWSER`／PATH 入口优先，防止 B 子 shell 借用 A。
+- 同步入口接受单个 HTTP(S) URL 或 `-- URL`，请求上限 64 KiB；已识别网页在来源、线路或目标校验失败时退出 `78`，不回落个人浏览器。多网页或附加选项的网页调用拒绝；非网页及显式 `-a`／`-b` 调用交给系统。
+- 同步入口固定工作区 A，当前 B 时要求用户先手动切换，不自动结束会话；系统链接分流器仍可使用明确的跨工作区确认。受控 Claude 私有打开器使用其所属工作区，普通网页保留现有全局代理挂起语义。
+- zsh 函数消除普通 `open` 在 Apple Event 到达前退出的竞态；`command /usr/bin/open`、`env /usr/bin/open`、程序直接 exec、其他 shell 或未加载 `~/.zshrc` 的终端可以绕过。绕过后的系统事件仍受来源可用性限制，不提供全机器拦截保证。

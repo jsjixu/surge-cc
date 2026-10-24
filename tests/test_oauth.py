@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from surge_cc import oauth, workspaces
+from surge_cc import shortcuts
 from surge_cc.core import Blocked
 
 
@@ -30,6 +31,19 @@ def config():
 
 
 class URLTests(unittest.TestCase):
+    def test_malformed_oauth_variants_do_not_become_ordinary_pages(self):
+        for value in (url(), url(state="short"), url().replace("https:", "http:", 1),
+                      url().replace("claude.com", "user@claude.com"),
+                      url().replace("claude.com", "claude.com.:444"),
+                      url().replace("/cai/oauth/authorize", "/cai/oauth/authorize/"),
+                      url().replace("/cai/oauth/authorize", "/cai/oauth%2Fauthorize"),
+                      url().replace("/cai/oauth/authorize", "/damaged-endpoint")):
+            with self.subTest(value=value):
+                self.assertTrue(oauth.authorization_candidate(value))
+        for value in ("https://claude.ai/artifact/example", "https://example.com/",
+                      "https://claude.ai/login", None, "https://[bad/", "not a URL"):
+            self.assertFalse(oauth.authorization_candidate(value))
+
     def test_official_endpoints_preserve_exact_url(self):
         for host, path in oauth.AUTHORIZE_ENDPOINTS:
             value = url(endpoint="https://" + host + path) + "&login_hint=user%2Btag%40example.com"
@@ -151,7 +165,209 @@ class SessionTests(unittest.TestCase):
             self.assertLess(len(str(hook.parent / "s").encode()), 104)
             self.assertNotIn("response_type", hook.read_text())
             self.assertNotIn("subprocess", hook.read_text())
+            self.assertEqual(session.open_hook.stat().st_mode & 0o777, 0o700)
         self.assertFalse(hook.exists())
+
+    def test_child_environment_is_scoped_and_preserves_other_settings(self):
+        base = {"PATH": "/custom/bin:/usr/bin", "EXAMPLE": "untouched"}
+        with self.session() as session:
+            env = session.child_environment(base)
+            self.assertEqual(env["BROWSER"], str(session.browser_hook))
+            self.assertEqual(env["PATH"], str(session.open_hook.parent) + ":/custom/bin:/usr/bin")
+            self.assertEqual(env["EXAMPLE"], "untouched")
+            self.assertNotIn("BROWSER", base)
+            self.assertEqual(base["PATH"], "/custom/bin:/usr/bin")
+        with self.assertRaises(Blocked):
+            session.child_environment(base)
+
+    def test_ordinary_links_use_current_workspace_independent_guard(self):
+        with patch.object(shortcuts, "open_url", return_value={"ok": True, "opened": True, "action": "focus"}) as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                session._open("https://claude.ai/artifact/example")
+                session._open("https://example.com/docs?q=1#section")
+                self.assertIsNone(session.browser)
+                self.assertIsNone(session._locks)
+                self.assertEqual(opener.call_count, 2)
+                opener.assert_called_with(self.config_path, "A", "https://example.com/docs?q=1#section",
+                                          focus_executable=session.focus_executable,
+                                          before_delivery=session._require_live)
+        self.spawn.assert_not_called()
+        self.stop.assert_not_called()
+        self.owner.assert_not_called()
+
+    def test_ordinary_web_works_in_token_mode_but_oauth_stays_disabled(self):
+        with patch.object(shortcuts, "open_url", return_value={"ok": True, "opened": True, "action": "focus"}) as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                session.allow_authorization = False
+                session._open("https://example.com/")
+                with self.assertRaises(Blocked):
+                    session._open(url())
+                with self.assertRaises(Blocked):
+                    session._open(url(state="short"))
+            opener.assert_called_once()
+        self.spawn.assert_not_called()
+        self.owner.assert_not_called()
+
+    def test_malformed_oauth_cannot_fall_through_normal_web(self):
+        with patch.object(shortcuts, "open_url") as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                for value in (url(state="short"), url().replace("https:", "http:", 1),
+                              url().replace("/cai/oauth/authorize", "/cai/oauth%2Fauthorize")):
+                    with self.assertRaises(Blocked):
+                        session._open(value)
+            opener.assert_not_called()
+        self.spawn.assert_not_called()
+
+    def test_ordinary_web_never_steals_running_oauth_profile(self):
+        with patch.object(shortcuts, "open_url") as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                session._open_authorization(url())
+                previous = session.browser
+                with self.assertRaises(oauth.BrowserProfileBusy):
+                    session._open("https://example.com/")
+                self.assertIs(session.browser, previous)
+                self.stop.assert_not_called()
+            opener.assert_not_called()
+
+    def test_ordinary_web_after_closed_oauth_releases_only_dead_lease(self):
+        with patch.object(shortcuts, "open_url", return_value={"ok": True, "opened": True}) as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                session._open_authorization(url())
+                session.browser.poll.return_value = 0
+                session._open("https://example.com/")
+                self.assertIsNone(session.browser)
+                self.assertIsNone(session._locks)
+            opener.assert_called_once()
+        self.stop.assert_not_called()
+
+    def test_ordinary_web_requires_live_session_and_passing_route(self):
+        with patch.object(shortcuts, "open_url", side_effect=Blocked("route failed")) as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                with self.assertRaises(Blocked):
+                    session._open("https://example.com/")
+                self.child.poll.return_value = 0
+                with self.assertRaises(Blocked):
+                    session._open("https://example.com/")
+            opener.assert_called_once()
+        self.checker.assert_not_called()
+
+    def test_ordinary_web_uses_current_shared_route_check_without_duplicate_oauth_probe(self):
+        # The CLI snapshot can be older than the workspace's current route.
+        # open_url is responsible for reloading it and honoring explicit global
+        # mode; the OAuth-only checker is not a second ordinary-page gate.
+        self.checker.return_value = {"ok": False}
+        with patch.object(shortcuts, "open_url", return_value={"ok": True, "opened": True, "suspended": True}) as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                session._open("https://example.com/")
+            opener.assert_called_once()
+        self.checker.assert_not_called()
+        self.spawn.assert_not_called()
+
+    def test_cli_exit_during_web_checks_cannot_deliver_url(self):
+        delivered = []
+        def open_url(_config_path, _workspace, value, **kwargs):
+            self.child.poll.return_value = 0
+            kwargs["before_delivery"]()
+            delivered.append(value)
+            return {"ok": True, "opened": True}
+        with patch.object(shortcuts, "open_url", side_effect=open_url):
+            with self.session() as session:
+                session.set_child(self.child)
+                with self.assertRaises(Blocked):
+                    session._open("https://example.com/private-document")
+        self.assertEqual(delivered, [])
+
+    def test_shutdown_during_slow_web_check_does_not_wait_for_delivery(self):
+        entered, finish, shutdown_done = threading.Event(), threading.Event(), threading.Event()
+        failures, delivered = [], []
+        def open_url(_config_path, _workspace, value, **kwargs):
+            entered.set()
+            finish.wait(3)
+            kwargs["before_delivery"]()
+            delivered.append(value)
+            return {"ok": True, "opened": True}
+        session = self.session().__enter__()
+        session.set_child(self.child)
+        def request():
+            try:
+                session._open("https://example.com/private-document")
+            except Blocked:
+                failures.append(True)
+        with patch.object(shortcuts, "open_url", side_effect=open_url):
+            thread = threading.Thread(target=request)
+            thread.start()
+            self.assertTrue(entered.wait(1))
+            def shutdown():
+                session.__exit__(None, None, None)
+                shutdown_done.set()
+            closing = threading.Thread(target=shutdown)
+            closing.start()
+            try:
+                # A held state lock would wait for the opener's three-second
+                # timeout instead of allowing prompt shutdown.
+                self.assertTrue(shutdown_done.wait(1.5))
+            finally:
+                finish.set()
+                thread.join(2)
+                closing.join(2)
+        self.assertEqual(failures, [True])
+        self.assertEqual(delivered, [])
+
+    def test_ordinary_page_rejects_switch_and_unconfirmed_open(self):
+        with patch.object(shortcuts, "open_url") as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                for result in ({"action": "needs_switch"}, {"ok": False}, {"ok": True}):
+                    opener.return_value = result
+                    with self.assertRaises(Blocked):
+                        session._open("https://example.com/")
+                self.assertTrue(all("confirmed_from" not in call.kwargs for call in opener.call_args_list))
+
+    def test_real_browser_and_bare_open_hooks_route_ordinary_web_privately(self):
+        with patch.object(shortcuts, "open_url", return_value={"ok": True, "opened": True}) as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                for command in ([str(session.browser_hook), "https://example.com/browser"],
+                                [str(session.open_hook), "https://example.com/open"],
+                                [str(session.open_hook), "--", "https://example.com/explicit"]):
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                self.assertEqual(opener.call_count, 3)
+        self.spawn.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_real_bare_open_rejects_options_files_and_multiple_urls(self):
+        with patch.object(shortcuts, "open_url") as opener:
+            with self.session() as session:
+                session.set_child(self.child)
+                for args in (["-a", "Google Chrome", "https://example.com/"],
+                             ["-b", "com.google.Chrome", "https://example.com/"],
+                             ["file:///private/secret"], ["/private/secret"],
+                             ["javascript:alert(1)"], ["https://example.com/", "https://example.net/"], []):
+                    result = subprocess.run([str(session.open_hook), *args], capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertNotIn("example.com", result.stderr)
+                    self.assertNotIn(session._token, result.stderr)
+            opener.assert_not_called()
+
+    def test_real_hook_web_failure_redacts_sensitive_url(self):
+        with patch.object(shortcuts, "open_url", side_effect=Blocked("private internal error")):
+            with self.session() as session:
+                session.set_child(self.child)
+                value = "https://example.com/?secret=synthetic-sensitive"
+                result = subprocess.run([str(session.browser_hook), value], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertNotIn(value, result.stderr)
+                self.assertNotIn("synthetic-sensitive", result.stderr)
+                self.assertNotIn("private internal", result.stderr)
 
     def test_success_owned_browser_and_context_cleanup(self):
         with self.session() as session:

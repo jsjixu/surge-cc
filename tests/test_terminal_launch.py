@@ -42,6 +42,8 @@ class TerminalLaunchContracts(unittest.TestCase):
         factory = self.stack.enter_context(patch.object(cli, 'OAuthSession'))
         self.oauth = factory.return_value.__enter__.return_value
         self.oauth.browser_hook = self.root / 'oauth-hook'
+        self.oauth.child_environment.side_effect = lambda env: dict(env, BROWSER=str(self.oauth.browser_hook),
+            PATH=str(self.oauth.browser_hook.parent) + ":" + env.get("PATH", "/usr/bin:/bin"))
         self.checker = Mock(return_value=checked())
         self.guarded = Mock(side_effect=self.completed_guard)
         self.original_launch = cli.launch

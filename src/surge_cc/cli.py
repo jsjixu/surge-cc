@@ -517,7 +517,7 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                 if paste is not None:
                     paste.start(child)
                 startup_release()
-            env["BROWSER"] = str(oauth.browser_hook)
+            env = oauth.child_environment(env)
             native = default_claude()
             terminal_options = {"terminal_device": Path(paste.tty_path)} if paste is not None else {}
             if development_proxy is not None:
@@ -526,7 +526,7 @@ def launch(config: dict, config_path: Path, target: str, terminal: bool, args: l
                     key: value for key, value in env.items()
                     if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy",
                                        "npm_config_proxy", "npm_config_https_proxy", "npm_config_noproxy"}
-                    or key in {"BROWSER", "NODE_USE_ENV_PROXY"}}
+                    or key in {"BROWSER", "PATH", "NODE_USE_ENV_PROXY"}}
             if titles is not None:
                 terminal_options["title_hook"] = titles.hook
                 print("[Surge CC] Orca 自动标题已接通，仅通知当前标签页。", file=sys.stderr)
@@ -741,6 +741,16 @@ def parser() -> argparse.ArgumentParser:
     shortcut.add_argument("--launcher-config", type=Path)
     shortcut.add_argument("--confirm-switch-from")
     shortcut.add_argument("--json", action="store_true")
+    links = commands.add_parser("links", help="Orca 网页分流与原默认浏览器恢复")
+    links.add_argument("action", choices=("install", "status", "enable", "disable", "open",
+                                        "shell-install", "shell-status", "shell-remove",
+                                        "shell-eligible", "shell-open"))
+    links.add_argument("--app", type=Path)
+    links.add_argument("--applications-dir", type=Path)
+    links.add_argument("--router-config", type=Path,
+                       default=Path.home() / "Applications/Surge CC Links.app/Contents/Resources/router.json")
+    links.add_argument("--confirm-switch-from")
+    links.add_argument("--json", action="store_true")
     # parse_known_args below accepts extra arguments only after an explicit "--".
     return value
 
@@ -762,7 +772,88 @@ def main(argv: list[str] | None = None) -> int:
         config_path = options.config.expanduser().absolute()
         if arguments and options.command != "launch":
             raise Blocked("只有启动命令接受额外参数。")
-        if options.command == "shortcut":
+        if options.command == "links":
+            from . import link_router, shortcuts
+            if options.action.startswith("shell-"):
+                from . import terminal_links
+                previous = signal.getsignal(signal.SIGTERM)
+                def interrupted_shell_link(*_):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    raise shortcuts.LauncherStopped("终端网页打开已取消。")
+                if options.action == "shell-open":
+                    signal.signal(signal.SIGTERM, interrupted_shell_link)
+                try:
+                    settings = link_router.load(options.router_config)
+                    if Path(settings["config"]) != config_path:
+                        raise Blocked("终端链接入口的配置不匹配，未打开网页。")
+                    if options.action == "shell-eligible":
+                        data = terminal_links.eligible(options.router_config)
+                    elif options.action == "shell-open":
+                        raw = sys.stdin.buffer.read(65537)
+                        if len(raw) > 65536:
+                            raise Blocked("终端网页请求过长，未打开网页。")
+                        data = terminal_links.dispatch(options.router_config, raw)
+                    else:
+                        operation = {"shell-install": terminal_links.install,
+                                     "shell-status": terminal_links.status,
+                                     "shell-remove": terminal_links.remove}[options.action]
+                        data = operation(options.router_config)
+                    if not isinstance(data, dict):
+                        raise ValueError("invalid terminal links result")
+                except Blocked as exc:
+                    data = {"ok": False, "action": "blocked", "message": str(exc), "exit_code": 78}
+                except Exception:
+                    # Never echo a malformed NUL payload, private URL/query,
+                    # command arguments or a raw lower-level exception.
+                    data = {"ok": False, "action": "blocked", "message": "终端网页入口无法验证，未打开网页。", "exit_code": 78}
+                finally:
+                    if options.action == "shell-open":
+                        signal.signal(signal.SIGTERM, previous)
+                if options.action in {"shell-eligible", "shell-open"}:
+                    status = data.get("exit_code")
+                    if type(status) is not int or not 0 <= status <= 255:
+                        status = 78
+                        data = {"ok": False, "action": "blocked", "message": "终端网页入口返回无效结果，未确认打开。", "exit_code": status}
+                    if options.action == "shell-open":
+                        print(json.dumps(data, ensure_ascii=False))
+                    return status
+                report = command_result(data.get("message", "终端网页入口操作完成"), {},
+                                        links=data, ok=data.get("ok") is True)
+                emit(report)
+                return 0 if report["ok"] else 2
+            if options.action == "open":
+                previous = signal.getsignal(signal.SIGTERM)
+                def interrupted_link(*_):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    raise shortcuts.LauncherStopped("网页打开已取消。")
+                signal.signal(signal.SIGTERM, interrupted_link)
+                try:
+                    settings = link_router.load(options.router_config)
+                    if Path(settings["config"]) != config_path:
+                        raise Blocked("链接入口的配置不匹配，未打开网页。")
+                    raw = sys.stdin.read(32769)
+                    if len(raw.encode("utf-8")) > 32768:
+                        raise ValueError()
+                    data = link_router.open_request(options.router_config, json.loads(raw),
+                                                    confirmed_from=options.confirm_switch_from)
+                except Blocked as exc:
+                    data = {"schema": 1, "action": "blocked", "message": str(exc)}
+                except Exception:
+                    data = {"schema": 1, "action": "blocked", "message": "链接请求无法验证，未打开网页。"}
+                finally:
+                    signal.signal(signal.SIGTERM, previous)
+                print(json.dumps(data, ensure_ascii=False))
+                return 0 if data.get("action") in {"focus", "needs_switch", "fallback"} else 2
+            if options.action == "install":
+                if not options.app:
+                    raise Blocked("安装链接分流器需要主应用路径。")
+                data = link_router.install(config_path, options.app, applications_dir=options.applications_dir)
+            elif options.action == "status":
+                data = link_router.status(options.router_config)
+            else:
+                data = link_router.set_default(options.router_config, restore=options.action == "disable")
+            report = command_result("网页分流设置操作完成", {}, links=data)
+        elif options.command == "shortcut":
             from . import shortcuts
             if options.action == "open":
                 previous = signal.getsignal(signal.SIGTERM)

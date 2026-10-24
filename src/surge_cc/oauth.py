@@ -33,6 +33,32 @@ AUTHORIZE_ENDPOINTS = {
 MAX_MESSAGE = 32768
 
 
+def authorization_candidate(value: str) -> bool:
+    """Keep malformed Claude OAuth requests out of the ordinary-page path.
+
+    Classification is deliberately broader than validation. Encoded paths,
+    trailing dots/slashes, wrong ports and non-HTTPS variants must still take
+    the strict validator, without earning its temporary callback exception.
+    """
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if host not in {host for host, _ in AUTHORIZE_ENDPOINTS}:
+            return False
+        path = parsed.path
+        for _ in range(3):
+            path = unquote(path)
+        path = path.lower().rstrip("/")
+        if path.endswith("/oauth/authorize"):
+            return True
+        # A damaged endpoint with an authorization query is still an OAuth
+        # attempt, rather than a normal page that can bypass its validation.
+        keys = {key for key, _ in parse_qsl(parsed.query, max_num_fields=64)}
+        return bool(keys & {"response_type", "code_challenge", "redirect_uri"})
+    except (ValueError, TypeError, UnicodeError):
+        return False  # The ordinary URL validator rejects malformed syntax.
+
+
 @dataclass(frozen=True)
 class Authorization:
     url: str
@@ -134,16 +160,19 @@ def _read_message(connection: socket.socket) -> dict:
     return result
 
 
-def _hook_source(socket_path: str, token: str) -> str:
+def _hook_source(socket_path: str, token: str, *, open_command: bool = False) -> str:
     # This file contains neither a current authorization URL nor a shell command.
     if any(c.isspace() for c in sys.executable):
         raise Blocked("Python 路径无法用作专用授权入口，未启动。")
     return f"""#!{sys.executable}
 import json, socket, sys
 try:
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    if {open_command!r} and args[:1] == ["--"]:
+        args = args[1:]
+    if len(args) != 1 or args[0].startswith("-"):
         raise ValueError()
-    packet = json.dumps({{"token": {token!r}, "url": sys.argv[1]}}, ensure_ascii=True).encode() + b"\\n"
+    packet = json.dumps({{"token": {token!r}, "url": args[0]}}, ensure_ascii=True).encode() + b"\\n"
     if len(packet) > {MAX_MESSAGE}:
         raise ValueError()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -165,7 +194,7 @@ try:
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise ValueError()
 except Exception:
-    sys.stderr.write("Surge CC 未能打开专用授权窗口；未使用系统浏览器。\\n")
+    sys.stderr.write("Surge CC 未能打开专用浏览器；只接受单个 HTTP(S) 网页链接，未使用系统浏览器。\\n")
     sys.exit(2)
 sys.exit(0)
 """
@@ -175,15 +204,18 @@ class OAuthSession:
     """One local CLI owns this broker and every browser process it launches."""
 
     def __init__(self, config: dict, config_path: Path, *, checker=None, popen=subprocess.Popen,
-                 allow_authorization: bool = True):
+                 allow_authorization: bool = True, focus_executable: Path | None = None):
         self.config = dict(config)
         self.config_path = Path(config_path).absolute()
         self.checker = checker
         self.popen = popen
         self.allow_authorization = allow_authorization
+        self.focus_executable = (Path(focus_executable) if focus_executable is not None
+                                 else Path(__file__).resolve().parents[2] / "SurgeCCShortcut")
         self.child = None
         self.browser = None
         self.browser_hook = None
+        self.open_hook = None
         self._folder = None
         self._socket = None
         self._thread = None
@@ -211,6 +243,11 @@ class OAuthSession:
             self.browser_hook = self._folder / "browser"
             self.browser_hook.write_text(_hook_source(socket_path, self._token), encoding="utf-8")
             self.browser_hook.chmod(0o700)
+            # Only controlled child processes receive this PATH entry. Never
+            # replace /usr/bin/open or modify the user's shell configuration.
+            self.open_hook = self._folder / "open"
+            self.open_hook.write_text(_hook_source(socket_path, self._token, open_command=True), encoding="utf-8")
+            self.open_hook.chmod(0o700)
             self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._socket.bind(socket_path)
             os.chmod(socket_path, 0o600)
@@ -223,6 +260,15 @@ class OAuthSession:
             self.__exit__(*sys.exc_info())
             raise
 
+    def child_environment(self, base: dict) -> dict:
+        if self._folder is None or self.browser_hook is None or self._closing.is_set():
+            raise Blocked("专用网页入口尚未就绪，未启动 Claude Code。")
+        env = dict(base)
+        env["BROWSER"] = str(self.browser_hook)
+        previous = env.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        env["PATH"] = str(self._folder) + (os.pathsep + previous if previous else "")
+        return env
+
     def set_child(self, child):
         with self._state:
             if self._closing.is_set() or self.child is not None or child.poll() is not None:
@@ -233,6 +279,10 @@ class OAuthSession:
     def _live(self) -> bool:
         return (not self._closing.is_set() and self.child is not None
                 and self.child.poll() is None)
+
+    def _require_live(self):
+        if not self._live():
+            raise Blocked("网页会话已结束，未打开链接。")
 
     def _check(self):
         if not self._live():
@@ -331,6 +381,41 @@ class OAuthSession:
                     self._stop_browser()
             raise
 
+    def _open_web(self, value: str):
+        from . import shortcuts, web_urls
+        web_urls.validate_url(value)
+        # The shared page opener reloads the workspace's current config and
+        # performs the route check under its account gate. Repeating the OAuth
+        # checker here would use this CLI's older config and double the probes.
+        self._require_live()
+        with self._state:
+            if not self._live():
+                raise Blocked("网页会话已结束，未打开浏览器。")
+            if self.browser is not None:
+                if self.browser.poll() is None:
+                    raise BrowserProfileBusy("专用授权窗口正在使用登录资料。请关闭专用窗口后重试。")
+                self.browser = None
+                self._release_profile()
+        # Route verification can be slow. Let shutdown mark this broker closed
+        # without waiting on its state lock; the delivery callback then rejects
+        # the request immediately before the browser receives any URL.
+        result = shortcuts.open_url(self.config_path, self.config["workspace"], value,
+                                    focus_executable=self.focus_executable,
+                                    before_delivery=self._require_live)
+        # A CLI is bound to its starting account. Never approve an account
+        # switch or default-browser fallback from a background request.
+        if (not isinstance(result, dict) or result.get("ok") is not True
+                or result.get("opened") is not True or result.get("action") == "needs_switch"):
+            raise Blocked("专用网页未能在当前工作区打开，未切换账号或浏览器。")
+        # Ordinary pages have their own guarded lifetime. They must not become
+        # this OAuth broker's owned child and close when the CLI ends.
+
+    def _open(self, value: str):
+        if authorization_candidate(value):
+            self._open_authorization(value)
+        else:
+            self._open_web(value)
+
     def _serve(self):
         while not self._closing.is_set():
             try:
@@ -355,7 +440,7 @@ class OAuthSession:
                         raise ValueError("Unauthorized")
                     if not self._ready.wait(timeout=5) or not self._live():
                         raise ValueError("Not ready")
-                    self._open_authorization(message["url"])
+                    self._open(message["url"])
                     ok = True
                 except BrowserProfileBusy:
                     # A fixed error code is actionable without disclosing any

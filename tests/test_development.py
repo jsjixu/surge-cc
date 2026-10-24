@@ -71,7 +71,7 @@ class SettingsTests(ProjectFixture):
         self.assertNotIn(self.root / ".claude/settings.json", paths)
 
     def test_rejects_protected_overrides_without_printing_values(self):
-        for key in ("ANTHROPIC_API_KEY", "claude_code_oauth_token", "HOME", "BROWSER",
+        for key in ("ANTHROPIC_API_KEY", "claude_code_oauth_token", "HOME", "BROWSER", "PATH", "path",
                     "HTTPS_PROXY", "no_proxy", "CLAUDE_CONFIG_DIR", "DYLD_INSERT_LIBRARIES",
                     "CLAUDE_SECURESTORAGE_CONFIG_DIR", "ORCA_HOOK_TOKEN", "NPM_CONFIG_PROXY"):
             self.settings({"env": {key: "sensitive-value"}})
@@ -98,12 +98,14 @@ class SettingsTests(ProjectFixture):
         titles = {"SessionStart": [{"hooks": [{"type": "command", "command": "/private/tmp/title/hook"}]}]}
         fixed = {"hooks": titles, "model": "opus", "effortLevel": "high", "disableAllHooks": True}
         env = {"HTTPS_PROXY": "http://127.0.0.1:49123", "BROWSER": "/private/tmp/oauth/hook",
+               "PATH": "/private/tmp/oauth:/isolated/bin:/usr/bin",
                "CLAUDE_CODE_OAUTH_TOKEN": "never-write-this", "TERM": "xterm"}
         result = development.runtime_settings(self.project, fixed, env)
         self.assertFalse(result["disableAllHooks"])
         self.assertEqual(result["hooks"], titles)
         self.assertEqual(result["model"], "opus")
         self.assertEqual(result["env"]["HTTPS_PROXY"], env["HTTPS_PROXY"])
+        self.assertEqual(result["env"]["PATH"], env["PATH"])
         self.assertEqual(result["env"]["HOME"], str(self.home))
         self.assertNotIn("never-write-this", json.dumps(result))
         self.assertTrue(result["disableRemoteControl"])
