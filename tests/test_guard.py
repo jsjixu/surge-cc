@@ -719,34 +719,52 @@ class SuperviseTests(unittest.TestCase):
             full = Mock(return_value={"ok": True})
             checker = guard.RuntimeChecker(config(), process=sys.executable, surge=surge,
                                            listener=Mock(return_value=True), preflight=full)
-            started = [None]
-            status = surge.status
-            def changing_status():
-                elapsed = time.monotonic() - started[0] if started[0] is not None else 0
-                surge.status_value["mode"] = "proxy" if .02 <= elapsed < .08 else "rule"
-                return status()
-            surge.status = changing_status
             children = []
             def spawn(command, **kwargs):
-                child = subprocess.Popen(command, **kwargs)
+                child = subprocess.Popen(command, stdin=subprocess.PIPE, **kwargs)
                 children.append(child)
-                started[0] = time.monotonic()
                 return child
             states = []
+            alive_states = []
+            released = False
             writer = guard.write_state
             def capture(path, **kwargs):
-                states.append(kwargs["state"])
+                nonlocal released
+                state = kwargs["state"]
+                states.append(state)
+                if children and children[0].poll() is None:
+                    alive_states.append(state)
+                    # Each transition is acknowledged by the real supervisor
+                    # before advancing. No short wall-clock mode window can be
+                    # missed when the CI runner delays process scheduling.
+                    if state == "suspended":
+                        surge.status_value["mode"] = "rule"
+                    elif state == "running" and "suspended" not in states:
+                        surge.status_value["mode"] = "proxy"
+                    elif state == "running" and not released:
+                        children[0].stdin.write(b"x")
+                        children[0].stdin.close()
+                        released = True
                 return writer(path, **kwargs)
-            with patch.object(guard, "write_state", side_effect=capture):
-                result = guard.run_guarded(
-                    [sys.executable, "-c", "import time; time.sleep(.18)"],
-                    env=dict(os.environ), cwd=Path(directory), config=config(), target="code",
-                    preflight=Mock(return_value={"ok": True}), checker=checker,
-                    popen=spawn, interval=.01, exit_interval=.03)
+            try:
+                with patch.object(guard, "write_state", side_effect=capture):
+                    result = guard.run_guarded(
+                        [sys.executable, "-c",
+                         "import select,sys; ready,_,_=select.select([sys.stdin],[],[],10); "
+                         "sys.exit(0 if ready and sys.stdin.buffer.read(1)==b'x' else 3)"],
+                        env=dict(os.environ), cwd=Path(directory), config=config(), target="code",
+                        preflight=Mock(return_value={"ok": True}), checker=checker,
+                        popen=spawn, interval=.01, exit_interval=.03)
+            finally:
+                for child in children:
+                    child.stdin.close()
             self.assertEqual(result, 0)
             self.assertEqual(children[0].returncode, 0)
             self.assertIn("suspended", states)
             self.assertIn("running", states[states.index("suspended") + 1:])
+            self.assertIn("suspended", alive_states)
+            self.assertIn("running", alive_states[alive_states.index("suspended") + 1:])
+            self.assertTrue(released)
             full.assert_called_once()
             self.assertFalse(checker.suspended)
 
